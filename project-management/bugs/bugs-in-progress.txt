@@ -1,0 +1,5 @@
+Bugs in Progress
+
+Track bugs currently being remediated. Keep entries concise, timestamped, and
+annotated with owners and blockers. Keep detailed remediation notes under
+`in-progress/`.

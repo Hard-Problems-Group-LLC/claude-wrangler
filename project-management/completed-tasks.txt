@@ -1,0 +1,21 @@
+Completed Tasks
+
+Record completed tasks with newest entries at the top. Use asterisk-plus-blank
+line formatting. Include concise outcomes, owners, blocker resolution notes,
+and ISO 8601 timestamps.
+
+* Port codex-wrangler to claude-wrangler (spirit-of-the-law). Shipped the
+  full utility (17 modules), ring-aware bin/claude-local launcher with
+  pinned CLAUDE_CONFIG_DIR=.local/claude and per-invocation ring-0 escape,
+  channels stable/latest/next, acceptEdits reasonable-permissions default
+  (shipped off), eight behavior specifications including the security ring
+  model, 160 passing tests, adopted docs (README, DEVELOPMENT, CHANGELOG,
+  AGENTS.md ring guidance), reviewed helper scripts, one open ECR for
+  TheKnowledge claude-wrangler awareness, and a clean dogfood install of
+  Claude Code 2.1.153 verified by --inspect (no issues) and --selftest
+  (13/13 PASS, npm audit clean). Required checks (black, ruff, compileall,
+  entropy_check, entropy_tripwire_verify, pytest) all pass. Requestor:
+  Matt Heck. Owner: AI (Claude) with operator review. Started:
+  2026-06-11T00:06:00-07:00. Completed: 2026-06-12T03:58:00-07:00.
+  Specs: docs/specifications/. Blockers: none.
+

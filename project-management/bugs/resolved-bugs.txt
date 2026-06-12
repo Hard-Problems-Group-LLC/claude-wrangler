@@ -1,0 +1,8 @@
+Resolved Bugs
+
+Record resolved bugs with newest entries at the top. Use the same
+asterisk-plus-blank-line formatting as the active bug files. Each entry must
+include the ISO 8601 timestamp for when the fix was recorded, a short symptom
+summary, `Root cause:` analysis, and `Resolution:` notes. Add commit or test
+references when they help trace the fix. Keep any detailed closure records
+aligned under `closed/`.

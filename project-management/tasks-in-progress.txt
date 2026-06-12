@@ -1,0 +1,5 @@
+Tasks in Progress
+
+Track tasks that are actively being implemented. Keep this file small and
+current. Use the same asterisk-plus-blank-line format as the backlog, with
+status notes, blockers, and ISO 8601 timestamps.

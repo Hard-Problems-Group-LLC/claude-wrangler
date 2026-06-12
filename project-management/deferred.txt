@@ -1,0 +1,12 @@
+Deferred Tasks
+
+Use this file for operator-directed deferrals. Move entries from backlog or
+in-progress lists without changing original task wording.
+
+Include:
+- reason for deferral,
+- timestamp,
+- quoted original task block:
+  - starts with `>>BEGIN>>`
+  - ends with `>>END>>`
+  - prefixes every original line (including blanks) with `> `.

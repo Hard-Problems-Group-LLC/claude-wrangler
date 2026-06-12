@@ -1,0 +1,17 @@
+AI-Human Requests
+=================
+
+Use this queue for non-blocking actions AI agents need humans to perform.
+Record each request with asterisk-plus-blank-line formatting, concise context,
+owner/requestor, and ISO 8601 timestamps.
+
+------------------------------------------------------------------------------
+
+Pending Requests
+----------------
+
+Active Requests
+---------------
+
+Completed Requests
+------------------

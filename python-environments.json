@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "bootstrap": {
+    "required_version": "3.9",
+    "base_version": "3.9.21",
+    "environment_name": "3.9.21"
+  },
+  "runtime": {
+    "required_version": "3.12",
+    "base_version": "3.12.12",
+    "environment_name": "3.12.12"
+  }
+}

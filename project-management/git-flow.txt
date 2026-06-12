@@ -1,0 +1,174 @@
+Git Flow Standard Operating Procedure
+=====================================
+
+Purpose
+-------
+Define branch naming, merge behavior, and day-to-day Git operating rules for
+this repository. This procedure applies to both human operators and AI agents.
+
+Branch Naming
+-------------
+Use these branch prefixes for all new work:
+- Proposals: `proposals/<name-of-proposal>`
+- Bug fixes: `bugfix/<bug-id>`
+- General backlog features: `feature/<descriptive-name>`
+
+Naming guidance:
+- Use lowercase and hyphen-separated tokens after the prefix.
+- Keep names short but specific.
+- Preserve bug IDs exactly for `bugfix/*` branches.
+- Avoid ad hoc prefixes unless explicitly approved by an operator.
+
+Lifecycle
+---------
+1. Start from current `trunk`.
+2. Create a branch with the required prefix.
+3. Implement work in small, coherent commits.
+4. Run required local checks before merging.
+5. Merge back to `trunk` after validation.
+6. Push updated `trunk`.
+
+Standard Merge Order
+--------------------
+When multiple branches are pending:
+1. Merge prerequisite proposals first when they define behavior needed by
+   downstream work.
+2. Merge bugfix branches before dependent features when bug fixes unblock
+   active work.
+3. Merge feature branches after relevant proposals and bugfixes land.
+4. Re-run checks after each conflict resolution and before final push.
+
+Conflict Resolution
+-------------------
+- Favor correctness and current project policy over preserving stale wording.
+- Keep accepted specification text aligned with implementation and tests.
+- Preserve completed-task history from both sides unless entries are truly
+  duplicative; if duplicates exist, consolidate without losing context.
+- Do not discard user-authored changes unless explicitly directed.
+
+Required Checks Before Merge Completion
+---------------------------------------
+Run all required checks via timeout wrapper:
+- `python TheKnowledge/scripts/run_tool_with_timeout.py black`
+- `python TheKnowledge/scripts/run_tool_with_timeout.py ruff`
+- `python TheKnowledge/scripts/run_tool_with_timeout.py compileall`
+- `python TheKnowledge/scripts/run_tool_with_timeout.py
+  entropy_check`
+- `python TheKnowledge/scripts/run_tool_with_timeout.py
+  entropy_tripwire_verify`
+- `python TheKnowledge/scripts/run_tool_with_timeout.py pytest`
+- Standardized push path:
+  - `python TheKnowledge/scripts/git_standard_commit_push.py -m
+    "<subject>"`
+  This command blocks push unless the cached quality gate passes, including
+  entropy tripwire verification. When
+  `project-management/state/pending-commit-changes.txt` is nonblank, the
+  command uses it as commit body text and clears the file after a successful
+  local commit.
+- `ACP` is accepted operator shorthand for "add, commit, push." Use the same
+  review-first, quality-gated workflow and split unrelated changes into
+  separate meaningful commits.
+- Standardized pull path:
+  - `python TheKnowledge/scripts/git_veteran_pull.py`
+  This command enforces a guarded fast-forward pull workflow.
+
+If known failures are already tracked and unchanged, document that explicitly
+in completion notes and merge summaries.
+
+Autonomous Operation Variance
+-----------------------------
+Default Git flow in many teams uses pull requests for branch integration.
+This repository currently permits an autonomous variance when the operator has
+explicitly authorized independent execution:
+- Proposal, bugfix, and feature branches may be merged directly into `trunk`
+  without opening individual pull requests.
+- The operator may still request pull requests for specific high-risk or
+  high-impact changes at any time.
+- Pull requests are expected to be used primarily for version-level reviews or
+  work that proves to require human review.
+
+This variance does not reduce testing or documentation requirements. All
+standard validation, traceability, and project-management updates remain
+mandatory.
+
+Operational Notes
+-----------------
+- During substantive AI-driven development work, prefix
+  intermediary status updates with an inline bracketed ISO 8601
+  timestamp including the timezone offset so workflow profiling
+  stays possible from the shared conversation.
+- Use those timestamps when work begins, before and after
+  long-running commands or waits, and at major phase boundaries.
+  Include elapsed durations when they are easy to compute.
+- Treat `collision resume` as a literal session-continuity directive. Do not
+  assume the newest SSH, `mosh`, terminal, or Codex session is the right one;
+  inspect candidate sessions for the current workspace when session data is
+  available, and preserve the phrase and its meaning in handoffs.
+- Before mutating outside the active project root, ask for explicit
+  cross-project confirmation in the current session. Name the active project
+  or path, the target project or path, and the intended change class. Do not
+  treat a URL, adjacent discussion, command escalation, or prior-session
+  approval as cross-project authorization.
+- Before any `git add`, list the files about to be staged and ask whether to
+  review them. Offer `1` review at least one file, `2` proceed without
+  review for this changeset, and `3` proceed and suppress review prompts for
+  the rest of the current session until resumed.
+- If review is requested, prefer changeset review in Meld when
+  available as the default visual review path.
+- Launch `meld .` from the repository or submodule root so Meld opens its
+  version-control view for the full working tree.
+- If Meld version-control view is unavailable or unsuitable, compare a
+  temporary clean snapshot directory against the working tree in Meld's
+  folder-comparison mode.
+- Otherwise offer file-by-file review in the conversation or abort the
+  staging step.
+- Never infer a Git author or committer email address from commit history,
+  hostnames, remote URLs, network overlays, or similar context.
+- Require a deliberate identity before commit. Prefer configured
+  `git config user.name` and `git config user.email`; explicit
+  `GIT_COMMITTER_*` and optional separate `GIT_AUTHOR_*` overrides are also
+  valid when set intentionally.
+- If a separate author identity is not configured, reuse the explicit
+  committer identity for author instead of inventing another address.
+- Run `git diff` before any `git add` and `git diff --cached` before any
+  commit. The standardized commit helper does both automatically.
+- Treat `project-management/state/pending-commit-changes.txt` as short-lived
+  commit-body input, not durable release history. Projects with durable
+  user-facing, operator-facing, or release-facing history needs should keep a
+  `CHANGELOG.md` and copy or summarize notable pending-queue entries there
+  before the queue is cleared by a successful commit.
+- Use the repository's configured SSH host alias for remote operations, as
+  documented in local operator notes.
+- Keep the managed git pre-commit hook installed; setup scripts maintain it
+  through `TheKnowledge/scripts/install_git_hooks.py`.
+- Keep local-only operator state and AI note files under `.local/`, and do
+  not stage or push them. The managed `.gitignore` block should already
+  ignore `.local/`, `.theknowledge-restricted-names.local`, and known local
+  Codex artifacts before those paths exist.
+- If the project is using the managed starter Python toolchain, rerun
+  `./install.sh` whenever `install.sh`, `bootstrap.sh`,
+  `scripts/install-stage-2.py`, `bootstrap-stage2.py`,
+  `python-environments.json`, `.python-version`, `set-context.sh`,
+  `set-context-bootstrap.sh`, `requirements-dev.txt`,
+  `scripts/dev_setup.py`, `scripts/python_environment_bootstrap.py`,
+  `tool_validation_profiles.json`, or
+  `scripts/tool_validation_profiles.py` changes, or when the local Black,
+  Ruff, or pytest install drifts from the pinned defaults.
+- When TheKnowledge is read-only in the consuming project and an upstream
+  request needs local staging first, record it under
+  `ECRs/TheKnowledge/open/` before carrying it into a writable TheKnowledge
+  checkout or the `Feedback` branch workflow. Move it to
+  `ECRs/TheKnowledge/in-progress/` during active upstream handling and to
+  `ECRs/TheKnowledge/closed/` once the upstream disposition is recorded.
+- When updating a TheKnowledge submodule inside a consuming project, prefer
+  `python TheKnowledge/scripts/update_theknowledge_submodule.py`
+  `--project-root . --knowledge-root TheKnowledge`. That helper
+  fetches and briefly reviews the incoming upstream `trunk` delta, adopts the
+  reviewed version, reconciles managed-file drift, and leaves a reviewable
+  parent-repo diff before commit.
+- When refreshing managed starter files manually after a submodule update,
+  include `--template .gitignore` so the managed ignore baseline stays in
+  sync with starter guidance.
+- Keep local working trees clean before broad integration work when practical.
+- Record significant merge operations and outcomes in project-management logs
+  when they affect backlog status, bug status, or delivery traceability.

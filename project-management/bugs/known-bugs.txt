@@ -1,0 +1,5 @@
+Known Bugs
+
+Ordered list of confirmed bugs awaiting work. Put highest-priority bug at the
+top. Use asterisk-plus-blank-line format, include concise context, owners, and
+ISO 8601 timestamps. Store any expanded per-bug notes under `open/`.

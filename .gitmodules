@@ -1,0 +1,3 @@
+[submodule "TheKnowledge"]
+	path = TheKnowledge
+	url = git@github.com:Hard-Problems-Group-LLC/TheKnowledge.git

@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# >>> THEKNOWLEDGE_MANAGED_IGNORES_START >>>
+# Local operator state, caches, and policy inputs managed by TheKnowledge.
+.cache/
+.local/
+.theknowledge-restricted-names.local
+
+# Local Codex package, home, wrapper, and sentinel artifacts managed by
+# codex-wrangler or repo-local Codex CLI setup.
+.codex-local/
+.codex-home/
+.codex
+bin/codex-local
+README-LOCAL-Start-Codex.md
+# <<< THEKNOWLEDGE_MANAGED_IGNORES_END <<<
+
+# BEGIN managed by claude-wrangler
+# Local Claude Code package, session state, wrapper, and sentinel
+# artifacts.
+.local/
+bin/claude-local
+README-LOCAL-Start-Claude.md
+# END managed by claude-wrangler

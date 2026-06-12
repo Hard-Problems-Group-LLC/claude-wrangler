@@ -1,0 +1,107 @@
+{
+  "schema_version": "1.0.0",
+  "runtime_policies": {
+    "bootstrap_python": {
+      "minimum_version": "3.9",
+      "environment_variables": [
+        "THEKNOWLEDGE_BOOTSTRAP_PYTHON"
+      ],
+      "preferred_executables": [
+        "python3.12",
+        "python3.11",
+        "python3.10",
+        "python3.9",
+        "python3",
+        "python"
+      ],
+      "required_modules": []
+    },
+    "steady_state_python_tools": {
+      "minimum_version": "3.12",
+      "environment_variables": [
+        "THEKNOWLEDGE_BLACK_PYTHON",
+        "THEKNOWLEDGE_PYTHON_TOOLS"
+      ],
+      "preferred_executables": [
+        ".venv/bin/python",
+        ".venv/Scripts/python.exe",
+        "python3.12",
+        "python",
+        "python3"
+      ],
+      "required_modules": [
+        "black"
+      ]
+    }
+  },
+  "tools": {
+    "black": {
+      "file_suffixes": [
+        ".ipynb",
+        ".py",
+        ".pyi"
+      ],
+      "default_roots": [
+        "src",
+        "tests",
+        "scripts",
+        "standards-and-practices/dev-utils",
+        "templates/scripts"
+      ],
+      "defense_in_depth_excluded_dirs": [
+        ".codex-home",
+        ".codex-local",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "project.egg-info"
+      ],
+      "profiles": [
+        {
+          "name": "starter_python",
+          "path_prefixes": [
+            "templates/scripts/"
+          ],
+          "extensions": [
+            ".py",
+            ".pyi"
+          ],
+          "target_version": "py39",
+          "runtime_policy": "steady_state_python_tools",
+          "allow_serial_fallback": true
+        },
+        {
+          "name": "repository_python",
+          "path_prefixes": [
+            "scripts/",
+            "src/",
+            "tests/",
+            "standards-and-practices/dev-utils/"
+          ],
+          "extensions": [
+            ".py",
+            ".pyi"
+          ],
+          "target_version": "py39",
+          "runtime_policy": "steady_state_python_tools",
+          "allow_serial_fallback": true
+        },
+        {
+          "name": "python_notebooks",
+          "path_prefixes": [],
+          "extensions": [
+            ".ipynb"
+          ],
+          "target_version": "py310",
+          "runtime_policy": "steady_state_python_tools",
+          "allow_serial_fallback": true,
+          "default_profile": true
+        }
+      ]
+    }
+  }
+}
