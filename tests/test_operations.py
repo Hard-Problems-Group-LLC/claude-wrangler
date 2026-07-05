@@ -359,6 +359,77 @@ def test_install_like_operation_repair_install_cleans_managed_npm_artifacts(
     assert called == {"npm_install": True, "verify": True}
 
 
+def test_install_like_operation_prunes_orphaned_npm_staging_dirs(
+    monkeypatch,
+    tmp_path,
+    config_factory,
+):
+    config = config_factory(tmp_path)
+    layout = config.layout
+    scope_dir = layout.local_node_modules_dir / "@anthropic-ai"
+    scope_dir.mkdir(parents=True)
+
+    # A real installed package plus the orphaned staging shadow that npm left
+    # behind after an interrupted run.
+    real_pkg = scope_dir / "claude-code-linux-arm64"
+    real_pkg.mkdir()
+    (real_pkg / "claude").write_text("binary", encoding="utf-8")
+    orphan_scoped = scope_dir / ".claude-code-linux-arm64-R6uF8y6e"
+    orphan_scoped.mkdir()
+    (orphan_scoped / "leftover").write_text("stale", encoding="utf-8")
+    orphan_top = layout.local_node_modules_dir / ".claude-code-R0j05alh"
+    orphan_top.mkdir()
+    (orphan_top / "leftover").write_text("stale", encoding="utf-8")
+
+    # Legitimate npm metadata that must never be pruned.
+    bin_dir = layout.local_node_modules_dir / ".bin"
+    bin_dir.mkdir()
+    lock_file = layout.local_node_modules_dir / ".package-lock.json"
+    lock_file.write_text("{}", encoding="utf-8")
+
+    called = {"npm_install": False, "verify": False}
+
+    monkeypatch.setattr(
+        "claude_wrangler.operations.detect_npm_binaries",
+        lambda: ("npm", "npx"),
+    )
+    monkeypatch.setattr(
+        "claude_wrangler.operations.ensure_command_exists",
+        lambda name: None,
+    )
+    monkeypatch.setattr(
+        "claude_wrangler.operations.resolve_install_version",
+        lambda config, npm_name, env=None, timeout_seconds=None: config,
+    )
+
+    def fake_run(
+        command,
+        cwd,
+        capture_output=False,
+        env=None,
+        timeout_seconds=None,
+    ):
+        called["npm_install"] = True
+        # Orphans are gone before npm runs, so the rename collision cannot recur.
+        assert not orphan_scoped.exists()
+        assert not orphan_top.exists()
+        # Real package and legitimate metadata are untouched.
+        assert real_pkg.exists()
+        assert bin_dir.exists()
+        assert lock_file.exists()
+
+    monkeypatch.setattr("claude_wrangler.operations.run_command", fake_run)
+    monkeypatch.setattr(
+        "claude_wrangler.operations.verify_local_claude_binary",
+        lambda _config: called.__setitem__("verify", True),
+    )
+
+    exit_code = install_like_operation(config)
+
+    assert exit_code == 0
+    assert called == {"npm_install": True, "verify": True}
+
+
 def test_gather_inspection_report_surfaces_warnings_and_metadata_mismatch(
     monkeypatch,
     tmp_path,

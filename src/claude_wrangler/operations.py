@@ -323,6 +323,56 @@ def remove_managed_install_file(config: Config, path: Path, label: str) -> bool:
     return True
 
 
+# npm replaces a package directory by first renaming the existing one to a
+# hidden ".<name>-<token>" staging directory, then swapping in the new tree.
+# An interrupted or crashed install leaves that staging directory behind, and
+# because npm recomputes the same staging name on the next attempt, every
+# retry then fails with "ENOTEMPTY: directory not empty, rename". These
+# orphans are pure npm scratch state -- never installed packages and never
+# project-local Claude session state under .local/claude/HOME -- so they are
+# safe to prune before a fresh install so an interrupted run self-heals.
+ORPHANED_NPM_STAGING_PATTERN = re.compile(r"^\..+-[A-Za-z0-9_]{6,}$")
+
+
+def _orphaned_npm_staging_dirs(node_modules_dir: Path) -> List[Path]:
+    """Return hidden npm rename-staging directories left by a broken install."""
+
+    if not node_modules_dir.is_dir():
+        return []
+    search_dirs = [node_modules_dir]
+    for entry in sorted(node_modules_dir.iterdir()):
+        if entry.name.startswith("@") and entry.is_dir() and not entry.is_symlink():
+            search_dirs.append(entry)
+    orphans: List[Path] = []
+    for search_dir in search_dirs:
+        for entry in sorted(search_dir.iterdir()):
+            if not entry.name.startswith("."):
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if ORPHANED_NPM_STAGING_PATTERN.match(entry.name):
+                orphans.append(entry)
+    return orphans
+
+
+def prune_orphaned_npm_staging_dirs(config: Config) -> None:
+    """Clear npm rename-staging leftovers so an interrupted install self-heals.
+
+    This removes only npm's transient ".<name>-<token>" scratch directories
+    inside the managed node_modules tree. It never removes installed packages
+    or any project-local Claude session state, so it is cheap and safe to run
+    before every managed install.
+    """
+
+    for orphan in _orphaned_npm_staging_dirs(config.layout.local_node_modules_dir):
+        remove_tree(
+            orphan,
+            label="orphaned npm staging directory",
+            project_root=config.project_root,
+            dry_run=config.dry_run,
+        )
+
+
 def repair_managed_npm_install(config: Config) -> None:
     """Remove managed npm install artifacts before a clean reinstall."""
 
@@ -419,6 +469,7 @@ def install_like_operation(config: Config) -> int:
     elif resolved_config.dry_run:
         if resolved_config.repair_install:
             repair_managed_npm_install(resolved_config)
+        prune_orphaned_npm_staging_dirs(resolved_config)
         eprint(
             "[claude-wrangler] Would set: NPM_CONFIG_CACHE={}".format(
                 npm_local_environment(resolved_config)["NPM_CONFIG_CACHE"]
@@ -434,6 +485,7 @@ def install_like_operation(config: Config) -> int:
     else:
         if resolved_config.repair_install:
             repair_managed_npm_install(resolved_config)
+        prune_orphaned_npm_staging_dirs(resolved_config)
         run_command(
             managed_npm_install_command(resolved_config, npm_name),
             cwd=str(resolved_config.project_root),

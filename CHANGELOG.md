@@ -35,5 +35,7 @@ where practical.
   claude-wrangler awareness in TheKnowledge's managed ignore baseline.
 
 ### Changed
+- Managed installs now prune npm's orphaned ".<name>-<token>" rename-staging directories from the local node_modules tree before running `npm install`, so an interrupted or crashed install self-heals instead of failing every retry with "ENOTEMPTY: directory not empty, rename". Only npm scratch state is removed; installed packages and project-local Claude session state are never touched.
+
 
 ### Fixed
