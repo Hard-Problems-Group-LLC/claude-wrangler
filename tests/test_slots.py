@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from claude_wrangler import slots as slots_module
 from claude_wrangler.models import ClaudeWranglerError
 from claude_wrangler.slots import (
     COMPLETION_RECORD_NAME,
@@ -916,7 +917,15 @@ def test_find_processes_under_sees_current_interpreter():
     processes = list_process_images()
     mine = [process for process in processes if process.pid == os.getpid()]
     if not mine or not os.path.isabs(mine[0].image):
-        pytest.skip("this platform does not report a full image path for us")
+        # Windows, Linux, and macOS (libproc) all report full image paths;
+        # only another system's ps fallback may not, so only it may skip.
+        if (
+            os.name == "nt"
+            or sys.platform in ("darwin",)
+            or (sys.platform.startswith("linux"))
+        ):
+            pytest.fail("no full image path for this process: {}".format(mine))
+        pytest.skip("this platform's ps does not report a full image path")
 
     image_dir = Path(mine[0].image).parent
     found = find_processes_under(image_dir)
@@ -959,8 +968,8 @@ def test_real_process_running_from_slot_blocks_displacement(tmp_path):
             found = find_processes_under(slot)
             if not found:
                 time.sleep(0.1)
-        if not found and sys.platform == "darwin":
-            pytest.skip("ps did not report a full path for the copied tool")
+        # macOS uses libproc, which reports the full image path, so a miss
+        # there is a detection failure, not a reason to skip.
         assert process.pid in [entry.pid for entry in found]
         assert find_processes_under(tmp_path / "wrangler" / "slots" / "a") == []
 
@@ -1038,3 +1047,441 @@ def test_stop_background_service_missing_binary_is_reported(tmp_path, capsys):
     assert result.returncode is None
     assert not result.ok
     assert "could not start" in capsys.readouterr().err
+
+
+# Verification stamp and exact slot layout ------------------------------------
+
+
+def test_promotion_stamps_the_host_binaries_it_promotes(tmp_path):
+    store = make_store(tmp_path)
+    slot = store.inactive_slot()
+    candidate, record = build_candidate(store, slot, "2.1.300")
+
+    store.promote(candidate, record, ensure_slot_free=no_op_free, stamp_keys=[PLATFORM])
+
+    assert store.stamp_problem(slot, PLATFORM) is None
+    stamp = slots_module.read_verification_stamp(store.slot_dir(slot))
+    assert stamp[PLATFORM]["size"] == binary_path(store, slot).stat().st_size
+
+
+def test_a_binary_replaced_after_verification_fails_the_stamp(tmp_path):
+    store = make_store(tmp_path)
+    slot = store.inactive_slot()
+    candidate, record = build_candidate(store, slot, "2.1.300")
+    store.promote(candidate, record, ensure_slot_free=no_op_free, stamp_keys=[PLATFORM])
+    binary = binary_path(store, slot)
+    same_size = b"x" * binary.stat().st_size
+    time.sleep(0.05)
+    # A clone or pull writes a new file: replace, as git does.
+    replacement = binary.with_name("incoming")
+    replacement.write_bytes(same_size)
+    os.replace(str(replacement), str(binary))
+
+    assert "changed after" in store.stamp_problem(slot, PLATFORM)
+    assert store.slot_problem(slot, PLATFORM) is None  # size-only check passes
+
+
+def test_stamp_keeps_another_operating_systems_entries(tmp_path):
+    store = make_store(tmp_path)
+    install(store, "2.1.300")
+    local = slots_module.local_os_family()
+    foreign = "darwin-arm64" if local != "darwin" else "win32-x64"
+    record = store.slot_record("a")
+    record.platforms[foreign] = dict(record.platforms[PLATFORM])
+    (store.slot_dir("a") / COMPLETION_RECORD_NAME).write_text(
+        record.to_json(), encoding="utf-8"
+    )
+    entries = {foreign: {"size": 1, "mtime_ns": 2}}
+    (store.slot_dir("a") / slots_module.VERIFICATION_STAMP_NAME).write_text(
+        json.dumps({"schema": 1, "binaries": entries}), encoding="utf-8"
+    )
+
+    store.write_stamp("a", store.binary_identities("a", [PLATFORM]))
+
+    stamp = slots_module.read_verification_stamp(store.slot_dir("a"))
+    assert stamp[foreign] == entries[foreign]
+    assert PLATFORM in stamp
+
+
+@pytest.mark.parametrize(
+    "extra, fragment",
+    [
+        ("{platform}/version.dll", "unexpected file"),
+        ("payload.exe", "unexpected file"),
+        ("{platform}/sub/", "unexpected directory"),
+        ("other-platform/", "unexpected directory"),
+    ],
+)
+def test_slot_layout_rejects_anything_beyond_the_expected_files(
+    tmp_path, extra, fragment
+):
+    store = make_store(tmp_path)
+    slot = install(store, "2.1.300")
+    directory = store.slot_dir(slot)
+    target = directory / extra.format(platform=PLATFORM)
+    if extra.endswith("/"):
+        target.mkdir(parents=True)
+    else:
+        target.write_bytes(b"MZ planted")
+
+    problem = slots_module.slot_layout_problem(directory, store.slot_record(slot))
+
+    assert problem is not None and fragment in problem
+
+
+def test_slot_layout_tolerates_finder_metadata_and_killed_writes(tmp_path):
+    store = make_store(tmp_path)
+    slot = install(store, "2.1.300")
+    directory = store.slot_dir(slot)
+    (directory / ".DS_Store").write_bytes(b"\0")
+    (directory / PLATFORM / ".DS_Store").write_bytes(b"\0")
+    (directory / ".{}.{}.tmp".format(".verified.json", "0" * 32)).write_bytes(b"{")
+
+    assert slots_module.slot_layout_problem(directory, store.slot_record(slot)) is None
+
+
+def test_slot_layout_rejects_a_link_inside_the_slot(tmp_path):
+    store = make_store(tmp_path)
+    slot = install(store, "2.1.300")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    make_dir_link(outside, store.slot_dir(slot) / "linked")
+
+    problem = slots_module.slot_layout_problem(
+        store.slot_dir(slot), store.slot_record(slot)
+    )
+
+    assert problem is not None and "link or junction" in problem
+
+
+# Process enumeration units ---------------------------------------------------
+
+
+def test_proc_process_images_reads_a_fake_proc_tree(tmp_path):
+    proc = tmp_path / "proc"
+    for name in ("1", "22", "33", "self", "abc"):
+        (proc / name).mkdir(parents=True)
+    slot_image = "/repo/.local/claude/wrangler/slots/a/linux-x64/claude (deleted)"
+    links = {
+        str(proc / "1" / "exe"): "/usr/lib/systemd/systemd",
+        str(proc / "22" / "exe"): slot_image,
+        str(proc / "self" / "exe"): "/usr/bin/python3",
+    }
+
+    def readlink(path: str) -> str:
+        """Answer like /proc: unreadable entries raise PermissionError."""
+
+        if path in links:
+            return links[path]
+        raise PermissionError(errno.EACCES, "denied", path)
+
+    found = slots_module._proc_process_images(proc, readlink=readlink)
+
+    assert sorted((item.pid, item.image) for item in found) == [
+        (1, "/usr/lib/systemd/systemd"),
+        (22, slot_image),
+    ]
+
+
+def test_proc_process_images_fails_closed_without_a_process_table(tmp_path):
+    with pytest.raises(slots_module.ProcessQueryError):
+        slots_module._proc_process_images(tmp_path / "missing")
+
+
+def completed_ps(stdout: bytes, returncode: int = 0, stderr: bytes = b""):
+    """Return a canned ``ps`` result."""
+
+    return subprocess.CompletedProcess(["ps"], returncode, stdout, stderr)
+
+
+def test_ps_process_images_parses_paths_with_spaces_and_short_names():
+    output = (
+        b"    1 /sbin/launchd\n"
+        b"  412 /Users/op/My Projects/repo/.local/claude/wrangler/slots/a/"
+        b"darwin-arm64/claude\n"
+        b"  500 (sshd)\n"
+        b"  501 -zsh\n"
+        b"garbage line\n"
+        b"\n"
+    )
+
+    found = slots_module._ps_process_images(runner=lambda: completed_ps(output))
+
+    assert [(item.pid, item.image) for item in found] == [
+        (1, "/sbin/launchd"),
+        (
+            412,
+            "/Users/op/My Projects/repo/.local/claude/wrangler/slots/a/"
+            "darwin-arm64/claude",
+        ),
+        (500, "(sshd)"),
+        (501, "-zsh"),
+    ]
+
+
+def test_ps_process_images_fails_closed_on_errors():
+    with pytest.raises(slots_module.ProcessQueryError, match="exited with 1"):
+        slots_module._ps_process_images(
+            runner=lambda: completed_ps(b"", 1, b"ps: bad option")
+        )
+
+    def broken():
+        """Fail like a missing ps."""
+
+        raise FileNotFoundError("ps")
+
+    with pytest.raises(slots_module.ProcessQueryError, match="Cannot run ps"):
+        slots_module._ps_process_images(runner=broken)
+
+
+class FakeLibproc:
+    """A stand-in for macOS libproc's proc_listallpids and proc_pidpath."""
+
+    def __init__(self, paths, listing_result=None):
+        """Serve ``paths`` (pid -> bytes, or None for an EPERM process)."""
+
+        self.paths = paths
+        self.listing_result = listing_result
+
+    def proc_listallpids(self, buffer, size):
+        """Return the pid count, filling ``buffer`` when given."""
+
+        import ctypes
+
+        if self.listing_result is not None:
+            return self.listing_result
+        pids = sorted(self.paths)
+        if buffer is None:
+            return len(pids)
+        capacity = size // ctypes.sizeof(ctypes.c_int)
+        for index, pid in enumerate(pids[:capacity]):
+            buffer[index] = pid
+        return min(len(pids), capacity)
+
+    def proc_pidpath(self, pid, buffer, size):
+        """Copy the vnode path into ``buffer``; 0 for a process we may not see."""
+
+        import ctypes
+
+        data = self.paths.get(pid)
+        if data is None:
+            return 0
+        ctypes.memmove(buffer, data, len(data))
+        return len(data)
+
+
+def test_darwin_process_images_use_proc_pidpath():
+    retired = b"/Volumes/Data/work/proj/.local/claude/wrangler/.retired/tx1/claude"
+    library = FakeLibproc({1: b"/sbin/launchd", 77: retired, 80: None})
+
+    found = slots_module._darwin_process_images(library)
+
+    assert [(item.pid, item.image) for item in found] == [
+        (1, "/sbin/launchd"),
+        (77, retired.decode("ascii")),
+    ]
+
+
+def test_darwin_process_images_fail_closed_when_the_list_fails():
+    with pytest.raises(slots_module.ProcessQueryError):
+        slots_module._darwin_process_images(FakeLibproc({}, listing_result=-1))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symbolic-link spelling")
+def test_processes_under_matches_an_argv0_spelled_through_a_symlink(tmp_path):
+    # ps reports argv[0], which the launcher spells through the logical
+    # (symlinked) checkout path; maintenance compares the resolved root.
+    physical = tmp_path / "physical"
+    slot = physical / "proj" / ".local" / "claude" / "wrangler" / "slots" / "a"
+    slot.mkdir(parents=True)
+    (slot / "claude").write_bytes(b"x")
+    logical = tmp_path / "logical"
+    os.symlink(str(physical), str(logical), target_is_directory=True)
+    image = logical / "proj" / ".local" / "claude" / "wrangler" / "slots" / "a"
+    output = "4242 {}/claude\n".format(image).encode("utf-8")
+
+    processes = slots_module._ps_process_images(runner=lambda: completed_ps(output))
+
+    assert [item.pid for item in processes_under(slot, processes)] == [4242]
+
+
+def windows_short_path(path: Path):
+    """Return the 8.3 spelling of an existing path, or None."""
+
+    from claude_wrangler.rendering import _windows_short_path
+
+    short = _windows_short_path(str(path))
+    if short is None or "~" not in short:
+        return None
+    return short
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 short names")
+def test_processes_under_expands_an_8_3_image_path(tmp_path):
+    root = tmp_path / "long-project-name" / ".local" / "claude" / "wrangler"
+    image = root / "slots" / "a" / "win32-x64" / "claude.exe"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"MZ")
+    short = windows_short_path(image)
+    if short is None:
+        pytest.skip("8.3 short names are disabled on this volume")
+
+    found = processes_under(root, [RunningProcess(7, short)])
+
+    assert [item.pid for item in found] == [7]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 short names")
+def test_a_slot_binary_started_through_its_short_path_is_in_use(tmp_path):
+    root = tmp_path / "long-project-name" / ".local" / "claude" / "wrangler"
+    command = long_running_copy(root / "slots" / "a" / "win32-x64")
+    short = windows_short_path(Path(command[0]))
+    if short is None:
+        pytest.skip("8.3 short names are disabled on this volume")
+    process = subprocess.Popen(
+        [short] + command[1:],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        found = []
+        while time.monotonic() < deadline and not found:
+            found = find_processes_under(root)
+            if not found:
+                time.sleep(0.1)
+        assert process.pid in [entry.pid for entry in found]
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS libproc")
+def test_macos_finds_a_process_after_its_directory_is_renamed(tmp_path):
+    slot = tmp_path / "wrangler" / "slots" / "a"
+    command = long_running_copy(slot / "tool")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        retired = tmp_path / "wrangler" / ".retired" / "tx1"
+        retired.parent.mkdir(parents=True)
+        time.sleep(0.5)
+        os.rename(str(slot), str(retired))
+        assert process.pid in [entry.pid for entry in find_processes_under(retired)]
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS libproc")
+def test_macos_finds_a_process_started_through_a_symlinked_checkout(tmp_path):
+    physical = tmp_path / "physical"
+    command = long_running_copy(physical / "slots" / "a")
+    logical = tmp_path / "logical"
+    os.symlink(str(physical), str(logical), target_is_directory=True)
+    started = str(logical / "slots" / "a" / Path(command[0]).name)
+    process = subprocess.Popen(
+        [started] + command[1:],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.5)
+        found = find_processes_under(Path(os.path.realpath(str(physical))))
+        assert process.pid in [entry.pid for entry in found]
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+
+# Maintenance lock errors and identity -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code", [errno.ENOLCK, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)]
+)
+def test_a_filesystem_without_locks_is_not_reported_as_contention(
+    tmp_path, monkeypatch, code
+):
+    store = make_store(tmp_path)
+
+    def unsupported(descriptor):
+        """Fail like flock on a filesystem without lock support."""
+
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(slots_module, "_lock_descriptor", unsupported)
+
+    with pytest.raises(MaintenanceLockError) as raised:
+        store.lock().acquire()
+
+    message = str(raised.value)
+    assert "already running" not in message
+    assert "errno {}".format(code) in message
+    assert "local filesystem" in message
+
+
+def test_contention_errno_is_still_reported_as_already_running(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+
+    def busy(descriptor):
+        """Fail like a lock another process holds."""
+
+        raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(slots_module, "_lock_descriptor", busy)
+
+    with pytest.raises(MaintenanceLockError, match="already running"):
+        store.lock().acquire()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX can unlink a held lock file")
+def test_acquire_refuses_a_lock_file_replaced_while_it_was_taken(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    real_lock = slots_module._lock_descriptor
+
+    def replaced(descriptor):
+        """Delete and recreate the path between open and lock, as a racing
+        uninstall followed by a new maintainer would."""
+
+        os.unlink(str(store.lock_path))
+        store.lock_path.write_bytes(b"")
+        real_lock(descriptor)
+
+    monkeypatch.setattr(slots_module, "_lock_descriptor", replaced)
+
+    with pytest.raises(MaintenanceLockError, match="replaced"):
+        store.lock().acquire()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX can unlink a held lock file")
+def test_release_with_delete_never_removes_another_maintainers_lock(tmp_path):
+    store = make_store(tmp_path)
+    first = store.lock()
+    first.acquire()
+    # Another maintainer's file now sits at the path (the first one's inode
+    # was deleted and recreated); deleting through the first lock must not
+    # remove it.
+    os.unlink(str(store.lock_path))
+    store.lock_path.write_bytes(b"")
+    first.release(delete=True)
+
+    assert store.lock_path.is_file()
+
+
+def test_release_with_delete_removes_the_held_lock_file(tmp_path):
+    store = make_store(tmp_path)
+    lock = store.lock()
+    lock.acquire()
+
+    lock.release(delete=True)
+
+    assert not store.lock_path.exists()
+    with store.lock():
+        pass

@@ -13,8 +13,9 @@ It implements the launch-time half of
 per-OS ring environment (``security_ring_model.md``), config-dir pinning,
 three-layer self-update suppression, the project settings scan, interception
 of ``update``/``upgrade``/``install``, caller ``--settings`` refusal, cheap
-A/B slot validation with launch-time fallback (``ab_runtime_slots.md``
-requirement 8), notify-only update checks
+A/B slot validation, including the verification stamp, with launch-time
+fallback (``ab_runtime_slots.md`` requirements 8 and 15), notify-only
+update checks
 (``native_runtime_distribution_and_verification.md`` requirement 12), the
 reasonable-permissions default, the warn-only Node.js parity check, the
 native-Windows sandbox warning, and process semantics.
@@ -52,13 +53,17 @@ LAUNCH_CONFIG_NAME = "launch.json"
 LAUNCH_CONFIG_SCHEMA = 1
 MAX_LAUNCH_CONFIG_BYTES = 1024 * 1024
 
-# Mirrors claude_wrangler.slots: SLOT_NAMES, POINTER_NAME, and
-# COMPLETION_RECORD_NAME, plus the slots/ directory under the runtime root.
+# Mirrors claude_wrangler.slots: SLOT_NAMES, POINTER_NAME,
+# COMPLETION_RECORD_NAME, and the verification stamp, plus the slots/
+# directory under the runtime root.
 SLOT_NAMES = ("a", "b")
 POINTER_NAME = "active-slot"
 COMPLETION_RECORD_NAME = ".complete.json"
+VERIFICATION_STAMP_NAME = ".verified.json"
+VERIFICATION_STAMP_SCHEMA = 1
 SLOTS_DIR_NAME = "slots"
 MAX_COMPLETION_RECORD_BYTES = 1024 * 1024
+MAX_VERIFICATION_STAMP_BYTES = 64 * 1024
 
 SHIM_DIR_NAME = "shim"
 FALLBACK_RECORD_NAME = "fallback.json"
@@ -768,6 +773,34 @@ def choose_repo_root(derived: str, environ: Mapping[str, str], os_name: str) -> 
     return cleaned if same else derived
 
 
+def long_path_spelling(path: str) -> str:
+    """Return an existing Windows path with its 8.3 short components expanded.
+
+    ``bin\\claude-local.cmd`` derives the repository root with ``%~f``,
+    which keeps a short spelling such as ``LONG-P~1`` when the shim was
+    started through one. A binary started by that spelling reports its
+    image the same way. Elsewhere, or when expansion fails, ``path`` is
+    returned unchanged.
+    """
+
+    if os.name != "nt" or "~" not in path:
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        function = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+        function.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        function.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = function(path, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return path
+    if not length or length >= len(buffer):
+        return path
+    return buffer.value
+
+
 def forward_slash_spelling(value: str) -> str:
     """Return a Windows path spelled the way Git Bash hands it to programs.
 
@@ -941,18 +974,30 @@ def ensure_session_directories(
 
     On Windows ring 1 also creates ``HOME\\AppData\\Roaming`` and
     ``HOME\\AppData\\Local``, because APPDATA and LOCALAPPDATA point
-    there and native programs expect both to exist.
+    there and native programs expect both to exist. A config dir or home
+    created here is private to the operator (mode 0700 on POSIX), because
+    it holds transcripts and credentials; existing directories are left as
+    they are (maintenance tightens them).
     """
 
-    targets = [paths.config_dir_fs]
+    # The config dir comes first so a home inside it never creates it with
+    # the default mode as an intermediate directory.
+    targets = [(paths.config_dir_fs, True)]
     if not shared_home:
-        targets.insert(0, paths.home_dir_fs)
+        targets.append((paths.home_dir_fs, True))
         if (os.name if os_name is None else os_name) == "nt":
-            targets.insert(1, os.path.join(paths.home_dir_fs, "AppData", "Roaming"))
-            targets.insert(2, os.path.join(paths.home_dir_fs, "AppData", "Local"))
-    for target in targets:
+            targets.append(
+                (os.path.join(paths.home_dir_fs, "AppData", "Roaming"), False)
+            )
+            targets.append((os.path.join(paths.home_dir_fs, "AppData", "Local"), False))
+    for target, private in targets:
         try:
-            os.makedirs(target, exist_ok=True)
+            # Windows is left to its inherited ACLs: Python 3.13+ turns mode
+            # 0700 into a restrictive ACL there, which earlier versions do not.
+            if private and os.name != "nt" and not os.path.isdir(target):
+                os.makedirs(target, mode=0o700, exist_ok=True)
+            else:
+                os.makedirs(target, exist_ok=True)
         except OSError as exc:
             raise LauncherError(
                 "cannot create managed directory {}: {}".format(target, exc)
@@ -1172,12 +1217,51 @@ def _slot_failure(name: str, reason: str, version: Optional[str] = None) -> Slot
     return SlotCheck(name, False, reason, version, None, None)
 
 
+def _binary_identity(status: os.stat_result) -> Dict[str, int]:
+    """Return a binary's identity as the verification stamp records it.
+
+    Mirrors ``claude_wrangler.slots.binary_identity``: size and modification
+    time in nanoseconds, plus the inode on POSIX.
+    """
+
+    identity = {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
+    if os.name != "nt":
+        identity["ino"] = int(status.st_ino)
+    return identity
+
+
+def _stamp_entry(slot_dir: str, platform_key: str) -> Optional[Dict[str, Any]]:
+    """Return the verification-stamp entry for one platform, or None."""
+
+    try:
+        raw = _read_limited(
+            os.path.join(slot_dir, VERIFICATION_STAMP_NAME),
+            MAX_VERIFICATION_STAMP_BYTES,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if type(payload.get("schema")) is not int or (
+        payload.get("schema") != VERIFICATION_STAMP_SCHEMA
+    ):
+        return None
+    binaries = payload.get("binaries")
+    entry = binaries.get(platform_key) if isinstance(binaries, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
 def check_slot(runtime_root_fs: str, name: str, platform_key: str) -> SlotCheck:
     """Validate one slot cheaply, without hashing the binary.
 
     The completion record must parse and name the slot, the platform entry
     must exist, and the binary must exist inside the runtime root with the
-    recorded size.
+    recorded size. The binary's identity (size, modification time, and on
+    POSIX the inode) must also equal the verification stamp maintenance
+    wrote right after it last verified the slot in full. A repository
+    cannot supply a matching stamp, because a clone or pull writes new
+    files, so a binary replaced after verification is refused.
     """
 
     slot_dir = os.path.join(runtime_root_fs, SLOTS_DIR_NAME, name)
@@ -1253,6 +1337,22 @@ def check_slot(runtime_root_fs: str, name: str, platform_key: str) -> SlotCheck:
         )
     if os.name != "nt" and not os.access(binary, os.X_OK):
         return _slot_failure(name, "binary is not executable", version)
+    stamp = _stamp_entry(slot_dir, platform_key)
+    if stamp is None:
+        return _slot_failure(
+            name,
+            "the binary has no verification stamp (claude-wrangler has not "
+            "verified this slot on this checkout)",
+            version,
+        )
+    if any(
+        stamp.get(field) != value for field, value in _binary_identity(status).items()
+    ):
+        return _slot_failure(
+            name,
+            "the binary changed after claude-wrangler last verified it",
+            version,
+        )
     return SlotCheck(name, True, "", version, binary, record)
 
 
@@ -2333,7 +2433,7 @@ def _launch(
         raise LauncherError(settings_refusal_message(paths, os_name), exit_code=2)
 
     if config.legacy_binary is not None:
-        selection = select_legacy_binary(repo_root, config)
+        selection = select_legacy_binary(long_path_spelling(repo_root), config)
         _emit(
             stderr,
             "{} {}".format(
@@ -2345,7 +2445,11 @@ def _launch(
         )
     else:
         key = platform_key or detect_host_platform_key()
-        selection = select_slot(paths.runtime_root_fs, key, config.wrangler_command)
+        # The binary is started by its long-name path, so maintenance's
+        # in-use check finds it even when the shim ran through an 8.3 path.
+        selection = select_slot(
+            long_path_spelling(paths.runtime_root_fs), key, config.wrangler_command
+        )
     if selection.fallback is not None:
         for line in fallback_warning_lines(selection, config.wrangler_command):
             _emit(stderr, "{} {}".format(MESSAGE_PREFIX, line))

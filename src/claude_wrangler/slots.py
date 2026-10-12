@@ -16,6 +16,7 @@ Layout under the runtime root (``.local/claude/wrangler`` by default)::
       <platform>/claude[.exe]
       manifest.json, manifest.json.sig, manifest.json.raw-sig.json
       .complete.json          completion record, written last
+      .verified.json          verification stamp (binary identity)
     .staging/<txid>/          candidate being prepared
     .retired/<txid>/          displaced slot awaiting deletion
 
@@ -23,6 +24,12 @@ The pointer is a regular file on every operating system, never a symbolic
 link, so one checkout behaves identically on Windows, macOS, Linux, and WSL.
 It is replaced only through a same-directory temporary file and
 ``os.replace``; that replacement is the promotion commit point.
+
+The verification stamp records each binary's size, modification time, and
+(on POSIX) inode at the moment maintenance last verified the slot in full.
+A repository cannot supply a matching stamp: a clone or pull writes new
+files with a fresh modification time and inode, so the launcher's cheap
+check refuses a binary that changed after verification.
 
 This module is standard-library-only and Python 3.9 compatible.
 """
@@ -32,6 +39,7 @@ from __future__ import annotations
 from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -70,6 +78,9 @@ SLOTS_DIR_NAME = "slots"
 STAGING_DIR_NAME = ".staging"
 RETIRED_DIR_NAME = ".retired"
 COMPLETION_RECORD_SCHEMA = 1
+# Mirrored by launcher_core.VERIFICATION_STAMP_NAME and _SCHEMA.
+VERIFICATION_STAMP_NAME = ".verified.json"
+VERIFICATION_STAMP_SCHEMA = 1
 
 # Retained signature evidence every promoted slot keeps for offline
 # re-verification (native_runtime_distribution_and_verification.md 11).
@@ -79,16 +90,38 @@ EVIDENCE_FILE_NAMES = (
     "manifest.json.sig",
     "manifest.json.raw-sig.json",
 )
+# Entry names tolerated anywhere in a slot by the exact-layout check:
+# Finder metadata cannot run code and appears when a folder is browsed.
+TOLERATED_SLOT_ENTRY_NAMES = (".DS_Store",)
 
 DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 30.0
 
 _POINTER_MAX_BYTES = 16
 _RECORD_MAX_BYTES = 1024 * 1024
+_STAMP_MAX_BYTES = 64 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
 # ASCII digits with ``fullmatch``: ``\d`` would accept other Unicode digits
 # and ``$`` a trailing newline, both of which distribution.py refuses.
 _VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 _SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+# The temporary sibling ``atomicio.atomic_write_bytes`` uses for the files
+# maintenance writes into a slot; a hard kill can leave one behind.
+_SLOT_TEMPORARY_RE = re.compile(
+    r"\.(?:\.complete\.json|\.verified\.json)\.[0-9a-f]{32}\.tmp"
+)
+# errno values a non-blocking lock attempt reports when another process
+# holds the lock (msvcrt reports EACCES or EDEADLOCK on Windows).
+_LOCK_CONTENTION_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EACCES", None),
+        getattr(errno, "EDEADLK", None),
+        getattr(errno, "EDEADLOCK", None),
+    )
+    if code is not None
+)
 
 # Windows reparse-point facts. A reparse tag with the name-surrogate bit set
 # (symbolic links, junctions, and similar) makes the entry an alias for
@@ -678,6 +711,152 @@ def _make_binaries_executable(directory: Path, record: CompletionRecord) -> None
             os.chmod(str(path), wanted)
 
 
+def local_os_family() -> str:
+    """Return this host's platform-key prefix: win32, darwin, or linux.
+
+    Maintenance stamps only binaries whose platform key starts with this
+    prefix, because only this operating system's launcher runs them and
+    another system (WSL sharing a Windows checkout) may see different
+    file identities for the same file.
+    """
+
+    if os.name == "nt":
+        return "win32"
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def binary_identity(status: os.stat_result) -> Dict[str, int]:
+    """Return the identity a verification stamp records for one binary.
+
+    Size and modification time in nanoseconds everywhere, plus the inode on
+    POSIX. Windows inode values differ between Python versions on ReFS, so
+    they are left out there; a checkout or pull still writes a new
+    modification time. Mirrored by ``launcher_core._binary_identity``.
+    """
+
+    identity = {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
+    if os.name != "nt":
+        identity["ino"] = int(status.st_ino)
+    return identity
+
+
+def _identity_mapping(value: Any) -> Optional[Dict[str, int]]:
+    """Return a stamp entry's integer fields, or None when malformed."""
+
+    if not isinstance(value, AbcMapping):
+        return None
+    result: Dict[str, int] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or isinstance(item, bool):
+            return None
+        if not isinstance(item, int):
+            return None
+        result[key] = item
+    if "size" not in result or "mtime_ns" not in result:
+        return None
+    return result
+
+
+def read_verification_stamp(directory: Path) -> Dict[str, Dict[str, int]]:
+    """Return a slot's stamp entries by platform key ({} when absent or bad).
+
+    The stamp is read without following links; a malformed stamp is
+    treated as absent, which makes the launcher refuse the slot until
+    maintenance verifies it again.
+    """
+
+    path, _reason = _contained_regular_file(directory, VERIFICATION_STAMP_NAME)
+    if path is None:
+        return {}
+    try:
+        if os.lstat(str(path)).st_size > _STAMP_MAX_BYTES:
+            return {}
+        payload = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(payload, AbcMapping):
+        return {}
+    if payload.get("schema") != VERIFICATION_STAMP_SCHEMA or isinstance(
+        payload.get("schema"), bool
+    ):
+        return {}
+    binaries = payload.get("binaries")
+    if not isinstance(binaries, AbcMapping):
+        return {}
+    entries: Dict[str, Dict[str, int]] = {}
+    for key, value in binaries.items():
+        identity = _identity_mapping(value)
+        if isinstance(key, str) and identity is not None:
+            entries[key] = identity
+    return entries
+
+
+def slot_layout_problem(directory: Path, record: CompletionRecord) -> Optional[str]:
+    """Return why a slot holds anything beyond its expected files, or None.
+
+    A slot may hold only its completion record, verification stamp, the
+    three retained-evidence files, and each recorded binary inside the
+    directories that lead to it. Anything else, including a link or
+    junction anywhere, fails: on Windows a DLL beside an executable is
+    loaded before the system copy, so an extra file can change what a
+    verified binary runs. ``.DS_Store`` and the temporary siblings a
+    killed atomic write leaves are tolerated.
+    """
+
+    top_level = {COMPLETION_RECORD_NAME, VERIFICATION_STAMP_NAME}
+    top_level.update(EVIDENCE_FILE_NAMES)
+    binaries = set()
+    directories = set()
+    for entry in record.platforms.values():
+        parts = tuple(PurePosixPath(entry["binary"]).parts)
+        binaries.add(parts)
+        for index in range(1, len(parts)):
+            directories.add(parts[:index])
+
+    def walk(current: Path, prefix: Tuple[str, ...]) -> Optional[str]:
+        """Check one directory level and recurse into expected directories."""
+
+        try:
+            with os.scandir(str(current)) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError as exc:
+            return "cannot list {}: {}".format(current, exc)
+        for item in entries:
+            relative = prefix + (item.name,)
+            shown = "/".join(relative)
+            try:
+                status = os.lstat(item.path)
+            except OSError as exc:
+                return "cannot inspect {}: {}".format(shown, exc)
+            if _status_is_link_like(status):
+                return "{} is a link or junction".format(shown)
+            if item.name in TOLERATED_SLOT_ENTRY_NAMES and stat.S_ISREG(status.st_mode):
+                continue
+            if stat.S_ISDIR(status.st_mode):
+                if relative not in directories:
+                    return "unexpected directory {}".format(shown)
+                problem = walk(Path(item.path), relative)
+                if problem is not None:
+                    return problem
+                continue
+            if not stat.S_ISREG(status.st_mode):
+                return "{} is not a regular file".format(shown)
+            if relative in binaries:
+                continue
+            if not prefix and (
+                item.name in top_level or _SLOT_TEMPORARY_RE.fullmatch(item.name)
+            ):
+                continue
+            return "unexpected file {}".format(shown)
+        return None
+
+    return walk(directory, ())
+
+
 def _open_for_flush(path: Path) -> int:
     """Open a file so ``os.fsync`` is permitted on this platform."""
 
@@ -924,6 +1103,100 @@ class RuntimeStore:
 
         return self.slot_problem(name, platform_key) is None
 
+    def binary_identities(
+        self, name: str, platform_keys: Iterable[str]
+    ) -> Dict[str, Dict[str, int]]:
+        """Return the current identity of each named platform's binary.
+
+        Raises ``SlotError`` when a slot has no valid record or a binary is
+        missing or reached through a link.
+        """
+
+        directory = self.slot_dir(name)
+        record = self.slot_record(name)
+        if record is None:
+            raise SlotError("slot {} has no valid completion record".format(name))
+        identities: Dict[str, Dict[str, int]] = {}
+        for key in platform_keys:
+            entry = record.platforms.get(key)
+            if entry is None:
+                raise SlotError("slot {} has no {} binary".format(name, key))
+            path, reason = _contained_regular_file(directory, entry["binary"])
+            if path is None:
+                raise SlotError("slot {} binary {}".format(name, reason))
+            identities[key] = binary_identity(os.lstat(str(path)))
+        return identities
+
+    def write_stamp(self, name: str, identities: Mapping[str, Dict[str, int]]) -> None:
+        """Record the identities of binaries maintenance just verified in full.
+
+        Entries for platforms of another operating system are kept from an
+        existing stamp so a checkout shared with WSL keeps both sides'
+        stamps; every other entry is replaced.
+        """
+
+        directory = self.slot_dir(name)
+        record = self.slot_record(name)
+        if record is None:
+            raise SlotError("slot {} has no valid completion record".format(name))
+        family = local_os_family()
+        entries = {
+            key: value
+            for key, value in read_verification_stamp(directory).items()
+            if key in record.platforms and key.split("-", 1)[0] != family
+        }
+        entries.update({key: dict(value) for key, value in identities.items()})
+        payload = {"schema": VERIFICATION_STAMP_SCHEMA, "binaries": entries}
+        atomic_write_text(
+            directory / VERIFICATION_STAMP_NAME,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        )
+
+    def remove_stamp(self, name: str) -> bool:
+        """Delete a slot's verification stamp so no launcher runs the slot.
+
+        Returns True when a stamp was removed. Failures are left to the
+        caller's next verification, which finds the slot unverified again.
+        """
+
+        path = self.slot_dir(name) / VERIFICATION_STAMP_NAME
+        if not _lexists(path):
+            return False
+        try:
+            status = os.lstat(str(path))
+            if _status_is_link_like(status):
+                _remove_link(path, status)
+            else:
+                _unlink_file(path)
+        except OSError:
+            return False
+        return True
+
+    def stamp_problem(self, name: str, platform_key: str) -> Optional[str]:
+        """Return why a binary does not match its stamp, or None when it does.
+
+        This is the launcher's stamp check (``launcher_core.check_slot``),
+        used by inspect and selftest.
+        """
+
+        directory = self.slot_dir(name)
+        record = self.slot_record(name)
+        if record is None or platform_key not in record.platforms:
+            return "slot {} has no {} binary".format(name, platform_key)
+        entry = read_verification_stamp(directory).get(platform_key)
+        if entry is None:
+            return "slot {} has no verification stamp for {}".format(name, platform_key)
+        try:
+            current = self.binary_identities(name, [platform_key])[platform_key]
+        except (OSError, SlotError) as exc:
+            return str(exc)
+        if any(entry.get(field) != value for field, value in current.items()):
+            return (
+                "slot {} {} binary changed after claude-wrangler last verified "
+                "it".format(name, platform_key)
+            )
+        return None
+
     def active_slot(self) -> Optional[str]:
         """Return the active slot, or ``None`` when no pointer exists yet.
 
@@ -1072,6 +1345,7 @@ class RuntimeStore:
         ensure_slot_free: Callable[[Path], None],
         allow_invalid_pointer: bool = False,
         verify_checksums: bool = True,
+        stamp_keys: Optional[Iterable[str]] = None,
     ) -> str:
         """Make a validated staging candidate the active slot.
 
@@ -1087,7 +1361,9 @@ class RuntimeStore:
            into the candidate, and flush it;
         4. move an occupied target slot to ``.retired/<txid>``;
         5. rename the candidate to ``slots/<slot>``;
-        6. re-check the moved record and binary sizes;
+        6. re-check the moved record and binary sizes, then write the
+           verification stamp for ``stamp_keys`` (by default every recorded
+           platform of this host's operating system);
         7. replace ``active-slot`` (the commit point).
 
         A failure before step 7 restores the retired slot, leaves the pointer
@@ -1105,6 +1381,12 @@ class RuntimeStore:
         record = record.validated()
         target_name = record.slot
         target = self.slot_dir(target_name)
+        family = local_os_family()
+        keys_to_stamp = (
+            sorted(key for key in record.platforms if key.split("-", 1)[0] == family)
+            if stamp_keys is None
+            else sorted(stamp_keys)
+        )
 
         try:
             current = self.read_pointer()
@@ -1172,6 +1454,11 @@ class RuntimeStore:
                         target_name, moved_problem
                     )
                 )
+            # The binaries were hashed while staged and nothing else writes
+            # under the lock, so their identity now is the verified one.
+            self.write_stamp(
+                target_name, self.binary_identities(target_name, keys_to_stamp)
+            )
             self._write_pointer(target_name)
         except BaseException as exc:
             if self._pointer_value_or_none() == target_name:
@@ -1258,10 +1545,13 @@ class MaintenanceLock:
     """Exclusive, non-blocking maintenance lock on ``<root>/.lock``.
 
     Uses ``msvcrt.locking`` on Windows and ``fcntl.flock`` elsewhere. The
-    lock file is created when absent and never deleted, so a waiting
-    maintainer can never lock a replaced inode. A second maintainer, in this
+    lock file is created when absent and deleted only by uninstall, through
+    ``release(delete=True)``. On POSIX ``acquire`` also proves that the path
+    still names the inode it locked, so a maintainer racing that deletion
+    never proceeds on an orphaned inode. A second maintainer, in this
     process or another, fails fast with ``MaintenanceLockError`` and changes
-    nothing. Launchers never take this lock.
+    nothing; a filesystem that cannot lock at all is reported as such.
+    Launchers never take this lock.
     """
 
     def __init__(self, root: Path, *, project_root: Optional[Path] = None) -> None:
@@ -1336,25 +1626,62 @@ class MaintenanceLock:
             raise
         except OSError as exc:
             os.close(descriptor)
+            if exc.errno not in _LOCK_CONTENTION_ERRNOS:
+                # ENOLCK, EINVAL, ENOTSUP and similar mean the filesystem
+                # cannot lock at all; waiting would never help.
+                raise MaintenanceLockError(
+                    "Cannot lock {} ({}): this filesystem does not support the "
+                    "file locks claude-wrangler needs. Keep the checkout on a "
+                    "local filesystem or a lock-capable mount.".format(
+                        self.path,
+                        "errno {} {}".format(
+                            exc.errno,
+                            exc.strerror or errno.errorcode.get(exc.errno, ""),
+                        ).strip(),
+                    )
+                ) from exc
             raise MaintenanceLockError(
                 "Another claude-wrangler maintenance operation is already running "
                 "for {} (lock: {}). Wait for it to finish, then retry.".format(
                     self.root, self.path
                 )
             ) from exc
+        if os.name != "nt" and not _descriptor_is_path(descriptor, self.path):
+            # Another maintainer's uninstall deleted the lock file between our
+            # open and lock; a lock on that orphaned inode excludes nobody.
+            _unlock_and_close(descriptor)
+            raise MaintenanceLockError(
+                "The maintenance lock {} was replaced while it was being taken; "
+                "another claude-wrangler run is changing this project. Retry once "
+                "it has finished.".format(self.path)
+            )
         self._descriptor = descriptor
 
-    def release(self) -> None:
-        """Release and close the lock; the lock file itself is kept."""
+    def release(self, *, delete: bool = False) -> None:
+        """Release and close the lock; with ``delete`` remove the lock file too.
+
+        Only uninstall deletes the lock file. On POSIX the file is unlinked
+        while the lock is still held, and only when the path still names
+        the locked inode, so a lock another maintainer holds is never
+        removed. Windows refuses to delete a file another process has open,
+        so there the file is deleted once, without retrying, after closing.
+        """
 
         descriptor = self._descriptor
         self._descriptor = None
         if descriptor is None:
             return
-        try:
-            _unlock_descriptor(descriptor)
-        finally:
-            os.close(descriptor)
+        if delete and os.name != "nt" and _descriptor_is_path(descriptor, self.path):
+            try:
+                os.unlink(str(self.path))
+            except OSError:
+                pass
+        _unlock_and_close(descriptor)
+        if delete and os.name == "nt":
+            try:
+                os.unlink(str(self.path))
+            except OSError:
+                pass
 
     def __enter__(self) -> "MaintenanceLock":
         """Acquire the lock for a ``with`` block."""
@@ -1396,6 +1723,29 @@ def _unlock_descriptor(descriptor: int) -> None:
         import fcntl
 
         fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _unlock_and_close(descriptor: int) -> None:
+    """Release the OS lock on a descriptor, then close it."""
+
+    try:
+        _unlock_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_is_path(descriptor: int, path: Path) -> bool:
+    """Return whether ``path`` still names the file open as ``descriptor``.
+
+    Used on POSIX only: st_dev and st_ino identify the locked inode.
+    """
+
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(str(path))
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
 
 
 _kernel32_bundle: Optional[Tuple[Any, Any]] = None
@@ -1520,13 +1870,18 @@ def _windows_process_images() -> List[RunningProcess]:
     return results
 
 
-def _proc_process_images(proc_root: Path = Path("/proc")) -> List[RunningProcess]:
+def _proc_process_images(
+    proc_root: Path = Path("/proc"),
+    readlink: Optional[Callable[[str], str]] = None,
+) -> List[RunningProcess]:
     """Enumerate process images through ``/proc/<pid>/exe`` on Linux.
 
     Without privileges, other users' processes cannot be read and are
-    skipped, as are processes that exit during the scan.
+    skipped, as are processes that exit during the scan. ``readlink`` is
+    injectable for tests.
     """
 
+    read = readlink or os.readlink
     try:
         names = os.listdir(str(proc_root))
     except OSError as exc:
@@ -1538,31 +1893,101 @@ def _proc_process_images(proc_root: Path = Path("/proc")) -> List[RunningProcess
         if not name.isdigit():
             continue
         try:
-            image = os.readlink(str(proc_root / name / "exe"))
+            image = read(str(proc_root / name / "exe"))
         except OSError:
             continue
         results.append(RunningProcess(int(name), image))
     return results
 
 
-def _ps_process_images() -> List[RunningProcess]:
-    """Enumerate process images with ``ps -axo pid=,comm=`` (macOS, BSD).
+# PROC_PIDPATHINFO_MAXSIZE from <sys/proc_info.h> (4 * MAXPATHLEN).
+_DARWIN_PIDPATH_MAX = 4 * 1024
 
-    On macOS ``comm`` is the executable path as passed to exec, which is a
-    full path for processes started through a launcher or ``PATH`` lookup.
-    A process exec'd through a relative path reports a relative name and
-    cannot be matched; that is a documented limitation of this fallback.
+
+def _load_libproc() -> Any:
+    """Return macOS ``libproc`` through ``ctypes`` with prototypes set."""
+
+    import ctypes
+
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    library.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    library.proc_listallpids.restype = ctypes.c_int
+    library.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    library.proc_pidpath.restype = ctypes.c_int
+    return library
+
+
+def _darwin_process_images(libproc: Any = None) -> List[RunningProcess]:
+    """Enumerate process images with ``proc_pidpath`` from macOS ``libproc``.
+
+    ``proc_pidpath`` returns the path of the executable's vnode as the
+    kernel sees it now: physical (no symbolic links) and current after a
+    directory rename, so a process running from a slot moved to
+    ``.retired/`` is still found there. Processes that cannot be queried
+    (other users' processes without privileges, or processes that just
+    exited) are skipped. A process list that cannot be read raises
+    ``ProcessQueryError`` so callers fail closed.
+    """
+
+    import ctypes
+
+    library = libproc if libproc is not None else _load_libproc()
+    count = library.proc_listallpids(None, 0)
+    if count <= 0:
+        raise ProcessQueryError(
+            "proc_listallpids failed: errno {}".format(ctypes.get_errno())
+        )
+    # Leave room for processes started between the two calls.
+    capacity = count + 256
+    pids = (ctypes.c_int * capacity)()
+    count = library.proc_listallpids(pids, ctypes.sizeof(pids))
+    if count <= 0:
+        raise ProcessQueryError(
+            "proc_listallpids failed: errno {}".format(ctypes.get_errno())
+        )
+    buffer = ctypes.create_string_buffer(_DARWIN_PIDPATH_MAX)
+    results: List[RunningProcess] = []
+    for pid in list(pids)[: min(count, capacity)]:
+        if pid <= 0:
+            continue
+        length = library.proc_pidpath(pid, buffer, _DARWIN_PIDPATH_MAX)
+        if length <= 0:
+            continue
+        results.append(RunningProcess(int(pid), os.fsdecode(buffer.raw[:length])))
+    return results
+
+
+def _run_ps() -> "subprocess.CompletedProcess[bytes]":
+    """Run ``ps -axo pid=,comm=`` with a timeout and captured output."""
+
+    return subprocess.run(
+        ["ps", "-axo", "pid=,comm="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+        check=False,
+    )
+
+
+def _ps_process_images(
+    runner: Optional[Callable[[], "subprocess.CompletedProcess[bytes]"]] = None,
+) -> List[RunningProcess]:
+    """Enumerate process images with ``ps -axo pid=,comm=`` (BSD fallback).
+
+    Used where neither ``/proc`` nor macOS ``libproc`` is available. On
+    macOS and the BSDs ``comm`` is the process's ``argv[0]`` as it was
+    exec'd (a login shell shows ``-zsh``) or, for another user's process,
+    only the short command name, so it is spelled however the caller
+    spelled it: a symbolic link, a relative path, or a bare name found on
+    ``PATH``. ``processes_under`` also compares the resolved spelling of
+    absolute images, but a relative or rewritten ``argv[0]`` cannot be
+    matched; that is the documented limitation of this fallback. ``runner``
+    is injectable for tests.
     """
 
     try:
-        completed = subprocess.run(
-            ["ps", "-axo", "pid=,comm="],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
-        )
+        completed = (runner or _run_ps)()
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProcessQueryError("Cannot run ps: {}".format(exc)) from exc
     if completed.returncode != 0:
@@ -1592,7 +2017,40 @@ def list_process_images() -> List[RunningProcess]:
         return _windows_process_images()
     if sys.platform.startswith("linux"):
         return _proc_process_images()
+    if sys.platform == "darwin":
+        try:
+            library = _load_libproc()
+        except (OSError, AttributeError):
+            # No usable libproc: fall back to ps rather than refusing every
+            # maintenance operation.
+            return _ps_process_images()
+        return _darwin_process_images(library)
     return _ps_process_images()
+
+
+def _windows_long_path(path: str) -> Optional[str]:
+    """Return the long-name spelling of an existing Windows path, or None.
+
+    A process started through an 8.3 short path (``LONG-P~1``) reports its
+    image in that form; ``GetLongPathNameW`` expands every component.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        function = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+        function.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        function.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = function(path, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not length or length >= len(buffer):
+        return None
+    return buffer.value
 
 
 def _comparable_path(path: str) -> str:
@@ -1606,6 +2064,35 @@ def _comparable_path(path: str) -> str:
         # toward reporting a process as in use, which is the safe side.
         normalized = normalized.casefold()
     return normalized
+
+
+def _image_spellings(image: str) -> List[str]:
+    """Return the comparable spellings of one process image path.
+
+    The image as reported always counts. On Windows an image with an 8.3
+    short component (``~``) is also expanded to its long name; elsewhere an
+    absolute image is also resolved, because ``ps`` reports ``argv[0]``,
+    which may run through a symbolic link that the resolved runtime root
+    never contains.
+    """
+
+    spellings = [_comparable_path(image)]
+    if os.name == "nt":
+        if "~" in image:
+            expanded = _windows_long_path(image)
+            if expanded is None:
+                try:
+                    expanded = os.path.realpath(image)
+                except (OSError, ValueError):
+                    expanded = None
+            if expanded:
+                spellings.append(_comparable_path(expanded))
+    elif image.startswith("/"):
+        try:
+            spellings.append(_comparable_path(os.path.realpath(image)))
+        except (OSError, ValueError):
+            pass
+    return spellings
 
 
 def _root_prefixes(root: Path) -> Tuple[str, ...]:
@@ -1629,7 +2116,9 @@ def processes_under(
     Paths are compared after normalization (case-insensitively on Windows
     and macOS) with a trailing-separator boundary, so ``slots/b`` never
     matches ``slots/bb``. Linux's `` (deleted)`` suffix is ignored so a
-    process running a replaced binary still counts.
+    process running a replaced binary still counts. Each image is compared
+    in every spelling ``_image_spellings`` gives (8.3 names expanded on
+    Windows, symbolic links resolved elsewhere).
     """
 
     prefixes = _root_prefixes(root)
@@ -1638,8 +2127,11 @@ def processes_under(
         image = process.image
         if image.endswith(" (deleted)"):
             image = image[: -len(" (deleted)")]
-        comparable = _comparable_path(image)
-        if any(comparable.startswith(prefix) for prefix in prefixes):
+        if any(
+            comparable.startswith(prefix)
+            for comparable in _image_spellings(image)
+            for prefix in prefixes
+        ):
             matches.append(process)
     return sorted(matches, key=lambda process: process.pid)
 
@@ -1648,9 +2140,10 @@ def find_processes_under(root: Path) -> List[RunningProcess]:
     """Return running processes whose executable image lives under ``root``.
 
     Windows uses Toolhelp32 and ``QueryFullProcessImageNameW`` through
-    ``ctypes``; Linux reads ``/proc/<pid>/exe``; macOS and other systems
-    parse ``ps -axo pid=,comm=``. See the enumerators for each platform's
-    blind spots.
+    ``ctypes``; Linux reads ``/proc/<pid>/exe``; macOS asks ``libproc``'s
+    ``proc_pidpath`` (falling back to ``ps -axo pid=,comm=`` only when
+    ``libproc`` cannot be loaded); other systems parse ``ps``. See the
+    enumerators for each platform's blind spots.
     """
 
     return processes_under(root, list_process_images())

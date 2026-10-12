@@ -9,7 +9,7 @@
 # it never runs sudo itself.
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 helper="${script_dir}/install_prerequisites.py"
 
 python_is_supported() {

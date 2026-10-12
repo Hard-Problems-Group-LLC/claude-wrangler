@@ -131,6 +131,14 @@ children, so the runtime root must never be placed there.
    "inherited from the caller" at ring 0), and the per-session escape
    hatches.
 
+Privacy of the session directories (POSIX): the pinned config dir and
+the redirected HOME hold transcripts, history, and credentials. The
+launcher creates either one that is missing with mode 0700, and every
+maintenance operation that publishes managed files tightens both to
+0700 when they are group- or world-accessible, saying so. A checkout in
+a shared location (for example `/srv`) therefore never exposes session
+state to other local users. On Windows the inherited ACLs apply.
+
 ## Validation
 
 - Launcher tests must cover the pinned config dir, the redirected home

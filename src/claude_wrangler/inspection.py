@@ -12,11 +12,13 @@ generated-file freshness, the config-dir `settings.json` suppression keys,
 the project's `.claude/settings*.json` warnings, and the launcher
 environment for each ring on this host's operating system.
 
-The self-test re-verifies both slots offline (signatures and SHA-256), runs
-the active binary's `--version` in a scratch environment, checks that
-`launch.py` is a byte-for-byte copy of the packaged launcher core, and
-fails when the project's `.claude/settings*.json` sets a suppression
-variable to a falsy value.
+The self-test re-verifies both slots offline (signatures, SHA-256, and each
+slot's exact file set), checks that the active binary still matches its
+verification stamp, runs the active binary's `--version` in a scratch
+environment, checks that `launch.py` is a byte-for-byte copy of the
+packaged launcher core, and fails when the project's
+`.claude/settings*.json` sets a suppression variable to a falsy value.
+Both report managed files that git tracks.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from .migration import (
     select_legacy_launch_binary,
 )
 from .models import ClaudeWranglerError, Config, SelfTestResult
-from .operations import describe_in_use
+from .operations import describe_in_use, tracked_state_paths
 from .rendering import build_known_versions, launcher_core_source
 from .runtime import utc_now_iso
 from .services import Services, default_services, scratch_environment
@@ -125,6 +127,11 @@ def _slot_report(
     directory = store.slot_dir(name)
     record = store.slot_record(name)
     problem = store.slot_problem(name, host_key) if directory.is_dir() else None
+    stamp_problem = (
+        store.stamp_problem(name, host_key)
+        if record is not None and host_key is not None
+        else None
+    )
     report: Dict[str, Any] = {
         "path": str(directory),
         "present": directory.is_dir(),
@@ -146,6 +153,10 @@ def _slot_report(
         ),
         "verified_at": record.verified_at if record else None,
         "promoted_by": record.promoted_by if record else None,
+        # The launcher runs a slot only while its binary matches the stamp
+        # maintenance wrote after the last full verification.
+        "stamp_ok": record is not None and host_key is not None and not stamp_problem,
+        "stamp_problem": stamp_problem,
         "evidence": {
             evidence: (directory / evidence).is_file()
             for evidence in EVIDENCE_FILE_NAMES
@@ -194,6 +205,7 @@ def gather_inspection_report(
         _legacy_launch(config, services, host_key) if migration_pending else None
     )
     generated = generated_file_status(config, legacy_launch)
+    tracked = services.tracked_files(config.project_root, tracked_state_paths(config))
     fallback = _read_json(layout.fallback_path)
     update_check = _read_json(layout.update_check_path)
     settings = settings_suppression_status(layout.config_settings_path)
@@ -279,6 +291,7 @@ def gather_inspection_report(
         },
         "state": {
             "git_repository": (config.project_root / ".git").exists(),
+            "tracked_managed_files": tracked,
             "metadata_exists": config.existing_metadata is not None,
             "metadata_parse_error": config.existing_metadata_error,
             "metadata": config.existing_metadata,
@@ -298,6 +311,12 @@ def gather_inspection_report(
     state = report["state"]
     if not state["git_repository"]:
         warnings.append("Target project root does not appear to be a git repository.")
+    if tracked:
+        issues.append(
+            "git tracks managed runtime, session-state, or launcher files ({}); a "
+            "clone or pull can replace them with unverified content. Remove them "
+            "from the repository.".format(", ".join(tracked[:10]))
+        )
     if config.existing_metadata_error:
         issues.append(
             "Managed metadata could not be used: {}".format(
@@ -331,6 +350,13 @@ def gather_inspection_report(
             issues.append(
                 "Active slot {} is not usable: {}".format(
                     pointer_value, slots[pointer_value]["problem"]
+                )
+            )
+        elif pointer_value is not None and slots[pointer_value]["stamp_problem"]:
+            issues.append(
+                "Active slot {} will not launch: {}. Run `{} --repair-install .` "
+                "to verify it again offline.".format(
+                    pointer_value, slots[pointer_value]["stamp_problem"], SCRIPT_NAME
                 )
             )
     if config.existing_metadata is not None and not store.root.is_dir():
@@ -499,6 +525,15 @@ def selftest_operation(config: Config, services: Optional[Services] = None) -> i
         )
 
     if active is not None and host_key is not None and verifications[active].ok:
+        stamp_problem = store.stamp_problem(active, host_key)
+        record(
+            "active_slot_stamp_matches",
+            stamp_problem is None,
+            stamp_problem
+            or "slot {} binary matches the stamp of its last full verification".format(
+                active
+            ),
+        )
         record_entry = verifications[active].record
         relative = record_entry.binary_relpath(host_key) if record_entry else None
         if relative is None or host_key not in (
@@ -559,6 +594,16 @@ def selftest_operation(config: Config, services: Optional[Services] = None) -> i
         "gitignore_managed_block_present",
         bool(report["state"]["gitignore_managed_block_present"]),
         "managed .gitignore block",
+    )
+    tracked = report["state"]["tracked_managed_files"]
+    record(
+        "managed_files_untracked",
+        not tracked,
+        (
+            "git tracks managed files: {}".format(", ".join(tracked[:10]))
+            if tracked
+            else "git tracks no runtime, session-state, or launcher files"
+        ),
     )
     settings = report["config_settings"]
     record(

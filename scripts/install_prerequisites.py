@@ -63,6 +63,15 @@ class OSInfo:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STEADY_STATE_RUNTIME_POLICY = "steady_state_python_tools"
 MINIMUM_PYTHON = (3, 9)
+# The development extras (pytest 9, black 26) need the steady-state floor.
+DEV_MINIMUM_PYTHON = (3, 12)
+# macOS ships these as xcode-select stubs that exist but only open the
+# Command Line Tools installer until the tools are installed.
+MACOS_CLT_STUBS = frozenset({"/usr/bin/git", "/usr/bin/python3"})
+MACOS_CLT_INSTALL_HINT = (
+    "run `xcode-select --install` to install the Command Line Tools"
+)
+PROBE_TIMEOUT_SECONDS = 15
 GIT_HOOK_INSTALLER = REPO_ROOT / "scripts" / "install_git_hooks.py"
 # Claude Code reads this variable when Git for Windows' bash is not where
 # it expects; an operator who set it has chosen a bash explicitly.
@@ -133,6 +142,23 @@ def path_is_file(path: str) -> bool:
     return os.path.isfile(path)
 
 
+def command_succeeds(command: Sequence[str]) -> bool:
+    """Return True when `command` runs and exits 0 within the probe timeout."""
+
+    try:
+        completed = subprocess.run(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 @dataclass
 class HostFacts:
     """Host facts that detection and policy read; tests inject fakes."""
@@ -146,6 +172,7 @@ class HostFacts:
     which: Callable[[str], Optional[str]] = shutil.which
     is_file: Callable[[str], bool] = path_is_file
     python_executable: str = sys.executable
+    succeeds: Callable[[Sequence[str]], bool] = command_succeeds
 
 
 @dataclass
@@ -374,6 +401,36 @@ def python_is_supported(version: Sequence[int]) -> bool:
     return tuple(version[:2]) >= MINIMUM_PYTHON
 
 
+def is_macos_clt_stub(facts: HostFacts, path: Optional[str]) -> bool:
+    """Return True when `path` is a macOS Command Line Tools stub, not a tool.
+
+    `/usr/bin/git` and `/usr/bin/python3` always exist on macOS; without
+    the Command Line Tools they only open the installer dialog and fail.
+    `xcode-select -p` exits 0 only when the tools are installed.
+    """
+
+    if facts.os_info.platform_id != "macos" or path not in MACOS_CLT_STUBS:
+        return False
+    return not facts.succeeds(["xcode-select", "-p"])
+
+
+def find_git(facts: HostFacts) -> Optional[str]:
+    """Return the usable git on PATH, or None (a macOS CLT stub is not one)."""
+
+    git = facts.which("git")
+    if git and is_macos_clt_stub(facts, git):
+        return None
+    return git
+
+
+def manual_install_hint(key: str, os_info: OSInfo) -> str:
+    """Return the manual-install hint for one prerequisite on this platform."""
+
+    if key == GIT and os_info.platform_id == "macos":
+        return "{}, or {}".format(MACOS_CLT_INSTALL_HINT, MANUAL_INSTALL_HINTS[key])
+    return MANUAL_INSTALL_HINTS[key]
+
+
 def detect_missing_prerequisites(
     facts: HostFacts, *, include_git_bash: bool, dev: bool
 ) -> List[str]:
@@ -384,7 +441,7 @@ def detect_missing_prerequisites(
         missing.append(PYTHON)
     elif dev and not facts.venv_available:
         missing.append(PYTHON_VENV)
-    if not facts.which("git"):
+    if not find_git(facts):
         missing.append(GIT)
     if (
         include_git_bash
@@ -419,12 +476,17 @@ def describe_prerequisites(
                 "missing" if PYTHON_VENV in missing else "found",
             )
         )
-    git = facts.which("git")
-    lines.append(
-        "{}: {}".format(
-            PREREQUISITE_LABELS[GIT], "found at {}".format(git) if git else "missing"
+    git = find_git(facts)
+    stub = facts.which("git") if git is None else None
+    if git:
+        git_status = "found at {}".format(git)
+    elif stub and is_macos_clt_stub(facts, stub):
+        git_status = "missing ({} is the Command Line Tools stub; {})".format(
+            stub, MACOS_CLT_INSTALL_HINT
         )
-    )
+    else:
+        git_status = "missing"
+    lines.append("{}: {}".format(PREREQUISITE_LABELS[GIT], git_status))
     if include_git_bash and is_windows(facts.os_info):
         bash = find_git_bash(facts.env, facts.which, facts.is_file)
         lines.append(
@@ -711,16 +773,49 @@ def install_git_hooks(python_executable: str, runner: CommandRunner) -> bool:
     return True
 
 
-def select_tool_python(python_override: Optional[str] = None) -> str:
+def _running_interpreter_for_dev(running_version: Sequence[int], reason: str) -> str:
+    """Return the running interpreter for `--dev`, or refuse one that is too old.
+
+    The development extras pin releases that need Python 3.12, so a 3.9
+    to 3.11 interpreter would only fail later inside pip's resolver.
+    """
+
+    if tuple(running_version[:2]) < DEV_MINIMUM_PYTHON:
+        raise RuntimeError(
+            "--dev needs Python {}.{}+ for the development tools, and no such "
+            "interpreter was found ({}); this interpreter is {}. Install Python "
+            "{}.{}+ or pass --python <path to it>.".format(
+                *DEV_MINIMUM_PYTHON,
+                reason,
+                ".".join(str(part) for part in running_version[:3]),
+                *DEV_MINIMUM_PYTHON,
+            )
+        )
+    return sys.executable
+
+
+def select_tool_python(
+    python_override: Optional[str] = None,
+    running_version: Optional[Sequence[int]] = None,
+) -> str:
     """Choose the interpreter that creates the development virtual environment.
 
     Prefers the steady-state tool runtime from tool_validation_profiles.json
     when that helper is importable. An explicit `--python` that fails the
-    policy is an error; otherwise the running interpreter is the fallback.
+    policy is an error; otherwise the running interpreter is the fallback,
+    but only when it meets the development floor (Python 3.12).
+    ``running_version`` defaults to this interpreter's version.
     """
 
+    version = tuple(
+        sys.version_info[:3] if running_version is None else running_version
+    )
     if resolve_runtime_policy_executable is None:
-        return python_override or sys.executable
+        if python_override:
+            return python_override
+        return _running_interpreter_for_dev(
+            version, "the tool-validation profile helper is unavailable"
+        )
     try:
         return resolve_runtime_policy_executable(
             REPO_ROOT,
@@ -731,12 +826,11 @@ def select_tool_python(python_override: Optional[str] = None) -> str:
     except (RuntimeError, ValueError, OSError) as error:
         if python_override:
             raise RuntimeError(str(error)) from error
+        selected = _running_interpreter_for_dev(version, str(error))
         print(
-            "install_prerequisites: note: {} Using {} instead.".format(
-                error, sys.executable
-            )
+            "install_prerequisites: note: {} Using {} instead.".format(error, selected)
         )
-        return sys.executable
+        return selected
 
 
 def validate_platform(os_info: OSInfo) -> None:
@@ -806,13 +900,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def report_unresolved(prerequisites: Iterable[str]) -> None:
+def report_unresolved(
+    prerequisites: Iterable[str], os_info: Optional[OSInfo] = None
+) -> None:
     """Print a manual-install hint for each prerequisite left missing."""
 
     for key in prerequisites:
         print(
             "install_prerequisites: {} is still missing: {}.".format(
-                PREREQUISITE_LABELS[key], MANUAL_INSTALL_HINTS[key]
+                PREREQUISITE_LABELS[key],
+                (
+                    manual_install_hint(key, os_info)
+                    if os_info
+                    else MANUAL_INSTALL_HINTS[key]
+                ),
             ),
             file=sys.stderr,
         )
@@ -870,7 +971,7 @@ def main(
             validate_platform(os_info)
         except RuntimeError as error:
             print(f"install_prerequisites: {error}", file=sys.stderr)
-            report_unresolved(missing)
+            report_unresolved(missing, os_info)
             return 1
         manager_names = (
             ("winget",) if is_windows(os_info) else ("apt-get", "dnf", "yum", "brew")
@@ -921,7 +1022,7 @@ def main(
             for command in plan.operator_commands:
                 print("  {}".format(format_command(command)))
         still_missing = plan.operator_prerequisites + plan.unresolved
-        report_unresolved(plan.unresolved)
+        report_unresolved(plan.unresolved, os_info)
 
     if args.dev:
         if PYTHON in still_missing or PYTHON_VENV in still_missing or PYTHON in missing:

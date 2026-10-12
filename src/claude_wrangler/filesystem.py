@@ -28,6 +28,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from . import atomicio
 from .constants import GITIGNORE_BEGIN, GITIGNORE_END, README_MARKER, SCRIPT_MARKER
+from .layout import real_path
 from .models import ClaudeWranglerError, Config
 from .runtime import eprint
 from .slots import is_link_like
@@ -296,28 +297,54 @@ def ensure_managed_directories(config: Config) -> None:
     redirected HOME directory is conditional on isolation mode. On Windows
     the redirected home also gets `AppData\\Roaming` and `AppData\\Local`,
     because the ring-1 launcher points APPDATA and LOCALAPPDATA there.
+
+    On POSIX the config dir and the redirected HOME hold transcripts,
+    history, and credentials, so they are made private to the operator
+    (mode 0700), including when they already exist with looser modes.
     """
 
-    targets = [config.layout.config_dir]
+    targets = [(config.layout.config_dir, True)]
     if not config.shared_home:
-        targets.append(config.layout.claude_home_dir)
+        targets.append((config.layout.claude_home_dir, True))
         if os.name == "nt":
-            targets.append(config.layout.claude_home_dir / "AppData" / "Roaming")
-            targets.append(config.layout.claude_home_dir / "AppData" / "Local")
+            targets.append(
+                (config.layout.claude_home_dir / "AppData" / "Roaming", False)
+            )
+            targets.append((config.layout.claude_home_dir / "AppData" / "Local", False))
     if config.layout.launcher_path.parent != config.project_root:
-        targets.append(config.layout.launcher_path.parent)
+        targets.append((config.layout.launcher_path.parent, False))
 
-    for target in targets:
+    for target, private in targets:
         if config.dry_run:
             eprint("[claude-wrangler] Would ensure directory exists: {}".format(target))
             continue
         target.mkdir(parents=True, exist_ok=True)
+        if private and os.name != "nt":
+            _make_private_directory(target)
+
+
+def _make_private_directory(path: Path) -> None:
+    """Restrict a managed directory to its owner (mode 0700) on POSIX."""
+
+    if is_link_like(path) or not path.is_dir():
+        return
+    mode = stat.S_IMODE(os.stat(str(path)).st_mode)
+    if mode & 0o077:
+        eprint(
+            "[claude-wrangler] Restricting {} to its owner (mode {:o} -> 700): it "
+            "holds Claude Code session state.".format(path, mode)
+        )
+        os.chmod(str(path), 0o700)
 
 
 def require_safe_managed_path(path: Path, project_root: Path, label: str) -> None:
-    """Refuse a path outside the project root, or the project root itself."""
+    """Refuse a path outside the project root, or the project root itself.
 
-    resolved = path.resolve()
+    Links are resolved with `layout.real_path`, which also follows a
+    dangling link (Python 3.9's `Path.resolve()` does not on Windows).
+    """
+
+    resolved = real_path(path)
     try:
         resolved.relative_to(project_root)
     except ValueError as exc:

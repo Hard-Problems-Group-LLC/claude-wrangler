@@ -17,7 +17,9 @@ the caller holds the maintenance lock, following `ab_runtime_slots.md`
    background service only with `--stop-background-sessions`.
 
 It also re-verifies a slot fully offline (signatures from the retained
-evidence plus every binary's SHA-256) for rollback, repair, and selftest.
+evidence, every binary's SHA-256, and the slot's exact file set) for
+rollback, repair, selftest, and every maintenance operation that keeps or
+reuses a slot, and records the verification stamp the launcher checks.
 """
 
 from __future__ import annotations
@@ -47,7 +49,9 @@ from .slots import (
     ProcessQueryError,
     RunningProcess,
     RuntimeStore,
+    SlotError,
     remove_tree,
+    slot_layout_problem,
 )
 
 
@@ -432,6 +436,20 @@ def require_idle(
     binary = next((item for item in stop_binaries if item.is_file()), None)
     if binary is None:
         raise RuntimeInUseError(path, running, purpose)
+    if config.dry_run:
+        # A dry run must not end the operator's background sessions; it
+        # only says what the real run would do.
+        eprint(
+            "[claude-wrangler] Would run {} daemon stop --any (dry run; not "
+            "stopped) because processes run from {}: {}".format(
+                binary,
+                path,
+                ", ".join(
+                    "pid {} ({})".format(item.pid, item.image) for item in running
+                ),
+            )
+        )
+        return
     eprint(
         "[claude-wrangler] Stopping this project's Claude Code background service "
         "(--stop-background-sessions): {} daemon stop --any".format(binary)
@@ -505,6 +523,7 @@ def promote_candidate(
             prepared.record,
             ensure_slot_free=ensure_slot_free,
             allow_invalid_pointer=allow_invalid_pointer,
+            stamp_keys=host_platform_keys(services, prepared.record.platforms),
         )
     except PointerCommittedError as exc:
         eprint("[claude-wrangler] Warning: {}".format(exc))
@@ -552,9 +571,11 @@ def verify_slot_offline(
     """Re-verify a slot from its retained evidence, without the network.
 
     Both manifest signatures are verified again against the compiled-in
-    keys, the manifest hash must equal the record's, and every recorded
-    binary's size and SHA-256 must equal the signed manifest's. With
-    ``platform_key`` the slot must also hold that platform.
+    keys, the manifest hash must equal the record's, every recorded
+    binary's size and SHA-256 must equal the signed manifest's, and the
+    slot must hold nothing beyond its expected files
+    (``slots.slot_layout_problem``). With ``platform_key`` the slot must
+    also hold that platform.
     """
 
     directory = store.slot_dir(name)
@@ -577,6 +598,10 @@ def verify_slot_offline(
         result.problem = "slot {} ({}) has no {} binary".format(
             name, record.version, platform_key
         )
+        return result
+    layout_problem = slot_layout_problem(directory, record)
+    if layout_problem is not None:
+        result.problem = "slot {}: {}".format(name, layout_problem)
         return result
     try:
         bundle = services.verify_evidence(directory, record.version)
@@ -616,6 +641,73 @@ def verify_slot_offline(
             return result
     result.ok = True
     result.problem = None
+    return result
+
+
+def host_platform_keys(services: Services, platforms: Iterable[str]) -> List[str]:
+    """Return the platform keys this host's launcher runs, for stamping.
+
+    Only binaries for the host's operating system are stamped; a checkout
+    shared with WSL keeps the other system's stamps (``slots.write_stamp``).
+    """
+
+    return sorted(key for key in platforms if key.split("-", 1)[0] == services.host_os)
+
+
+def verify_and_stamp(
+    store: RuntimeStore,
+    name: str,
+    services: Services,
+    platform_key: Optional[str] = None,
+    *,
+    dry_run: bool = False,
+) -> SlotVerification:
+    """Verify a slot fully offline and, when it passes, record its stamp.
+
+    Every maintenance operation that keeps, reuses, or activates a slot
+    calls this, so the launcher only ever runs a binary whose identity was
+    recorded right after a full verification. The binaries' identities are
+    read before hashing and compared afterwards; a binary that changed in
+    between fails. A slot whose integrity fails loses its whole stamp, so
+    no launcher on any system runs it until a later verification passes.
+    A slot that is intact but lacks ``platform_key`` (a checkout shared
+    with WSL before this system's binary was added) fails without losing
+    its stamp, so the other system keeps launching it. ``dry_run``
+    verifies without writing or removing a stamp.
+    """
+
+    keys: List[str] = []
+    before: Dict[str, Dict[str, int]] = {}
+    record = store.slot_record(name)
+    if record is not None:
+        keys = host_platform_keys(services, record.platforms)
+        try:
+            before = store.binary_identities(name, keys)
+        except (OSError, SlotError):
+            before = {}
+    result = verify_slot_offline(store, name, services)
+    if result.ok:
+        try:
+            after = store.binary_identities(name, keys)
+        except (OSError, SlotError) as exc:
+            after = {}
+            result.problem = "slot {} changed while it was verified: {}".format(
+                name, exc
+            )
+        if result.problem is None and after != before:
+            result.problem = "slot {} changed while it was verified".format(name)
+        if result.problem is None:
+            if not dry_run:
+                store.write_stamp(name, after)
+            if platform_key is not None and platform_key not in result.platforms:
+                result.ok = False
+                result.problem = "slot {} ({}) has no {} binary".format(
+                    name, result.version, platform_key
+                )
+            return result
+        result.ok = False
+    if result.present and not dry_run:
+        store.remove_stamp(name)
     return result
 
 

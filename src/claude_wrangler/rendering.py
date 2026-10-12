@@ -287,6 +287,22 @@ def _require_ascii(value: str, label: str) -> str:
     return value
 
 
+def _cmd_path_literal(value: str, label: str) -> str:
+    """Return a managed relative path ready to embed in a quoted cmd value.
+
+    cmd files are ASCII-only and a double quote would end the quoted value,
+    so both are refused; ``%`` is doubled so cmd does not expand it.
+    """
+
+    _require_ascii(value, label)
+    if '"' in value:
+        raise ClaudeWranglerError(
+            "{} {!r} contains a double quote, which the cmd launcher cannot "
+            "quote. Choose another path.".format(label, value)
+        )
+    return value.replace("%", "%%")
+
+
 def build_posix_shim(config: Config) -> str:
     """Return `bin/claude-local`: a POSIX `sh` shim (LF) for the launcher core.
 
@@ -297,6 +313,11 @@ def build_posix_shim(config: Config) -> str:
     native Windows Python, passes Windows-form paths (`cygpath -w`), and
     disables MSYS argument conversion so prompts such as `/review` reach
     Claude Code unchanged.
+
+    `cd` runs with `CDPATH` cleared and `--`, so an exported `CDPATH`
+    cannot redirect it or make it print the directory into the captured
+    root. Every managed path is embedded single-quoted, so a `$`, backtick,
+    or double quote in `--local-dir` stays literal.
     """
 
     layout = config.layout
@@ -315,12 +336,14 @@ def build_posix_shim(config: Config) -> str:
         "#",
         "# All launch logic (the security-ring environment, the pinned",
         "# CLAUDE_CONFIG_DIR, self-update suppression, and A/B slot selection)",
-        "# lives in {}. This shim only finds a Python 3.9+".format(core_relative),
-        "# interpreter. It never falls back to a global claude.",
-        'CLAUDE_LOCAL_REPO_ROOT=$(cd "$(dirname "$0")/{}" && pwd) || exit 1'.format(
-            ups
+        "# lives in the launcher core (launch.py under the runtime root). This",
+        "# shim only finds a Python 3.9+ interpreter. It never falls back to a",
+        "# global claude.",
+        "CLAUDE_LOCAL_REPO_ROOT=$(CDPATH= cd -- "
+        '"$(dirname -- "$0")/{}" && pwd) || exit 1'.format(ups),
+        'claude_local_core="$CLAUDE_LOCAL_REPO_ROOT"/{}'.format(
+            _sh_quote(core_relative)
         ),
-        'claude_local_core="$CLAUDE_LOCAL_REPO_ROOT/{}"'.format(core_relative),
         "claude_local_recorded={}".format(_sh_quote(recorded)),
         "claude_local_probe={}".format(_sh_quote(PYTHON_PROBE_POSIX)),
         'case "$(uname -s 2>/dev/null)" in',
@@ -367,16 +390,22 @@ def build_posix_shim(config: Config) -> str:
 def build_cmd_shim(config: Config) -> str:
     """Return `bin/claude-local.cmd`: an ASCII cmd shim (CRLF when written).
 
-    It has no labels, keeps `%*` on the final command line only, and exits
-    through `CMD_EXIT`, the TheKnowledge shim convention. The interpreter is
-    chosen by exit-code probe: the recorded interpreter, then `py -3`,
-    `python3`, and `python`.
+    It has no labels and keeps `%*` on the launch line only. The launch
+    line ends with `& call exit /b %%ERRORLEVEL%%`, so cmd leaves the batch
+    file on that same line: cmd re-reads a batch file by byte offset after
+    each command, and an upgrade that rewrites this file while a session
+    runs would otherwise make it resume in the middle of the new content.
+    `call` re-expands ERRORLEVEL after Claude Code exits, so its exit code
+    passes through. The `CMD_EXIT` lines after it (the TheKnowledge shim
+    convention) run only if an unbalanced quote in the arguments swallowed
+    that exit. The interpreter is chosen by exit-code probe: the recorded
+    interpreter, then `py -3`, `python3`, and `python`.
     """
 
     layout = config.layout
     depth = _parent_depth(layout.launcher_relative)
     ups = "\\".join([".."] * depth) or "."
-    core_relative = _require_ascii(
+    core_relative = _cmd_path_literal(
         ntpath.join(
             *PurePosixPath(layout.local_dir_relative).parts, LAUNCH_CORE_FILENAME
         ),
@@ -394,8 +423,9 @@ def build_cmd_shim(config: Config) -> str:
         ),
         "rem",
         "rem ASCII only, no labels, and the argument list appears only on the",
-        "rem final command line, so arguments such as x)y never break parsing.",
-        "rem The exit code passes through CMD_EXIT.",
+        "rem launch line, so arguments such as x)y never break parsing. That",
+        "rem line also exits, so a rewrite of this file during a session is",
+        "rem never read; the exit code passes through.",
         "setlocal EnableExtensions DisableDelayedExpansion",
         'set "NoDefaultCurrentDirectoryInExePath=1"',
         'for %%I in ("%~dp0{}") do set "CLAUDE_LOCAL_REPO_ROOT=%%~fI"'.format(ups),
@@ -433,7 +463,8 @@ def build_cmd_shim(config: Config) -> str:
             "  >&2 echo claude-local: Rerun {} to record one.".format(SCRIPT_NAME),
             "  exit /b 127",
             ")",
-            '"%CLAUDE_LOCAL_PY%" %CLAUDE_LOCAL_PYARG% -I "%CLAUDE_LOCAL_CORE%" %*',
+            '"%CLAUDE_LOCAL_PY%" %CLAUDE_LOCAL_PYARG% -I "%CLAUDE_LOCAL_CORE%" %* '
+            "& call exit /b %%ERRORLEVEL%%",
             'set "CMD_EXIT=%ERRORLEVEL%"',
             "exit /b %CMD_EXIT%",
             "",
@@ -468,7 +499,7 @@ def build_path_shim_sh(config: Config) -> str:
                 PATH_SHIM_NAME
             ),
             "# {}. Do not edit.".format(SCRIPT_NAME),
-            'exec "$(dirname "$0")/{}" "$@"'.format(relative),
+            'exec "$(dirname -- "$0")"/{} "$@"'.format(_sh_quote(relative)),
             "",
         ]
     )
@@ -482,7 +513,10 @@ def build_path_shim_cmd(config: Config) -> str:
     the exit code.
     """
 
-    relative = path_shim_relative_target(config.layout, cmd=True).replace("/", "\\")
+    relative = _cmd_path_literal(
+        path_shim_relative_target(config.layout, cmd=True).replace("/", "\\"),
+        "Launcher path",
+    )
     text = "\n".join(
         [
             "@echo off",
@@ -757,6 +791,12 @@ def build_install_summary(config: Config, runtime_summary: str) -> str:
             config.claude_version or "not installed"
         ),
         "Version source: {}".format(config.version_source),
+    ]
+    if config.release_base_url and config.release_base_url != DEFAULT_RELEASE_BASE_URL:
+        lines.append(
+            "Release host: {} (not the default)".format(config.release_base_url)
+        )
+    lines += [
         "Runtime: {}".format(runtime_summary),
         "Runtime root: {}".format(layout.local_dir),
         "Metadata file: {}".format(layout.metadata_path),

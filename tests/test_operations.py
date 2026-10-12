@@ -8,11 +8,16 @@ manifests, binary execution, the process table, and the clock are faked
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict
+import shutil
+import stat
+import subprocess
+import time
+from typing import Any, Dict, List
 
 import pytest
 
@@ -36,6 +41,7 @@ from claude_wrangler.transaction import RuntimeInUseError
 
 from native_fakes import (
     FakeProcessTable,
+    UnreachableSource,
     FakeRelease,
     FakeReleaseSource,
     Recorder,
@@ -43,6 +49,8 @@ from native_fakes import (
     host_key,
     make_config,
     make_services,
+    plant_unverified_slot,
+    standard_releases,
     standard_source,
 )
 
@@ -1405,3 +1413,577 @@ def test_uninstall_holds_the_lock_from_checks_through_session_state(
     }
     assert not (upgraded / ".local").exists()
     assert GITIGNORE_BEGIN not in (upgraded / ".gitignore").read_text("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Repository-supplied state is never trusted as verified (SEC-1, SEC-3, SEC-5)
+# ---------------------------------------------------------------------------
+
+
+def plant_slot(project: Path, *, version: str = "2.1.296", name: str = "a") -> Path:
+    """Plant a slot a hostile repository could supply (see native_fakes)."""
+
+    return plant_unverified_slot(runtime(project), version, KEY, name=name)
+
+
+def test_plain_install_never_reuses_a_planted_slot(project, capsys):
+    plant_slot(project)
+    source = UnreachableSource()
+
+    with pytest.raises(ClaudeWranglerError, match="network blocked"):
+        install(project, source)
+
+    err = capsys.readouterr().err
+    assert "already installed" not in err
+    assert "failed full offline verification" in err
+    assert source.contacted  # it had to fetch a verified release instead
+    for path in (
+        project / "bin" / "claude-local",
+        project / "bin" / "claude-local.cmd",
+        runtime(project) / "launch.py",
+        runtime(project) / "launch.json",
+    ):
+        assert not path.exists(), path
+
+
+def test_plain_install_replaces_a_planted_slot_with_a_verified_release(project):
+    plant_slot(project)
+    source = standard_source()
+
+    assert install(project, source) == 0
+
+    slots = store(project)
+    # The planted record's version is not trusted as the pin either: the
+    # stable channel decides, and the verified release goes into slot b.
+    assert slots.read_pointer() == "b"
+    assert slots.slot_record("b").version == "2.1.287"
+    assert metadata(project)["claude_version"] == "2.1.287"
+    assert len(source.downloads) == 1
+    # No launcher ever runs the planted slot: it carries no stamp.
+    check = launcher_core.check_slot(str(runtime(project)), "a", KEY)
+    assert not check.ok and "verification stamp" in check.reason
+
+
+def test_launcher_refuses_a_binary_swapped_after_verification(installed):
+    binary = slot_binary(installed, "a")
+    swapped = b"S" * binary.stat().st_size
+    time.sleep(0.05)
+    incoming = binary.with_name("incoming")
+    incoming.write_bytes(swapped)
+    os.replace(str(incoming), str(binary))
+    spawns: List[Any] = []
+    stderr = io.StringIO()
+
+    code = launcher_core.main(
+        ["--version"],
+        environ={"PATH": os.environ.get("PATH", "")},
+        core_path=str(runtime(installed) / "launch.py"),
+        exec_fn=lambda path, argv, env: spawns.append(argv),
+        spawn_fn=lambda argv, env: spawns.append(argv) or 0,
+        stderr=stderr,
+        stdout=io.StringIO(),
+        fetch_fn=lambda url, timeout: b"",
+        platform_key=KEY,
+        node_probe=lambda environ, os_name: (None, None),
+    )
+
+    assert code != 0
+    assert spawns == []
+    assert "changed after claude-wrangler last verified it" in stderr.getvalue()
+
+
+def test_repair_restamps_a_moved_checkout_without_downloading(installed):
+    # A copy of the checkout (backup restore) gets new file identities; the
+    # launcher refuses until repair re-verifies offline and stamps again.
+    stamp = runtime(installed) / "slots" / "a" / ".verified.json"
+    stamp.write_text(
+        json.dumps({"schema": 1, "binaries": {KEY: {"size": 1, "mtime_ns": 1}}}),
+        encoding="utf-8",
+    )
+    assert store(installed).stamp_problem("a", KEY) is not None
+    source = standard_source()
+
+    assert install(installed, source, "--repair-install") == 0
+
+    assert store(installed).stamp_problem("a", KEY) is None
+    assert source.downloads == []
+
+
+def git(project: Path, *args: str) -> str:
+    """Run git in the project and return its output."""
+
+    # core.longpaths lets Git for Windows write objects under a deep
+    # temporary directory; it changes nothing elsewhere.
+    completed = subprocess.run(
+        ["git", "-c", "core.longpaths=true", "-C", str(project)] + list(args),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    return completed.stdout.decode("utf-8", "replace")
+
+
+@pytest.fixture
+def git_project(tmp_path: Path) -> Path:
+    """Return a project that is a real git work tree."""
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    root = tmp_path / "repo"
+    root.mkdir()
+    git(root, "init", "-q")
+    return root
+
+
+def test_install_refuses_when_git_tracks_runtime_files(git_project, capsys):
+    from claude_wrangler.services import list_tracked_files
+
+    plant_slot(git_project)
+    git(git_project, "add", "-f", ".local/claude/wrangler/active-slot")
+    source = standard_source()
+    services = make_services(source, tracked_files=list_tracked_files)
+
+    with pytest.raises(ClaudeWranglerError) as raised:
+        install_like_operation(make_config(git_project), services)
+
+    assert ".local/claude/wrangler/active-slot" in str(raised.value)
+    assert "--allow-tracked-state" in str(raised.value)
+    assert source.downloads == [] and source.pointer_requests == []
+    assert not (git_project / "bin").exists()
+
+
+def test_allow_tracked_state_overrides_the_refusal(git_project, capsys):
+    from claude_wrangler.services import list_tracked_files
+
+    (git_project / ".local" / "claude").mkdir(parents=True)
+    (git_project / ".local" / "claude" / "settings.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    git(git_project, "add", "-f", ".local/claude/settings.json")
+    services = make_services(standard_source(), tracked_files=list_tracked_files)
+
+    code = install_like_operation(
+        make_config(git_project, "--allow-tracked-state"), services
+    )
+
+    assert code == 0
+    assert "continuing because --allow-tracked-state" in capsys.readouterr().err
+
+
+def test_tracked_metadata_pin_and_host_are_refused(git_project):
+    # A tracked metadata file could pin an old signed release or add its own
+    # release host without the operator choosing either.
+    from claude_wrangler.services import list_tracked_files
+
+    root = runtime(git_project)
+    root.mkdir(parents=True)
+    (root / METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "claude_version": "2.1.207",
+                "claude_channel": "stable",
+                "release_base_url": "https://mirror.example.invalid/releases",
+                "version_source": "default stable channel request",
+            }
+        ),
+        encoding="utf-8",
+    )
+    git(git_project, "add", "-f", ".local/claude/wrangler/.claude-wrangler.json")
+    source = standard_source()
+    services = make_services(source, tracked_files=list_tracked_files)
+
+    with pytest.raises(ClaudeWranglerError, match="git tracks"):
+        install_like_operation(make_config(git_project), services)
+
+    assert source.downloads == [] and source.manifest_requests == []
+
+
+def test_recorded_release_host_is_named_before_it_is_contacted(
+    project, monkeypatch, capsys
+):
+    mirror = "https://mirror.example.invalid/releases"
+    first = FakeReleaseSource(standard_releases(), {"stable": "2.1.287"}, mirror)
+    assert install(project, first, "--release-base-url", mirror) == 0
+    events: List[str] = []
+    source = FakeReleaseSource(
+        standard_releases(), {"stable": "2.1.287", "latest": "2.1.296"}, mirror
+    )
+    services = make_services(source)
+    original_factory = services.release_source
+
+    def recording_factory(*args):
+        """Record the first network-facing call."""
+
+        events.append("release source")
+        return original_factory(*args)
+
+    services.release_source = recording_factory
+    monkeypatch.setattr(
+        operations, "eprint", lambda message: events.append(str(message))
+    )
+    capsys.readouterr()
+
+    assert (
+        install_like_operation(make_config(project, "--channel", "latest"), services)
+        == 0
+    )
+
+    notice = next(
+        index
+        for index, event in enumerate(events)
+        if "records the release host" in event
+    )
+    assert mirror in events[notice]
+    assert notice < events.index("release source")
+    assert "Release host: {}".format(mirror) in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Exact slot contents (SEC-3)
+# ---------------------------------------------------------------------------
+
+
+def test_offline_verification_rejects_a_planted_dll_beside_the_binary(installed):
+    from claude_wrangler.transaction import verify_slot_offline
+
+    (slot_binary(installed, "a").parent / "version.dll").write_bytes(b"MZ planted")
+
+    result = verify_slot_offline(
+        store(installed), "a", make_services(standard_source()), KEY
+    )
+
+    assert not result.ok
+    assert "version.dll" in result.problem
+
+
+def test_selftest_fails_on_an_extra_file_in_a_slot(installed, capsys):
+    (runtime(installed) / "slots" / "a" / "extra.txt").write_text("x", "utf-8")
+
+    code = selftest_operation(
+        make_config(installed, "--selftest"), make_services(standard_source())
+    )
+
+    assert code == 1
+    assert "extra.txt" in capsys.readouterr().out
+
+
+def test_repair_replaces_a_slot_that_holds_extra_files(installed):
+    platform_dir = slot_binary(installed, "a").parent
+    (platform_dir / "version.dll").write_bytes(b"MZ planted")
+    source = standard_source()
+
+    assert install(installed, source, "--repair-install") == 0
+
+    slots = store(installed)
+    active = slots.read_pointer()
+    assert active == "b"
+    assert sorted(
+        path.name for path in slot_binary(installed, active).parent.iterdir()
+    ) == [BINARY]
+    # The slot that failed lost its stamp, so no launcher falls back to it.
+    assert slots.stamp_problem("a", KEY) is not None
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle (LC-1, LC-2, LC-4, LC-5, LC-6, LC-8, LC-11)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("operation", ["--uninstall", "--rollback"])
+def test_dry_run_never_stops_background_sessions(upgraded, operation, capsys):
+    processes = FakeProcessTable()
+    processes.run_from(slot_binary(upgraded, "a"))
+    recorder = Recorder()
+    services = make_services(standard_source(), recorder=recorder, processes=processes)
+    before = managed_files(upgraded)
+    config = make_config(upgraded, operation, "--dry-run", "--stop-background-sessions")
+
+    if operation == "--uninstall":
+        code = uninstall_operation(config, services)
+    else:
+        code = rollback_operation(config, services)
+
+    assert code == 0
+    assert recorder.stops == []
+    assert managed_files(upgraded) == before
+    assert "dry run; not stopped" in capsys.readouterr().err
+
+
+def test_partial_uninstall_keeps_the_ownership_proof_for_a_rerun(
+    installed, monkeypatch, capsys
+):
+    real_remove = operations.remove_runtime_tree
+
+    def locked_slots(path):
+        """Fail like Windows refusing to delete a binary something holds."""
+
+        if "slots" in Path(path).parts:
+            raise PermissionError(errno.EACCES, "in use", str(path))
+        return real_remove(path)
+
+    monkeypatch.setattr(operations, "remove_runtime_tree", locked_slots)
+
+    code = uninstall_operation(
+        make_config(installed, "--uninstall"), make_services(standard_source())
+    )
+
+    assert code == 1
+    assert (runtime(installed) / METADATA_FILENAME).is_file()
+    assert (runtime(installed) / "launch.py").is_file()
+    assert "rerunning --uninstall finishes" in capsys.readouterr().err
+
+    monkeypatch.setattr(operations, "remove_runtime_tree", real_remove)
+    code = uninstall_operation(
+        make_config(installed, "--uninstall"), make_services(standard_source())
+    )
+
+    assert code == 0
+    assert not (installed / ".local").exists()
+
+
+def test_non_ascii_local_dir_is_refused_before_any_download(project):
+    source = standard_source()
+
+    with pytest.raises(ClaudeWranglerError, match="not ASCII"):
+        install(project, source, "--local-dir", ".local/claude/wränglér")
+
+    assert source.downloads == [] and source.manifest_requests == []
+    assert source.pointer_requests == []
+    assert not (project / ".local" / "claude" / "wränglér").exists()
+
+
+def test_non_ascii_local_dir_state_can_always_be_uninstalled(project):
+    local_dir = ".local/claude/wränglér"
+    root = project / ".local" / "claude" / "wränglér"
+    (root / "slots" / "a").mkdir(parents=True)
+    (root / "active-slot").write_bytes(b"a\n")
+    (root / METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "claude_version": "2.1.287",
+                "paths": {"local_dir": local_dir},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = uninstall_operation(
+        make_config(project, "--uninstall", "--force", "--local-dir", local_dir),
+        make_services(standard_source()),
+    )
+
+    assert code == 0
+    assert not root.exists()
+
+
+def test_state_changed_while_it_was_read_reruns_from_a_fresh_read(
+    installed, monkeypatch
+):
+    from claude_wrangler import config as config_module
+    from claude_wrangler.config import config_from_args
+
+    real_read = config_module.read_existing_state
+    fired: List[bool] = []
+
+    def read_then_upgrade(layout):
+        """Return the state, then let another maintainer upgrade at once."""
+
+        state = real_read(layout)
+        if not fired:
+            fired.append(True)
+            assert (
+                install(
+                    installed, standard_source(), "--upgrade", "--channel", "latest"
+                )
+                == 0
+            )
+        return state
+
+    monkeypatch.setattr(config_module, "read_existing_state", read_then_upgrade)
+
+    with pytest.raises(operations.ManagedStateChangedError):
+        config_from_args(parse_args([str(installed)]))
+
+    assert metadata(installed)["claude_version"] == "2.1.296"
+    assert store(installed).read_pointer() == "b"
+
+
+def test_interrupted_publish_does_not_download_the_pinned_release_again(
+    installed, monkeypatch, capsys
+):
+    real_write = operations.write_metadata
+    failures: List[bool] = []
+
+    def full_disk_once(*args, **kwargs):
+        """Fail the first metadata write like a full disk."""
+
+        if not failures:
+            failures.append(True)
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(operations, "write_metadata", full_disk_once)
+    upgrade_source = standard_source()
+    with pytest.raises(ClaudeWranglerError, match="Rerun the same command"):
+        install(installed, upgrade_source, "--upgrade", "--channel", "latest")
+    assert store(installed).read_pointer() == "b"
+    assert metadata(installed)["claude_version"] == "2.1.287"
+
+    source = standard_source()
+    assert install(installed, source) == 0
+
+    assert source.downloads == []
+    assert store(installed).read_pointer() == "a"
+    assert metadata(installed)["claude_version"] == "2.1.287"
+    assert "made it active without downloading" in capsys.readouterr().err
+
+
+def test_symlinked_config_settings_is_refused_before_any_change(project, tmp_path):
+    shared = tmp_path / "shared-settings.json"
+    shared.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    link = project / ".local" / "claude" / "settings.json"
+    link.parent.mkdir(parents=True)
+    try:
+        os.symlink(str(shared), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not permitted on this host")
+    source = standard_source()
+
+    with pytest.raises(SettingsFileError, match="symbolic link"):
+        install(project, source)
+
+    assert source.downloads == [] and source.pointer_requests == []
+    assert not runtime(project).exists()
+    assert json.loads(shared.read_text("utf-8")) == {"theme": "dark"}
+
+
+def test_symlinked_config_settings_that_already_has_the_keys_is_accepted(
+    project, tmp_path
+):
+    shared = tmp_path / "shared-settings.json"
+    shared.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "DISABLE_UPDATES": "1",
+                    "DISABLE_AUTOUPDATER": "1",
+                    "DISABLE_INSTALLATION_CHECKS": "1",
+                },
+                "disableDeepLinkRegistration": "disable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    link = project / ".local" / "claude" / "settings.json"
+    link.parent.mkdir(parents=True)
+    try:
+        os.symlink(str(shared), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not permitted on this host")
+
+    assert install(project, standard_source()) == 0
+    assert link.is_symlink()
+
+
+def test_failed_uninstall_lock_never_touches_another_maintainers_lock(
+    project, monkeypatch
+):
+    # The runtime root does not exist yet (an npm-era layout has none), so
+    # uninstall would create it; another maintainer creates it and takes the
+    # lock first.
+    from claude_wrangler import slots as slots_module
+    from claude_wrangler.slots import MaintenanceLockError
+
+    legacy = project / ".local" / "claude" / "npm"
+    legacy.mkdir(parents=True)
+    (legacy / "package.json").write_text(
+        json.dumps({"name": "claude-local-managed-install"}), encoding="utf-8"
+    )
+    other = store(project).lock()
+    real_acquire = slots_module.MaintenanceLock.acquire
+    unlinked: List[str] = []
+    real_unlink = Path.unlink
+
+    def acquire(self):
+        """Let the other maintainer win the race, then try ours."""
+
+        if self is not other and not other.held:
+            real_acquire(other)
+        return real_acquire(self)
+
+    def unlink(self, *args, **kwargs):
+        """Record every Path.unlink."""
+
+        unlinked.append(str(self))
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(slots_module.MaintenanceLock, "acquire", acquire)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    try:
+        with pytest.raises(MaintenanceLockError):
+            uninstall_operation(
+                make_config(project, "--uninstall", "--force"),
+                make_services(standard_source()),
+            )
+        assert other.held
+        assert other.path.is_file()
+        assert str(other.path) not in unlinked
+    finally:
+        other.release()
+
+
+def test_inspect_and_selftest_report_a_missing_stamp_and_tracked_files(
+    installed, capsys
+):
+    (runtime(installed) / "slots" / "a" / ".verified.json").unlink()
+    services = make_services(
+        standard_source(),
+        tracked_files=lambda root, paths: [".local/claude/settings.json"],
+    )
+
+    report = gather_inspection_report(make_config(installed, "--inspect"), services)
+
+    assert report["runtime"]["slots"]["a"]["stamp_ok"] is False
+    assert any("will not launch" in issue for issue in report["issues"])
+    assert report["state"]["tracked_managed_files"] == [".local/claude/settings.json"]
+    assert any("git tracks" in issue for issue in report["issues"])
+
+    code = selftest_operation(make_config(installed, "--selftest"), services)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[FAIL] active_slot_stamp_matches" in out
+    assert "[FAIL] managed_files_untracked" in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_install_makes_the_session_directories_private(project):
+    config_dir = project / ".local" / "claude"
+    (config_dir / "HOME").mkdir(parents=True)
+    os.chmod(str(config_dir), 0o755)
+    os.chmod(str(config_dir / "HOME"), 0o755)
+
+    assert install(project, standard_source()) == 0
+
+    for path in (config_dir, config_dir / "HOME"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700, path
+
+
+def test_a_slot_lacking_this_hosts_platform_keeps_its_stamp(installed):
+    # A checkout shared with WSL: the other system's maintenance finds the
+    # slot intact but without its own platform. It must not un-stamp the
+    # slot this system launches.
+    from claude_wrangler.transaction import verify_and_stamp
+
+    foreign = "darwin-arm64" if not KEY.startswith("darwin") else "linux-x64"
+
+    result = verify_and_stamp(
+        store(installed), "a", make_services(standard_source()), foreign
+    )
+
+    assert not result.ok
+    assert "no {} binary".format(foreign) in result.problem
+    assert store(installed).stamp_problem("a", KEY) is None

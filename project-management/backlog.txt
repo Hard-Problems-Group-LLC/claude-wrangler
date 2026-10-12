@@ -113,3 +113,95 @@ the background service's executable-path fallback and
 subcommand interception, and the real `install.cmd` flow in a fresh
 profile. Blockers: the operator must enable the Windows Sandbox optional
 feature and reboot (`ai-human-requests.txt`, 2026-10-12T01:00:00-07:00).
+
+*
+
+`install.sh` aborts on stock macOS bash 3.2 (review POSIX-2, added
+2026-10-12T05:40:00-07:00). With no arguments, `local
+stage_2_args=("$@")` and the later `"${stage_2_args[@]}"` expansion
+fail under `set -u` in bash before 4.4 ("unbound variable"), so the
+documented `./install.sh` Quick Start stops before stage 2 on a default
+Mac; passing any argument, or a newer bash first on `PATH`, works
+around it. `install.sh` is TheKnowledge-managed and must not be edited
+or refreshed from this Windows checkout, so carry the fix upstream with
+the FieldManual items above: exec with `"$@"` directly (main never
+shifts) or use `${stage_2_args[@]+"${stage_2_args[@]}"}`, apply
+`CDPATH= cd --` to the managed root scripts' `cd "$(dirname ...)"`
+lines, and add a macOS CI step that runs `/bin/bash install.sh` with no
+arguments against a stub stage 2. Blockers: FieldManual availability.
+
+*
+
+Correct the cross-platform CI proposal draft (review CI-1, added
+2026-10-12T05:40:00-07:00). In
+`proposals/under-review/github-actions-cross-platform-ci.md` the prose
+promises a Python 3.9 job for the launcher core and verifier, but the
+YAML only runs `python -m compileall` on `scripts` and `signing.py`.
+Before approval: run the full suite on Python 3.9 on ubuntu-latest and
+on macOS (3.9 mirrors Apple's 3.9.6); run every job through
+`python scripts/run_tests_isolated.py -q --timeout 180` rather than bare
+`pytest`; add an Alpine (musl) container leg and an ubuntu arm64 leg;
+lint the workflow with actionlint; and make the prose and the YAML
+agree. On this Windows host the full suite now passes on CPython 3.9.13
+with short temporary paths. Blockers: operator approval of the proposal.
+
+*
+
+Validate the new macOS and POSIX code paths on real hosts (review
+POSIX-1, POSIX-4, POSIX-6, POSIX-7, LC-11, added
+2026-10-12T05:40:00-07:00). Not yet run outside Windows: in-use
+detection through `libproc`'s `proc_pidpath` (including a slot renamed
+into `.retired/` and a checkout reached through a symbolic link; the
+darwin-only tests in `tests/test_slots.py` now fail instead of
+skipping), the POSIX inode in the verification stamp on APFS, ext4, and
+WSL drvfs, the `flock` errno classification on NFS without `lockd`, the
+POSIX lock-identity checks, the PATH-shim execute-bit repair, and mode
+0700 on the config dir and redirected home. Extend the macOS port
+validation entry above with these. Blockers: a macOS host or CI runner.
+
+*
+
+Measure the DLL-planting exposure of the real Windows binary (review
+SEC-3, added 2026-10-12T05:40:00-07:00). Full verification now rejects
+any extra file in a slot, but the launcher's per-launch check still
+looks only at the binary and its stamp. Inspect the shipped
+`claude.exe` import table for non-KnownDLL imports and whether it sets
+`DependentLoadFlags`; if it can load a planted DLL from its directory,
+consider a cheap launcher-side listing of the platform directory.
+Blockers: inspecting the real binary is operator-run (safety rules).
+
+*
+
+Strengthen the Windows verification stamp (review SEC-1 follow-up,
+added 2026-10-12T05:40:00-07:00). On Windows the stamp records size and
+modification time only, because `st_ino` differs between Python
+versions on ReFS (Dev Drive). An archive that preserves modification
+times could therefore satisfy it; a git clone or pull cannot. Evaluate
+a version-independent file identity (for example the 128-bit
+`FILE_ID_INFO` read through `ctypes` on both sides) and whether the
+stamp should move outside any path a repository can supply. Also
+evaluate whether the WSL side should stamp a Windows-carried Linux
+binary automatically instead of needing one plain install there.
+Blockers: none.
+
+*
+
+Offline legacy-mode binary vetting (review SEC-2 follow-up, added
+2026-10-12T05:40:00-07:00). `--update` now hashes the npm-era binary
+against the signed manifest, but the offline toggles and
+`--skip-install` still run a structurally checked binary in a checkout
+that already has a claude-wrangler launcher, so a hostile archive (not
+a git clone) that also ships a launcher could reach it. Consider
+recording the identity of the binary `--update` verified and requiring
+it offline. Blockers: none.
+
+*
+
+Roll forward an interrupted publish (review LC-6 follow-up, added
+2026-10-12T05:40:00-07:00). After a failure between the pointer flip
+and the metadata write, a plain install now reactivates the pinned
+release without downloading it, as `ab_runtime_slots.md` requirement 10
+specifies, and the error tells the operator to rerun the same command.
+Decide whether maintenance should instead roll forward to the slot the
+pointer names (journal the intended pin before the flip), which would
+need a spec change. Blockers: operator decision.

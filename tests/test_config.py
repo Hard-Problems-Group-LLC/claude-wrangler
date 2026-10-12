@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -253,6 +254,48 @@ def test_resolve_relative_within_root_rejects_windows_anchored_paths(tmp_path, r
         resolve_relative_within_root(tmp_path, raw, "--local-dir")
 
 
+def make_dangling_outward_link(project: Path, outside: Path) -> Path:
+    """Create `.local` as a link to ``outside``, then delete ``outside``.
+
+    Windows uses a junction (no privilege needed); POSIX a symbolic link.
+    """
+
+    outside.mkdir(parents=True)
+    link = project / ".local"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(link))
+    else:
+        os.symlink(str(outside), str(link), target_is_directory=True)
+    outside.rmdir()
+    return link
+
+
+def test_a_dangling_link_out_of_the_project_is_refused(tmp_path):
+    # Python 3.9's Path.resolve() does not follow a dangling link on
+    # Windows; the containment check must follow it anyway.
+    from claude_wrangler.filesystem import require_safe_managed_path
+
+    project = tmp_path / "project"
+    project.mkdir()
+    make_dangling_outward_link(project, tmp_path / "outside")
+
+    with pytest.raises(ClaudeWranglerError, match="escapes the project root"):
+        resolve_relative_within_root(project, ".local/claude", "--local-dir")
+    with pytest.raises(ClaudeWranglerError, match="outside the project root"):
+        require_safe_managed_path(
+            project / ".local" / "claude", project, "managed directory"
+        )
+
+
+@pytest.mark.parametrize("raw", ["rt\nx", "rt\rx", "rt\x00x", "rt\x1bx"])
+def test_layout_paths_refuse_control_characters(tmp_path, raw):
+    # A newline would end a line of a generated shell script.
+    with pytest.raises(ClaudeWranglerError, match="control characters"):
+        resolve_relative_within_root(tmp_path, raw, "--local-dir")
+
+
 def test_new_install_defaults(tmp_path):
     config = config_from_args(parsed(str(tmp_path)))
     assert config.operation == "install"
@@ -413,10 +456,27 @@ def test_legacy_local_dir_is_discovered_automatically(tmp_path):
 def test_explicit_legacy_local_dir_is_treated_as_the_legacy_layout(tmp_path):
     legacy = tmp_path / "tools" / "npm-claude"
     (legacy / "node_modules").mkdir(parents=True)
+    (legacy / "package.json").write_text(
+        json.dumps({"name": "claude-local-managed-install"}), encoding="utf-8"
+    )
     config = config_from_args(parsed("--local-dir", "tools/npm-claude", str(tmp_path)))
     assert config.legacy is not None
     assert config.legacy.dir_relative == "tools/npm-claude"
     assert config.layout.local_dir_relative == DEFAULT_LOCAL_DIR
+
+
+def test_local_dir_without_ownership_evidence_is_not_a_legacy_layout(tmp_path):
+    # An unrelated web project's package.json and node_modules never make a
+    # directory the npm-era layout whose npm tree install and uninstall delete.
+    web = tmp_path / "web"
+    (web / "node_modules" / "left-pad").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {"left-pad": "1.3.0"}}),
+        encoding="utf-8",
+    )
+    config = config_from_args(parsed("--local-dir", "web", str(tmp_path)))
+    assert config.legacy is None
+    assert config.layout.local_dir_relative == "web"
 
 
 def test_custom_native_local_dir(tmp_path):

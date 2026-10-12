@@ -43,8 +43,15 @@ the migration.
       path in a migration-pending `launch.json` (requirement 6);
    4. the default `.local/claude/npm`.
 
-   A candidate counts only when it resolves inside the project and holds
-   an npm-era layout, so `claude-wrangler .` migrates a custom tree
+   A candidate counts only when it resolves inside the project, is
+   reached without passing through a symbolic link or junction, and
+   carries ownership evidence: schema-1 metadata written by
+   claude-wrangler (`script_name` `claude-wrangler`, including the
+   compatibility projection), or the managed `package.json` (named
+   `claude-local-managed-install`, or depending on nothing but
+   `@anthropic-ai/claude-code`). A bare `package.json` or `node_modules`
+   proves nothing, because install cleanup and uninstall delete a legacy
+   directory's npm tree. `claude-wrangler .` still migrates a custom tree
    without the operator repeating `--local-dir`.
 
 3. **Version continuity**
@@ -86,7 +93,10 @@ the migration.
       the next install, upgrade, or repair retries the cleanup.
 
    A failure before step 4 leaves the legacy launcher and npm tree fully
-   working.
+   working. When the active native slot already records the target
+   version, migration reuses it only after the full offline verification
+   of `ab_runtime_slots.md` requirement 15; a slot that fails is never
+   reused, and the release is adopted or downloaded instead.
 
 6. **Launcher during migration**
 
@@ -98,9 +108,28 @@ the migration.
    not exist yet. The launcher is the native core and shims, with a
    `legacy` block (binary path and version) in `launch.json`; the core,
    `launch.json`, shims, and `update-check.json` already live in the
-   native runtime root. The binary must pass the structural check of
-   `native_runtime_distribution_and_verification.md` requirement 9; when
-   no binary passes, the existing launcher is left untouched and a
+   native runtime root. How the binary is vetted depends on the
+   operation:
+   - `--update` contacts the release host anyway, so it fetches and
+     verifies the signed manifest for the version the layout pins and
+     renders the launcher only for a candidate whose size and SHA-256
+     match it (as adopt-in-place does) and that passes the structural
+     check of `native_runtime_distribution_and_verification.md`
+     requirement 9.
+   - The offline toggles and `--skip-install` cannot check a signature.
+     They use the first candidate that passes the structural check, and
+     only in a checkout that already has a claude-wrangler launcher:
+     legacy mode exists to keep an existing npm-era checkout running and
+     is never offered to a fresh clone, which must run
+     `claude-wrangler .` (migration hashes the binary or downloads it).
+   - Every one of these operations refuses when git tracks any file of
+     the npm-era directory (`ab_runtime_slots.md` requirement 15).
+
+   Limitation: on a checkout an attacker prepared without git (for
+   example, an archive that also carries a claude-wrangler launcher),
+   the offline toggles still run an npm-era binary that was only
+   structurally checked, as the npm-era launcher itself would have. When
+   no binary qualifies, the existing launcher is left untouched and a
    warning names the fix. Until migration writes schema-2 metadata, the
    state these operations change is kept in the schema-1 legacy
    metadata. No subcommand list is recorded for a legacy binary, so the
@@ -156,8 +185,15 @@ the migration.
 - Below-floor refusal.
 - Deferred cleanup when a legacy file is locked.
 - Launcher rendering for `--update` against an unmigrated layout, and
-  no rendering when the legacy binary is missing or fails the
-  structural check.
+  no rendering when the legacy binary is missing, fails the structural
+  check, or does not match the signed manifest.
+- No offline legacy-mode launcher for a checkout without a
+  claude-wrangler launcher or with a tracked npm tree.
+- A link at the legacy location, and a directory without ownership
+  evidence, are never discovered as a legacy layout; their files
+  survive install and uninstall.
+- Migration never reuses a planted native slot.
+- Uninstall accepts the migration-pending README it rendered.
 - Discovery of a custom npm-era directory from the old launcher and
   from a migration-pending `launch.json`, without `--local-dir`.
 - Selftest reporting "migration pending" as a warning, and uninstall

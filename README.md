@@ -375,20 +375,44 @@ maintenance operation holds `.local/claude/wrangler/.lock`; a second
 maintainer fails fast and changes nothing.
 
 - **Launch-time fallback.** On every launch the launcher checks the
-  active slot cheaply (completion record, binary present, size). If it
-  fails and the other slot passes, the launcher prints a prominent
-  warning naming both versions, runs the other slot, and records the
-  event in `fallback.json` for `--inspect` and `--repair-install`. If
-  neither slot passes it refuses and tells you to run
-  `claude-wrangler --repair-install`. It never runs a global `claude`.
+  active slot cheaply (completion record, binary present, size, and the
+  verification stamp below). If it fails and the other slot passes, the
+  launcher prints a prominent warning naming both versions, runs the
+  other slot, and records the event in `fallback.json` for `--inspect`
+  and `--repair-install`. If neither slot passes it refuses and tells
+  you to run `claude-wrangler --repair-install`. It never runs a global
+  `claude`.
+- **Verification stamp.** Every operation that keeps, reuses, or
+  activates a slot (install, upgrade, repair, rollback, `--update`, the
+  settings toggles, and `--skip-install`) first re-verifies it fully
+  offline: both signatures, the manifest hash, each binary's SHA-256,
+  and that the slot holds nothing but its expected files. It then
+  records each binary's size, modification time, and (on POSIX) inode
+  in `slots/<a|b>/.verified.json`. The launcher runs a binary only while
+  it still matches that stamp, so a binary that a clone, a `git pull`,
+  or anything else replaced after verification is refused. A copied or
+  restored checkout gets new file identities: run
+  `claude-wrangler --repair-install .` once to re-verify and re-stamp it
+  offline, without a download.
 - **`--rollback`** makes the other slot active after checking that
   nothing runs from it and re-verifying it fully offline (signatures and
   SHA-256 from its retained evidence).
 - **`--repair-install`** clears `.staging/`, deletes retired slots that
-  are no longer in use, re-verifies both slots offline, repairs an
-  invalid pointer, re-downloads the pinned version when the active slot
-  is missing or corrupt, and regenerates the launchers. It never
-  removes Claude session state.
+  are no longer in use, re-verifies both slots offline (stamping the
+  ones that pass and un-stamping the ones that fail), repairs an invalid
+  pointer, re-downloads the pinned version when the active slot is
+  missing, corrupt, or holds unexpected files, and regenerates the
+  launchers. A release the inactive slot already holds is activated
+  instead of being downloaded again. It never removes Claude session
+  state.
+- **Tracked files are refused.** Install, upgrade, repair, `--update`,
+  and `--rollback` refuse when git tracks anything under the runtime
+  root, the config dir, the redirected home, the npm-era layout, or the
+  launchers, because a clone or pull could then replace them with
+  content `claude-wrangler` never verified. Remove such files from the
+  repository; `--allow-tracked-state` overrides the refusal for an
+  operator who tracks them on purpose. `--inspect` and `--selftest`
+  report them.
 - **In-use protection.** A slot is never replaced, rolled back to, or
   removed while a process runs from it; the operation stops and names
   the process IDs. Claude Code's background service counts. Pass
@@ -473,7 +497,16 @@ automatically the next time you run an install, `--upgrade`, or
   upgrade, or repair.
 - `--update` and the permission and notice toggles still work before
   migration; they write a Node-free launcher that runs the npm-era
-  binary directly and reports "migration pending".
+  binary directly and reports "migration pending". `--update` does so
+  only after the binary hashes to the signed manifest for the version
+  the npm install pins. The offline toggles and `--skip-install` cannot
+  check a signature, so they rewrite the launcher only in a checkout
+  that already has a `claude-wrangler` launcher; a fresh clone that
+  carries an npm tree must run `claude-wrangler .`.
+- An npm-era directory counts only when it carries `claude-wrangler`'s
+  own metadata or managed `package.json` and is reached without a
+  symbolic link or junction, so another project's `node_modules` is
+  never cleaned up or uninstalled.
 - The retired `--npm-timeout-seconds` and `--npm-install-loglevel`
   flags are still accepted, but only print a warning. Use
   `--download-timeout-seconds` instead.
@@ -537,7 +570,16 @@ the checks off with `--set-update-checks off`.
   machine), and a `--version` smoke test in a scratch environment that
   never sees your home or the project's config dir.
 - Each slot keeps its manifest and both signatures, so `--selftest`,
-  `--rollback`, and `--repair-install` re-verify it offline.
+  `--rollback`, and `--repair-install` re-verify it offline. A slot
+  that holds anything beyond its record, stamp, evidence, and binaries
+  (for example a DLL beside `claude.exe`, which Windows would load
+  first) fails that verification.
+- Nothing a repository can supply is trusted as verified: a slot is
+  reused only after a full offline verification, and the launcher runs
+  only binaries stamped right after one (see "Runtime Slots, Rollback,
+  and Repair").
+- A release host other than Anthropic's that was recorded in the
+  metadata is named before it is contacted and in the install summary.
 
 ## Runtime Boundary
 
@@ -609,8 +651,16 @@ The tool is intentionally suspicious.
   children.
 - Uninstall removes files only when it can prove ownership, unless
   `--force` is used. It refuses while anything runs from the runtime,
-  removes the runtime before session state, and stops before session
-  state if a binary cannot be deleted.
+  removes the binaries first and the ownership metadata last, removes
+  the runtime before session state, and stops before session state if a
+  binary cannot be deleted; a plain rerun then finishes the job. A
+  `--dry-run` never stops background sessions, even with
+  `--stop-background-sessions`.
+- `--local-dir` must name a new, empty, or `claude-wrangler`-owned
+  directory, and every managed path must be ASCII-safe for the cmd
+  launcher; both are checked before anything is downloaded.
+- On POSIX the config dir and the redirected home are kept private to
+  you (mode 0700): they hold transcripts and credentials.
 - The generated launchers and the generated local README are
   content-checked; the launcher core must be a byte-for-byte copy of
   the packaged one.
@@ -638,7 +688,9 @@ The tool is intentionally suspicious.
   `claude-wrangler` refuses to install another operating system's build,
   so install and run it inside WSL to add the Linux binary. A slot can
   carry the same release for several platforms, so a checkout shared
-  between Windows and WSL keeps both builds.
+  between Windows and WSL keeps both builds. Each system stamps only
+  its own binaries, so after an upgrade on one side, run
+  `claude-wrangler .` once on the other before launching there.
 - **Pinned trust anchors.** If Anthropic rotates its release signing
   key, a new `claude-wrangler` release is required, and a manifest
   signed by several keys during a rotation is refused.

@@ -149,7 +149,14 @@ The npm package is a wrapper around the same bytes and is not used.
     Each promoted slot must keep `manifest.json`, `manifest.json.sig`,
     `manifest.json.raw-sig.json`, and a completion record (see
     `ab_runtime_slots.md`). Repair and selftest re-verify a slot offline
-    from this evidence.
+    from this evidence, and so does every operation that keeps or
+    reuses a slot (`ab_runtime_slots.md` requirement 15): a slot is never
+    trusted on its completion record alone, because a repository can
+    supply one. A release host other than the default that came from
+    recorded metadata is named before it is contacted, and install-like
+    operations refuse metadata that git tracks; signatures still bind
+    every byte, so such metadata could otherwise only pin an older signed
+    release or redirect the update check's traffic.
 
 12. **Notify-only update checks**
 

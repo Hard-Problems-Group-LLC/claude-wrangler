@@ -46,12 +46,20 @@ from .migration import (
     legacy_dir_from_launcher,
     looks_like_legacy_dir,
     npm_era_launcher_paths,
+    unaliased_dir_within_root,
 )
-from .models import ClaudeWranglerError, Config, ExistingState, LegacyState
+from .models import (
+    ClaudeWranglerError,
+    Config,
+    ExistingState,
+    LegacyState,
+    ManagedStateChangedError,
+)
 from .platforms import PLATFORM_KEYS
 from .runtime import eprint
 
 MISSING_DASH_FLAG_HINTS = {
+    "allow-tracked-state": "--allow-tracked-state",
     "ca-bundle": "--ca-bundle",
     "channel": "--channel",
     "claude-config-dir": "--claude-config-dir",
@@ -368,6 +376,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-tracked-state",
+        action="store_true",
+        help=(
+            "Proceed even when git tracks files under the runtime root, the "
+            "config dir, the redirected HOME, the npm-era layout, or the "
+            "launchers. By default install, upgrade, repair, update, and "
+            "rollback refuse, because a clone or pull can replace such files "
+            "with content claude-wrangler never verified."
+        ),
+    )
+    parser.add_argument(
         "--skip-install",
         action="store_true",
         help=(
@@ -550,6 +569,15 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error(
             "--stop-background-sessions is only valid for install, upgrade, "
             "repair, rollback, and uninstall."
+        )
+    if getattr(args, "allow_tracked_state", False) and operation in (
+        "inspect",
+        "selftest",
+        "uninstall",
+    ):
+        parser.error(
+            "--allow-tracked-state is only valid for install, upgrade, repair, "
+            "update, and rollback."
         )
     if args.release_base_url is not None:
         try:
@@ -836,12 +864,14 @@ def config_from_args(args: argparse.Namespace) -> Config:
     operation = determine_operation(args)
 
     # A --local-dir that names an npm-era directory is the legacy layout to
-    # migrate from; the native runtime then lives at the default root.
+    # migrate from; the native runtime then lives at the default root. It
+    # counts only when reached without links and carrying ownership
+    # evidence, because install and uninstall delete a legacy npm tree.
     local_dir_raw = args.local_dir if args.local_dir is not None else DEFAULT_LOCAL_DIR
     explicit_legacy_dir: Optional[str] = None
     if args.local_dir is not None:
-        candidate = _safe_relative(project_root, args.local_dir, "--local-dir")
-        if candidate is not None and looks_like_legacy_dir(candidate):
+        found = unaliased_dir_within_root(project_root, args.local_dir, "--local-dir")
+        if found is not None and looks_like_legacy_dir(found[1]):
             explicit_legacy_dir = args.local_dir
             local_dir_raw = DEFAULT_LOCAL_DIR
 
@@ -885,6 +915,20 @@ def config_from_args(args: argparse.Namespace) -> Config:
         resolved = _safe_relative(project_root, candidate_dir, "legacy local dir")
         if resolved is not None:
             state_paths.append(resolved / METADATA_FILENAME)
+    # The digest must describe the bytes this configuration was derived
+    # from (ab_runtime_slots.md requirement 4). It is computed first and the
+    # state read again afterwards: when another maintainer published after
+    # the first read, the second read differs and the command reruns from a
+    # fresh read instead of carrying a digest of state it never parsed.
+    state_fingerprint = managed_state_fingerprint(state_paths)
+    if _state_signature(
+        read_existing_state(probe_layout),
+        discover_legacy(project_root, legacy_candidates),
+    ) != _state_signature(existing, legacy):
+        raise ManagedStateChangedError(
+            "Another claude-wrangler run changed this project's managed state "
+            "while this command read it; nothing was changed."
+        )
     legacy_paths: Dict[str, str] = {}
     if legacy is not None:
         # The npm-era launcher built CLAUDE_CONFIG_DIR and HOME from these
@@ -1012,5 +1056,21 @@ def config_from_args(args: argparse.Namespace) -> Config:
         existing_metadata_error=existing.metadata_error,
         legacy=legacy,
         state_paths=state_paths,
-        state_fingerprint=managed_state_fingerprint(state_paths),
+        state_fingerprint=state_fingerprint,
+        release_base_url_explicit=args.release_base_url is not None,
+        allow_tracked_state=bool(getattr(args, "allow_tracked_state", False)),
+    )
+
+
+def _state_signature(
+    existing: ExistingState, legacy: Optional[LegacyState]
+) -> Tuple[object, ...]:
+    """Return what a configuration takes from the metadata files it read."""
+
+    return (
+        existing.metadata,
+        existing.metadata_error,
+        legacy.dir_relative if legacy is not None else None,
+        legacy.metadata if legacy is not None else None,
+        legacy.metadata_error if legacy is not None else None,
     )

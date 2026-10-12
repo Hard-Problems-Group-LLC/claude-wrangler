@@ -83,8 +83,13 @@ def make_facts(
     programs: Optional[Dict[str, str]] = None,
     files: Sequence[str] = (),
     env: Optional[Dict[str, str]] = None,
+    succeeds=None,
 ):
-    """Build injected host facts; `programs` maps names to PATH hits."""
+    """Build injected host facts; `programs` maps names to PATH hits.
+
+    ``succeeds`` answers command probes (such as `xcode-select -p`); by
+    default every probe succeeds and nothing runs.
+    """
 
     pretty = {"windows": "Windows", "macos": "macOS"}.get(platform_id, platform_id)
     existing = set(files)
@@ -98,6 +103,7 @@ def make_facts(
         which=fake_which(programs or {}),
         is_file=lambda path: path in existing,
         python_executable="/usr/bin/python3",
+        succeeds=succeeds if succeeds is not None else (lambda command: True),
     )
 
 
@@ -332,6 +338,60 @@ def test_detection_ignores_git_bash_outside_windows(prereq):
         prereq.detect_missing_prerequisites(facts, include_git_bash=True, dev=False)
         == []
     )
+
+
+def test_macos_command_line_tools_stub_is_not_git(prereq, capsys):
+    # Without the Command Line Tools, /usr/bin/git exists but only opens the
+    # installer dialog; `xcode-select -p` fails until the tools are present.
+    probes: List[List[str]] = []
+
+    def succeeds(command):
+        probes.append(list(command))
+        return False
+
+    facts = make_facts(
+        prereq,
+        platform_id="macos",
+        programs={"git": "/usr/bin/git"},
+        succeeds=succeeds,
+    )
+
+    missing = prereq.detect_missing_prerequisites(
+        facts, include_git_bash=False, dev=False
+    )
+    lines = prereq.describe_prerequisites(
+        facts, missing, include_git_bash=False, dev=False
+    )
+    prereq.report_unresolved(missing, facts.os_info)
+
+    assert missing == ["git"]
+    assert ["xcode-select", "-p"] in probes
+    assert any("Command Line Tools stub" in line for line in lines)
+    assert "xcode-select --install" in capsys.readouterr().err
+
+
+def test_macos_git_counts_once_the_command_line_tools_are_installed(prereq):
+    for path in ("/usr/bin/git", "/opt/homebrew/bin/git"):
+        facts = make_facts(
+            prereq,
+            platform_id="macos",
+            programs={"git": path},
+            succeeds=lambda command: command == ["xcode-select", "-p"],
+        )
+        assert (
+            prereq.detect_missing_prerequisites(
+                facts, include_git_bash=False, dev=False
+            )
+            == []
+        )
+    # A git outside /usr/bin is never a stub, even without the tools.
+    facts = make_facts(
+        prereq,
+        platform_id="macos",
+        programs={"git": "/opt/homebrew/bin/git"},
+        succeeds=lambda command: False,
+    )
+    assert prereq.find_git(facts) == "/opt/homebrew/bin/git"
 
 
 # Privilege and planning -------------------------------------------------------
@@ -736,7 +796,9 @@ def test_select_tool_python_falls_back_to_running_interpreter(prereq, monkeypatc
 
     monkeypatch.setattr(prereq, "resolve_runtime_policy_executable", no_runtime)
 
-    assert prereq.select_tool_python(None) == sys.executable
+    assert prereq.select_tool_python(None, running_version=(3, 12, 4)) == (
+        sys.executable
+    )
     with pytest.raises(RuntimeError):
         prereq.select_tool_python("/nonexistent/python")
 
@@ -744,8 +806,53 @@ def test_select_tool_python_falls_back_to_running_interpreter(prereq, monkeypatc
 def test_select_tool_python_without_profiles_helper(prereq, monkeypatch):
     monkeypatch.setattr(prereq, "resolve_runtime_policy_executable", None)
 
-    assert prereq.select_tool_python(None) == sys.executable
+    assert prereq.select_tool_python(None, running_version=(3, 12, 4)) == (
+        sys.executable
+    )
     assert prereq.select_tool_python("custom-python") == "custom-python"
+
+
+@pytest.mark.parametrize("helper", ["missing", "no-match"])
+def test_select_tool_python_refuses_a_running_interpreter_below_the_dev_floor(
+    prereq, monkeypatch, helper
+):
+    # The [dev] extras pin pytest 9 and black 26, which need Python 3.12; a
+    # 3.9 fallback would only fail later inside pip's resolver.
+    def no_runtime(*args, **kwargs):
+        raise RuntimeError("No Python runtime matched policy")
+
+    monkeypatch.setattr(
+        prereq,
+        "resolve_runtime_policy_executable",
+        None if helper == "missing" else no_runtime,
+    )
+
+    with pytest.raises(RuntimeError, match=r"--dev needs Python 3\.12\+"):
+        prereq.select_tool_python(None, running_version=(3, 9, 13))
+
+
+def test_main_dev_refuses_before_creating_a_venv_on_a_too_old_interpreter(
+    prereq, monkeypatch, capsys, tmp_path
+):
+    monkeypatch.setattr(prereq, "resolve_runtime_policy_executable", None)
+    original = prereq.select_tool_python
+    monkeypatch.setattr(
+        prereq,
+        "select_tool_python",
+        lambda override: original(override, running_version=(3, 9, 13)),
+    )
+    runner = RecordingRunner()
+    facts = make_facts(
+        prereq, python_version=(3, 9, 13), programs={"git": "/usr/bin/git"}
+    )
+
+    code = prereq.main(
+        ["--dev", "--venv", str(tmp_path / "venv")], facts=facts, runner=runner
+    )
+
+    assert code == 1
+    assert runner.commands == []
+    assert "--dev needs Python 3.12+" in capsys.readouterr().err
 
 
 def test_command_runner_dry_run_only_prints(prereq, capsys, monkeypatch):
@@ -829,3 +936,24 @@ def test_wrapper_does_not_fall_back_from_a_bad_override(wrapper_bash, tmp_path):
 
     assert completed.returncode == 1
     assert "not falling back" in completed.stderr
+
+
+def test_wrapper_ignores_an_exported_cdpath(wrapper_bash):
+    # Run as `bash scripts/install_prerequisites.sh` from the repository
+    # root, `cd scripts` would consult CDPATH, print the directory, and
+    # double the captured script_dir; `CDPATH= cd --` prevents both.
+    env = dict(os.environ, THEKNOWLEDGE_BOOTSTRAP_PYTHON=sys.executable, CDPATH=".")
+
+    completed = subprocess.run(
+        [wrapper_bash, "scripts/install_prerequisites.sh", "--help"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--dev" in completed.stdout

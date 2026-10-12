@@ -24,6 +24,16 @@ class ClaudeWranglerError(RuntimeError):
     """Raised when an operation cannot be completed safely."""
 
 
+class ManagedStateChangedError(ClaudeWranglerError):
+    """Raised when another maintainer changed the managed state this run read.
+
+    Raised under the maintenance lock when the digest of the metadata files
+    no longer matches, and by `config.config_from_args` when the state
+    changed while it was being read. Nothing has been changed; `cli.main`
+    re-reads the state and runs the command again.
+    """
+
+
 @dataclass
 class Layout:
     """Concrete filesystem layout for one managed installation.
@@ -177,6 +187,12 @@ class Config:
     stop_background_sessions: bool = False
     channel_explicit: bool = False
     version_explicit: bool = False
+    # True when --release-base-url was given on this command line rather
+    # than read from recorded metadata.
+    release_base_url_explicit: bool = False
+    # --allow-tracked-state: proceed even when git tracks runtime, session
+    # state, or launcher files.
+    allow_tracked_state: bool = False
     launcher_python: str = field(default_factory=lambda: sys.executable)
     config_dir_spelling: str = CONFIG_DIR_SPELLING_NATIVE
     available_versions: Dict[str, Optional[str]] = field(default_factory=dict)

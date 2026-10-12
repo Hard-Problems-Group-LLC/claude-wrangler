@@ -43,19 +43,22 @@ Native runtime (Python 3.9 and standard library only where noted):
   PE, Mach-O, and ELF structure checks.
 - `src/claude_wrangler/slots.py`
   The A/B slot store: layout, the `active-slot` pointer, completion
-  records, the maintenance lock, promotion, cleanup, and in-use
-  detection through the process table.
+  records, verification stamps and the exact-slot-contents check, the
+  maintenance lock, promotion, cleanup, and in-use detection through the
+  process table (Toolhelp on Windows, `/proc` on Linux, `libproc` on
+  macOS).
 - `src/claude_wrangler/atomicio.py`
   Atomic same-directory writes with explicit newlines and retries for
   transient Windows sharing violations.
 - `src/claude_wrangler/transaction.py`
   One install transaction: platform selection, staging (download or
   adopt), structure check, smoke test, evidence, and promotion behind
-  the in-use check; offline slot re-verification.
+  the in-use check; offline slot re-verification and `verify_and_stamp`,
+  which every operation that keeps or reuses a slot calls.
 - `src/claude_wrangler/services.py`
   Injectable side effects (network, smoke test, `--help` reader,
-  process table, clock) and the scratch environment for candidate
-  binaries.
+  process table, the `git ls-files` query for tracked managed files,
+  clock) and the scratch environment for candidate binaries.
 - `src/claude_wrangler/operations.py`
   Install, upgrade, repair, migrate, update, rollback, and uninstall,
   each holding the maintenance lock.
@@ -343,7 +346,17 @@ The tests stay offline and light on external side effects:
 - POSIX-only tests (`install.sh`, execute bits, file permissions) skip
   on Windows, and Windows-only tests skip elsewhere.
 - `tests/test_python39_compatibility.py` parses the shipped code with
-  the Python 3.9 grammar; a real Python 3.9 run still belongs in CI.
+  the Python 3.9 grammar; a real Python 3.9 run still belongs in CI. The
+  whole suite passes on CPython 3.9 on Windows when the temporary
+  directory is short: a temp path of about 140 characters pushes some
+  shim tests past `MAX_PATH`, so run from a short `TEMP` or pass a short
+  `--basetemp`.
+- `tests/native_fakes.py` also provides `UnreachableSource` (a release
+  source that fails like a blocked network and records each attempt) and
+  `plant_unverified_slot` (a slot whose record and size match but whose
+  bytes and evidence do not), for tests of state a repository could
+  supply. Fake services report no git-tracked files unless a test passes
+  `tracked_files=services.list_tracked_files` to use real git.
 
 ## Line Endings
 

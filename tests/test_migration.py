@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 from typing import Any, Dict, Optional
 
 import pytest
@@ -30,10 +32,12 @@ from claude_wrangler.slots import RuntimeStore
 
 from native_fakes import (
     FakeProcessTable,
+    UnreachableSource,
     fake_binary,
     host_key,
     make_config,
     make_services,
+    plant_unverified_slot,
     standard_source,
 )
 
@@ -749,7 +753,7 @@ def test_legacy_mode_keeps_the_old_launcher_when_no_binary_can_run(
         assert install_like_operation(config, services) == 0
 
     err = capsys.readouterr().err
-    assert "no runnable Claude Code binary was found" in err
+    assert "no runnable Claude Code binary" in err
     assert "the launcher was not rewritten" in err
     assert (project / "bin" / "claude-local").read_text("utf-8") == OLD_LAUNCHER
     assert not (project / "bin" / "claude-local.cmd").exists()
@@ -944,3 +948,182 @@ def test_recorded_legacy_metadata_paths_win_over_the_launcher(project):
         npm_era_launcher(CUSTOM, config_dir="state/cfg"), encoding="utf-8"
     )
     assert make_config(project).layout.config_dir_relative == ".local/claude"
+
+
+# ---------------------------------------------------------------------------
+# Repository-supplied npm-era state is never trusted (SEC-1, SEC-2, LC-7)
+# ---------------------------------------------------------------------------
+
+
+def test_update_renders_no_launcher_for_a_binary_that_fails_the_manifest(
+    project, capsys
+):
+    root = make_legacy(project, binary=fake_binary("2.1.287", KEY, b"tampered"))
+    source = standard_source()
+
+    assert (
+        update_operation(make_config(project, "--update"), make_services(source)) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "matches the signed manifest" in err
+    assert "the launcher was not rewritten" in err
+    assert (project / "bin" / "claude-local").read_text("utf-8") == OLD_LAUNCHER
+    assert not (project / "bin" / "claude-local.cmd").exists()
+    assert not (runtime(project) / "launch.json").exists()
+    assert source.manifest_requests[-1] == "2.1.287"
+    assert (root / "node_modules").exists()
+
+
+@pytest.mark.parametrize("args", [("--skip-install",), ("--set-update-checks", "off")])
+def test_offline_legacy_mode_needs_an_existing_managed_launcher(project, args):
+    # A fresh clone that carries an npm tree but no claude-wrangler launcher
+    # gets no launcher for its unverified binary.
+    root = make_legacy(project)
+    (project / "bin" / "claude-local").unlink()
+
+    with pytest.raises(ClaudeWranglerError, match="no claude-wrangler launcher"):
+        install(project, standard_source(), *args)
+
+    assert not (project / "bin" / "claude-local").exists()
+    assert not (runtime(project) / "launch.json").exists()
+    assert (root / "node_modules").exists()
+
+
+def test_offline_legacy_mode_refuses_a_tracked_npm_tree(project):
+    from claude_wrangler.services import list_tracked_files
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    root = make_legacy(project)
+    shutil.rmtree(str(project / ".git"))
+    for args in (["init", "-q"], ["add", "-f", LEGACY + "/package.json"]):
+        subprocess.run(
+            ["git", "-c", "core.longpaths=true", "-C", str(project)] + args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+    services = make_services(standard_source(), tracked_files=list_tracked_files)
+
+    with pytest.raises(ClaudeWranglerError, match="git tracks"):
+        install_like_operation(make_config(project, "--skip-install"), services)
+
+    assert (project / "bin" / "claude-local").read_text("utf-8") == OLD_LAUNCHER
+    assert not (runtime(project) / "launch.json").exists()
+    assert (root / "node_modules").exists()
+
+
+def test_migration_never_reuses_a_planted_slot(project, capsys):
+    make_legacy(project)
+    plant_unverified_slot(runtime(project), "2.1.287", KEY)
+    source = UnreachableSource()
+
+    with pytest.raises(ClaudeWranglerError, match="network blocked"):
+        install(project, source)
+
+    err = capsys.readouterr().err
+    assert "already holds verified" not in err
+    assert "failed full offline verification" in err
+    assert (project / "bin" / "claude-local").read_text("utf-8") == OLD_LAUNCHER
+    assert not (runtime(project) / METADATA_FILENAME).exists()
+    assert not (runtime(project) / "launch.json").exists()
+
+
+def test_uninstall_accepts_its_own_migration_pending_readme(project):
+    from claude_wrangler.operations import uninstall_operation
+
+    make_legacy(project)
+    assert (
+        update_operation(
+            make_config(project, "--update"), make_services(standard_source())
+        )
+        == 0
+    )
+    readme = project / "README-LOCAL-Start-Claude.md"
+    assert "Migration pending" in readme.read_text("utf-8")
+
+    code = uninstall_operation(
+        make_config(project, "--uninstall"), make_services(standard_source())
+    )
+
+    assert code == 0
+    assert not readme.exists()
+    assert not (project / ".local").exists()
+
+
+def make_managed_looking_dir(directory: Path) -> None:
+    """Create a directory that carries npm-era ownership evidence and files."""
+
+    (directory / "node_modules" / "left-pad").mkdir(parents=True)
+    (directory / "node_modules" / "left-pad" / "index.js").write_text("x", "utf-8")
+    (directory / "package.json").write_text(
+        json.dumps({"name": "claude-local-managed-install"}), encoding="utf-8"
+    )
+    (directory / "src").mkdir()
+    (directory / "src" / "app.js").write_text("app", "utf-8")
+
+
+def tree(directory: Path) -> Dict[str, bytes]:
+    """Return every file under a directory with its bytes."""
+
+    return {
+        path.relative_to(directory).as_posix(): path.read_bytes()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_a_link_at_the_legacy_location_is_never_followed(project):
+    from claude_wrangler.operations import uninstall_operation
+
+    web = project / "web"
+    web.mkdir()
+    make_managed_looking_dir(web)
+    before = tree(web)
+    link = project / ".local" / "claude" / "npm"
+    link.parent.mkdir(parents=True)
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(web), str(link))
+    else:
+        os.symlink(str(web), str(link), target_is_directory=True)
+
+    assert discover_legacy(project, [LEGACY]) is None
+    assert install(project, standard_source()) == 0
+    assert tree(web) == before
+    assert (
+        uninstall_operation(
+            make_config(project, "--uninstall"), make_services(standard_source())
+        )
+        == 0
+    )
+
+    assert tree(web) == before
+
+
+def test_an_unrelated_local_dir_is_never_treated_as_legacy(project):
+    from claude_wrangler.operations import uninstall_operation
+
+    assert install(project, standard_source()) == 0
+    web = project / "web"
+    (web / "node_modules" / "left-pad").mkdir(parents=True)
+    (web / "package.json").write_text(
+        json.dumps({"name": "web", "dependencies": {"left-pad": "1.3.0"}}), "utf-8"
+    )
+    (web / "src").mkdir()
+    (web / "src" / "app.js").write_text("app", "utf-8")
+    before = tree(web)
+
+    assert looks_like_legacy_dir(web) is False
+    with pytest.raises(ClaudeWranglerError, match="not claude-wrangler's"):
+        install(project, standard_source(), "--local-dir", "web")
+    with pytest.raises(ClaudeWranglerError, match="ownership cannot be proven"):
+        uninstall_operation(
+            make_config(project, "--uninstall", "--local-dir", "web"),
+            make_services(standard_source()),
+        )
+
+    assert tree(web) == before

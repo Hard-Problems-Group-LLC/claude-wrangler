@@ -430,8 +430,19 @@ def test_sysctl_ctypes_is_unavailable_off_macos():
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
-def test_live_rosetta_probe_returns_bool_on_macos():
-    assert isinstance(detect_rosetta_translated(), bool)
+def test_live_rosetta_probe_matches_sysctl_on_macos():
+    # `sysctl -n sysctl.proc_translated` prints 1 under Rosetta 2 and 0 on
+    # native processes; on Intel Macs the name does not exist (exit 1).
+    completed = subprocess.run(
+        ["/usr/sbin/sysctl", "-n", "sysctl.proc_translated"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    expected = completed.returncode == 0 and completed.stdout.strip() == b"1"
+
+    assert detect_rosetta_translated() is expected
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -115,10 +116,13 @@ def test_shims_for_a_nested_launcher_climb_to_the_repository(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     config = make_config(project, "--launcher", "tools/x/claude-local")
-    assert '$(cd "$(dirname "$0")/../.." && pwd)' in build_posix_shim(config)
-    assert 'for %%I in ("%~dp0..\\..") do' in build_cmd_shim(config)
-    assert '"$(dirname "$0")/../../../../tools/x/claude-local"' in build_path_shim_sh(
+    assert '$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)' in build_posix_shim(
         config
+    )
+    assert 'for %%I in ("%~dp0..\\..") do' in build_cmd_shim(config)
+    assert (
+        '"$(dirname -- "$0")"/\'../../../../tools/x/claude-local\''
+        in build_path_shim_sh(config)
     )
     assert (
         '"%~dp0..\\..\\..\\..\\tools\\x\\claude-local.cmd" %*'
@@ -548,3 +552,248 @@ def test_posix_shim_quotes_a_recorded_python_with_quotes(tmp_path):
     text = build_posix_shim(config)
     expected = "claude_local_recorded='/opt/it'\\''s here/python3'"
     assert expected in text
+
+
+# ---------------------------------------------------------------------------
+# Shim robustness: CDPATH, quoting, rewrites during a session, modes
+# ---------------------------------------------------------------------------
+
+
+def sh_path(path: Path) -> str:
+    """Return a path spelled for Git Bash's sh on Windows, or as-is."""
+
+    if not WINDOWS:
+        return str(path)
+    text = str(path)
+    drive, rest = os.path.splitdrive(text)
+    return "/" + drive.rstrip(":").lower() + rest.replace("\\", "/")
+
+
+NEWLINE = "\n"
+STUB_PYTHON = """#!/bin/sh
+if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then
+  exit 0
+fi
+printf 'ROOT=[%s]\\n' "$CLAUDE_LOCAL_REPO_ROOT"
+printf 'CORE=[%s]\\n' "$2"
+if [ -f "$2" ]; then
+  echo CORE-EXISTS
+fi
+"""
+
+
+def run_shim_with_stubs(
+    tmp_path: Path,
+    config,
+    command: str,
+    extra_env: Optional[Dict[str, str]] = None,
+):
+    """Generate the sh shims with a stub interpreter and run ``command``.
+
+    The recorded interpreter is a stub that prints the repository root and
+    core path it was given. On POSIX ``uname`` is stubbed to report Linux;
+    Git for Windows' sh puts its own tools first, so there the shim takes
+    its Git Bash branch and prints Windows-form paths (``cygpath -w``).
+    """
+
+    from dataclasses import replace
+
+    sh = posix_sh()
+    if sh is None:
+        pytest.skip("no POSIX sh available")
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "uname").write_bytes(b"#!/bin/sh\necho Linux\n")
+    stub_python = stubs / "python-stub"
+    stub_python.write_bytes(STUB_PYTHON.encode("ascii"))
+    for stub in (stubs / "uname", stub_python):
+        stub.chmod(0o755)
+    config = replace(config, launcher_python=sh_path(stub_python))
+    project = config.project_root
+    layout = config.layout
+    layout.launch_core_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.launch_core_path.write_bytes(b"# stub core\n")
+    layout.launcher_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.launcher_path.write_bytes(build_posix_shim(config).encode("utf-8"))
+    layout.shim_dir.mkdir(parents=True, exist_ok=True)
+    (layout.shim_dir / "claude").write_bytes(build_path_shim_sh(config).encode("utf-8"))
+    for path in (layout.launcher_path, layout.shim_dir / "claude"):
+        path.chmod(0o755)
+        syntax = subprocess.run(
+            [sh, "-n", sh_path(path)], capture_output=True, timeout=60, check=False
+        )
+        assert syntax.returncode == 0, syntax.stderr.decode("utf-8", "replace")
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    # Git Bash converts a Windows-style PATH itself; the stubs go first.
+    env["PATH"] = str(stubs) + os.pathsep + env.get("PATH", "")
+    completed = subprocess.run(
+        [sh, "-c", command],
+        cwd=str(project),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    return (
+        completed.returncode,
+        completed.stdout.decode("utf-8", "replace"),
+        completed.stderr.decode("utf-8", "replace"),
+    )
+
+
+@pytest.mark.parametrize("cdpath", [".", ".:{other}"])
+def test_posix_shim_ignores_an_exported_cdpath(tmp_path, cdpath):
+    project = tmp_path / "project"
+    project.mkdir()
+    other = tmp_path / "other"
+    (other / "bin").mkdir(parents=True)
+    config = make_config(project)
+
+    code, out, err = run_shim_with_stubs(
+        tmp_path,
+        config,
+        "sh bin/claude-local hello",
+        {"CDPATH": cdpath.format(other=sh_path(other))},
+    )
+
+    assert code == 0, err
+    assert "ROOT=[{}]{}".format(project, NEWLINE) in out, out
+    assert "CORE-EXISTS" in out, out
+
+
+def test_sh_shims_keep_special_characters_in_managed_paths_literal(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    local_dir = "rt/q`echo INJECTED`$HOME z"
+    config = make_config(project, "--local-dir", local_dir)
+    assert "'{}/launch.py'".format(local_dir) in build_posix_shim(config)
+
+    code, out, err = run_shim_with_stubs(tmp_path, config, "sh bin/claude-local hi")
+
+    assert code == 0, err
+    assert "INJECTED" not in err
+    assert "CORE-EXISTS" in out, out
+    assert "{}/launch.py".format(local_dir) in out.replace("\\", "/")
+
+
+def test_path_shim_reaches_a_launcher_with_special_characters(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    config = make_config(project, "--launcher", "b$x y/claude-local")
+
+    code, out, err = run_shim_with_stubs(
+        tmp_path, config, "sh .local/claude/wrangler/shim/claude hello"
+    )
+
+    assert code == 0, err
+    assert "ROOT=[{}]{}".format(project, NEWLINE) in out, out
+    assert "CORE-EXISTS" in out, out
+
+
+@pytest.mark.skipif(not WINDOWS, reason="cmd.exe batch semantics")
+@pytest.mark.parametrize("change", ["same", "longer", "shorter"])
+def test_cmd_shim_survives_being_rewritten_during_a_session(tmp_path, change):
+    # cmd.exe re-reads a batch file by byte offset after each command; an
+    # upgrade that rewrites the shim while Claude Code runs must not make it
+    # resume in the middle of the new content or lose the exit code.
+    from dataclasses import replace
+
+    project = tmp_path / "project"
+    project.mkdir()
+    base = make_config(project)
+    variants = {
+        "same": base.launcher_python,
+        "longer": base.launcher_python + "-" + "x" * 40,
+        "shorter": "C:\\py.exe",
+    }
+    core = base.layout.launch_core_path
+    core.parent.mkdir(parents=True)
+    started = tmp_path / "core-started"
+    core.write_text(
+        "import pathlib, sys, time\n"
+        "pathlib.Path({!r}).write_text('x')\n"
+        "time.sleep(2)\n"
+        "sys.exit(7)\n".format(str(started)),
+        encoding="utf-8",
+    )
+    shim = base.layout.launcher_cmd_path
+    shim.parent.mkdir(parents=True)
+    shim.write_bytes(build_cmd_shim(base).replace("\n", "\r\n").encode("ascii"))
+    replacement = build_cmd_shim(replace(base, launcher_python=variants[change]))
+
+    process = subprocess.Popen(
+        ["cmd", "/d", "/c", str(shim)],
+        cwd=str(project),
+        env=clean_launch_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # Rewrite only once the launch line runs, as an upgrade during a
+    # session would.
+    deadline = time.monotonic() + 60
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert started.exists(), "the stub core never started"
+    incoming = shim.with_name("incoming.cmd")
+    incoming.write_bytes(replacement.replace("\n", "\r\n").encode("ascii"))
+    os.replace(str(incoming), str(shim))
+    stdout, stderr = process.communicate(timeout=60)
+
+    assert process.returncode == 7, (stdout, stderr)
+    assert b"is not recognized" not in stderr
+    assert b"cannot find" not in stderr
+
+
+@pytest.mark.skipif(WINDOWS, reason="POSIX execute permission")
+def test_rewrite_restores_a_lost_execute_bit_on_the_path_shim(config):
+    write_generated_files(config)
+    shim = config.layout.shim_dir / "claude"
+    shim.chmod(0o644)
+    assert generated_file_status(config)["path_shim_sh"]["fresh"] is False
+
+    write_generated_files(config)
+
+    assert os.access(str(shim), os.X_OK)
+    assert generated_file_status(config)["path_shim_sh"]["fresh"] is True
+
+
+def test_unrenderable_cmd_files_raise_only_when_strict(tmp_path):
+    from claude_wrangler.generator import planned_files
+
+    project = tmp_path / "project"
+    project.mkdir()
+    config = make_config(project, "--local-dir", ".local/claude/wr\u00e4ngl\u00e9r")
+
+    with pytest.raises(ClaudeWranglerError, match="not ASCII"):
+        planned_files(config)
+    keys = [item.key for item in planned_files(config, strict=False)]
+
+    assert "launcher_cmd" not in keys
+    assert "launcher_sh" in keys and "readme" in keys
+
+
+def test_cmd_shims_double_percent_signs_in_managed_paths(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    config = make_config(
+        project, "--local-dir", "rt/100%done", "--launcher", "b%x%/claude-local"
+    )
+
+    launcher = build_cmd_shim(config)
+    path_shim = build_path_shim_cmd(config)
+
+    assert r"rt\100%%done\launch.py" in launcher
+    assert r"b%%x%%\claude-local.cmd" in path_shim
+
+
+@pytest.mark.skipif(WINDOWS, reason="Windows file names cannot contain quotes")
+def test_cmd_shim_refuses_a_double_quote_in_a_managed_path(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    config = make_config(project, "--local-dir", 'rt/a"b')
+
+    with pytest.raises(ClaudeWranglerError, match="double quote"):
+        build_cmd_shim(config)

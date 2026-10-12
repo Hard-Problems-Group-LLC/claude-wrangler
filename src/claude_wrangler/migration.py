@@ -68,6 +68,8 @@ LEGACY_NPM_ARTIFACTS = (
 )
 LEGACY_RUNTIME_ARTIFACTS = ("node_modules", "package.json", "package-lock.json")
 LEGACY_RETIRED_PREFIX = ".retired-"
+# The name npm-era claude-wrangler gave the package.json it managed.
+LEGACY_PACKAGE_NAME = "claude-local-managed-install"
 NPM_SCOPE = "@anthropic-ai"
 WRAPPER_PACKAGE_DIR = "claude-code"
 _HASH_CHUNK_BYTES = 1024 * 1024
@@ -109,12 +111,57 @@ def _read_metadata(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]
         return None, str(exc)
 
 
+def _managed_package_json(path: Path) -> bool:
+    """Return True for the package.json an npm-era claude-wrangler wrote.
+
+    That file is named `claude-local-managed-install` and depends on
+    nothing but Claude Code's npm package; an unrelated project's
+    package.json is never mistaken for it.
+    """
+
+    try:
+        payload = read_json_file(path)
+    except ClaudeWranglerError:
+        return False
+    if not payload:
+        return False
+    if payload.get("name") == LEGACY_PACKAGE_NAME:
+        return True
+    names = set()
+    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+        dependencies = payload.get(section)
+        if isinstance(dependencies, dict):
+            names.update(dependencies)
+    return names == {CLAUDE_PACKAGE_NAME}
+
+
+def has_legacy_ownership_evidence(path: Path) -> bool:
+    """Return True when a directory provably belongs to npm-era claude-wrangler.
+
+    Evidence is schema-1 metadata written by claude-wrangler (including the
+    compatibility projection a migration leaves) or the managed
+    package.json. A bare `package.json` or `node_modules` proves nothing:
+    install cleanup and uninstall delete the npm tree of a legacy directory,
+    so a directory without evidence must never count as one.
+    """
+
+    metadata, _error = _read_metadata(path / METADATA_FILENAME)
+    if (
+        metadata is not None
+        and metadata.get("schema_version") == LEGACY_SCHEMA_VERSION
+        and metadata.get("script_name") == SCRIPT_NAME
+    ):
+        return True
+    return _managed_package_json(path / "package.json")
+
+
 def looks_like_legacy_dir(path: Path) -> bool:
     """Return True when a directory holds npm-era claude-wrangler state.
 
-    That is schema-1 metadata, any npm install artifact, or a retired
-    leftover from an earlier migration cleanup. A schema-2 (native) runtime
-    root is never mistaken for a legacy directory.
+    The directory must be real (not a link or junction) and carry
+    ownership evidence (`has_legacy_ownership_evidence`): schema-1
+    claude-wrangler metadata or the managed package.json. A schema-2
+    (native) runtime root is never mistaken for a legacy directory.
     """
 
     try:
@@ -122,16 +169,36 @@ def looks_like_legacy_dir(path: Path) -> bool:
             return False
     except OSError:
         return False
-    if any(_lexists(path / name) for name in LEGACY_NPM_ARTIFACTS):
-        return True
-    metadata, _error = _read_metadata(path / METADATA_FILENAME)
-    if metadata is not None and metadata.get("schema_version") == LEGACY_SCHEMA_VERSION:
-        return True
+    return has_legacy_ownership_evidence(path)
+
+
+def unaliased_dir_within_root(
+    project_root: Path, raw: str, label: str
+) -> Optional[Tuple[str, Path]]:
+    """Resolve a relative directory only when no link or junction leads to it.
+
+    Returns ``(relative, path)`` when ``raw`` stays inside the project and
+    every existing component between the project root and the directory is
+    a real directory, so a link at `.local/claude/npm` can never make
+    another directory (inside or outside the project) the legacy layout
+    whose npm tree gets deleted. Returns None otherwise.
+    """
+
     try:
-        names = os.listdir(str(path))
-    except OSError:
-        return False
-    return any(name.startswith(LEGACY_RETIRED_PREFIX) for name in names)
+        relative, _resolved = resolve_relative_within_root(project_root, raw, label)
+    except ClaudeWranglerError:
+        return None
+    cursor = project_root
+    for part in Path(relative).parts:
+        cursor = cursor / part
+        try:
+            if not _lexists(cursor):
+                return None
+            if is_link_like(cursor):
+                return None
+        except OSError:
+            return None
+    return relative, cursor
 
 
 def _read_small_regular_file(path: Path, limit: int) -> Optional[bytes]:
@@ -416,17 +483,16 @@ def discover_legacy(
 ) -> Optional[LegacyState]:
     """Return the first candidate directory that holds an npm-era layout.
 
-    Candidates that are absolute, escape the project root, or are not
-    legacy directories are skipped. Discovery never writes.
+    Candidates that are absolute, escape the project root, are reached
+    through a link or junction, or lack ownership evidence are skipped.
+    Discovery never writes.
     """
 
     for raw in candidates:
-        try:
-            relative, directory = resolve_relative_within_root(
-                project_root, raw, "legacy local dir"
-            )
-        except ClaudeWranglerError:
+        found = unaliased_dir_within_root(project_root, raw, "legacy local dir")
+        if found is None:
             continue
+        relative, directory = found
         if looks_like_legacy_dir(directory):
             return read_legacy_state(project_root, relative, directory)
     return None
@@ -601,10 +667,14 @@ def select_legacy_launch_binary(
 ) -> Optional[str]:
     """Return the repo-relative POSIX path of a runnable legacy binary.
 
-    Used only to render the Node-free legacy launcher (requirement 6):
-    the first candidate that passes the structural check for this host's
-    platform key wins. No signature check is possible without the network;
-    this is the binary the npm-era launcher already ran.
+    Used only by offline operations (the settings toggles and
+    `--skip-install`) to keep an existing npm-era checkout's launcher
+    running (requirement 6): the first candidate that passes the
+    structural check for this host's platform key wins. No signature check
+    is possible without the network, so callers use this only where a
+    claude-wrangler launcher already exists and git tracks none of the
+    layout; `--update` hashes the binary against the signed manifest
+    instead.
     """
 
     for path in legacy_binary_candidates(legacy.dir, platform_key):

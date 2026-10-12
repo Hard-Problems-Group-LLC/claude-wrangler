@@ -33,6 +33,17 @@ def test_slot_constants_match():
     assert launcher_core.POINTER_NAME == slots.POINTER_NAME
     assert launcher_core.COMPLETION_RECORD_NAME == slots.COMPLETION_RECORD_NAME
     assert launcher_core.SLOTS_DIR_NAME == slots.SLOTS_DIR_NAME
+    assert launcher_core.VERIFICATION_STAMP_NAME == slots.VERIFICATION_STAMP_NAME
+    assert launcher_core.VERIFICATION_STAMP_SCHEMA == slots.VERIFICATION_STAMP_SCHEMA
+
+
+def test_binary_identity_matches(tmp_path):
+    # The launcher compares exactly the identity maintenance records.
+    path = tmp_path / "binary"
+    path.write_bytes(b"x" * 5)
+    status = path.stat()
+
+    assert launcher_core._binary_identity(status) == slots.binary_identity(status)
 
 
 def test_distribution_constants_match():
@@ -180,6 +191,10 @@ def test_completion_records_round_trip_into_the_core(tmp_path):
         promoted_by="test",
     )
     (slot_dir / slots.COMPLETION_RECORD_NAME).write_text(record.to_json(), "utf-8")
+    check = launcher_core.check_slot(str(store.root), "a", "linux-x64")
+    assert not check.ok and "verification stamp" in check.reason
+    # The stamp slots.py writes is the one the launcher core reads.
+    store.write_stamp("a", store.binary_identities("a", ["linux-x64"]))
     check = launcher_core.check_slot(str(store.root), "a", "linux-x64")
     assert check.ok, check.reason
     assert launcher_core.record_subcommands(check.record) == ("mcp",)

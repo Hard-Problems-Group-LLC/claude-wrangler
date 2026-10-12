@@ -324,8 +324,14 @@ def make_services(
     environ: Optional[Mapping[str, str]] = None,
     real_runner: bool = False,
     real_structure: bool = False,
+    tracked_files=None,
 ) -> Services:
-    """Return offline services over a fake release source."""
+    """Return offline services over a fake release source.
+
+    ``tracked_files`` replaces the git tracked-file query; by default no
+    file is tracked (most test projects only carry an empty `.git` marker).
+    Pass ``services.list_tracked_files`` to use real git.
+    """
 
     from claude_wrangler.services import (
         probe_settings_rejections,
@@ -389,6 +395,11 @@ def make_services(
         host_os=platform_key.split("-", 1)[0],
         progress=lambda label: None,
         environ=dict(os.environ if environ is None else environ),
+        tracked_files=(
+            tracked_files
+            if tracked_files is not None
+            else (lambda project_root, paths: [])
+        ),
     )
 
 
@@ -519,3 +530,66 @@ def clean_launch_environment(
     }
     env.update(extra or {})
     return env
+
+
+class UnreachableSource(FakeReleaseSource):
+    """A release source that records contact and fails like a blocked network."""
+
+    def __init__(self) -> None:
+        """Serve nothing; every network call is recorded and refused."""
+
+        super().__init__([], {})
+        self.contacted: List[str] = []
+
+    def channel_version(self, channel: str) -> str:
+        """Refuse a channel lookup."""
+
+        self.contacted.append("channel " + channel)
+        raise DownloadError("network blocked by test")
+
+    def fetch_manifest_bundle(self, version: str) -> ManifestBundle:
+        """Refuse a manifest fetch."""
+
+        self.contacted.append("manifest " + version)
+        raise DownloadError("network blocked by test")
+
+
+def plant_unverified_slot(
+    runtime_root: Path, version: str, key: str, *, name: str = "a"
+) -> Path:
+    """Plant a slot a hostile repository could supply; return its binary.
+
+    The record names a real release and the size of its binary, so the
+    cheap record-and-size check passes, but the binary bytes, the recorded
+    SHA-256, and the (absent) retained evidence are not the release's. The
+    pointer names the slot.
+    """
+
+    genuine = fake_binary(version, key)
+    slot = runtime_root / "slots" / name
+    binary = slot / key / binary_filename(key)
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"P" * len(genuine))
+    record = {
+        "schema": 1,
+        "slot": name,
+        "version": version,
+        "channel": "stable",
+        "platforms": {
+            key: {
+                "binary": "{}/{}".format(key, binary_filename(key)),
+                "sha256": "ab" * 32,
+                "size": len(genuine),
+            }
+        },
+        "manifest_sha256": "cd" * 32,
+        "build_date": None,
+        "commit": None,
+        "schemes": ["openpgp", "raw-rsa"],
+        "subcommands": ["mcp"],
+        "verified_at": "2026-10-01T00:00:00Z",
+        "promoted_by": "hostile",
+    }
+    (slot / ".complete.json").write_text(json.dumps(record), encoding="utf-8")
+    (runtime_root / "active-slot").write_bytes((name + "\n").encode("ascii"))
+    return binary

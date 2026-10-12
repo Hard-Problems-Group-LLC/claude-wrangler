@@ -37,6 +37,10 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
    - prerequisites are Python 3.9+, Git, and, on Windows, Git for
      Windows' bash (which Claude Code's Bash tool uses; optional, on by
      default, `--no-git-bash` skips it); Node.js is not a prerequisite;
+   - on macOS, `/usr/bin/git` and `/usr/bin/python3` are Command Line
+     Tools stubs that exist but only open the installer dialog, so they
+     count as installed only when `xcode-select -p` succeeds; otherwise
+     Git is reported missing with `xcode-select --install` as the fix;
    - package managers: `apt-get`, `dnf`/`yum`, `brew`, and on Windows
      `winget` with `--scope user` where the package supports it;
    - `--dry-run` prints commands; `--yes` runs without prompting; without
@@ -46,13 +50,19 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
      `Scripts\python.exe` on Windows) and installs the project with
      development extras, so contributors on Windows have a development
      path while the managed `--mode dev` (pyenv and direnv) stays
-     POSIX-only;
+     POSIX-only. The development extras need Python 3.12, so `--dev`
+     uses the steady-state interpreter from the tool-validation profile
+     and falls back to the running interpreter only when it is 3.12 or
+     newer; otherwise it refuses before creating anything and names
+     `--python`;
    - it never uses `sudo` unless it is already root or the operator passed
      `--system-packages`, and never elevates on Windows; when a package
      needs elevation it prints the exact command for the operator to run.
 
    Thin wrappers find an interpreter and delegate:
-   - `scripts/install_prerequisites.sh` (POSIX);
+   - `scripts/install_prerequisites.sh` (POSIX), which finds its own
+     directory with `CDPATH= cd --` so an exported `CDPATH` cannot
+     redirect it;
    - `scripts/install_prerequisites.cmd` (Windows), which, when no Python
      3.9+ exists, offers to run `winget install --scope user` for Python
      itself and then re-runs in a new environment.
@@ -146,6 +156,7 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
   PowerShell 5.1, PowerShell 7, and Git Bash, with a stub-only `PATH`,
   a stub-first `PATH`, and an invalid override.
 - Prerequisite-installer tests for command construction on every package
-  manager, missing-only detection, `--dry-run`, the consent rules, and
-  `--dev` virtual-environment paths.
+  manager, missing-only detection (including the macOS Command Line
+  Tools stubs), `--dry-run`, the consent rules, `--dev`
+  virtual-environment paths, and the `--dev` interpreter floor.
 - The `.gitignore` tripwire test.

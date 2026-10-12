@@ -12,8 +12,11 @@ Python 3.9.
 from __future__ import annotations
 
 import ast
+import importlib.util
+import os
 from pathlib import Path
 import sys
+import sysconfig
 from typing import Iterator, List, Tuple
 
 import pytest
@@ -217,13 +220,82 @@ def test_source_uses_no_python_310_apis(path: Path) -> None:
     assert findings == [], findings
 
 
+# Standard-library modules that exist only on some operating systems, so
+# `find_spec` cannot locate them on every host.
+PLATFORM_ONLY_STDLIB = frozenset(
+    {
+        "fcntl",
+        "grp",
+        "msvcrt",
+        "nt",
+        "posix",
+        "pwd",
+        "resource",
+        "syslog",
+        "termios",
+        "winreg",
+        "winsound",
+        "_winapi",
+    }
+)
+
+
+def _is_stdlib_module(name: str) -> bool:
+    """Return whether a top-level module ships with this interpreter (3.9).
+
+    `sys.stdlib_module_names` needs Python 3.10; on 3.9 a module counts as
+    standard library when it is built in or lives in the interpreter's own
+    library directories rather than in site-packages.
+    """
+
+    if name in sys.builtin_module_names or name in PLATFORM_ONLY_STDLIB:
+        return True
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return False
+    if spec is None:
+        return False
+    origin = spec.origin or ""
+    if origin in ("built-in", "frozen"):
+        return True
+    locations = [
+        os.path.normcase(os.path.abspath(path))
+        for key in ("stdlib", "platstdlib")
+        for path in [sysconfig.get_paths().get(key)]
+        if path
+    ]
+    normalized = os.path.normcase(os.path.abspath(origin))
+    return "site-packages" not in normalized and any(
+        normalized.startswith(location + os.sep) for location in locations
+    )
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("json", True),
+        ("hashlib", True),
+        ("sys", True),
+        ("ctypes", True),
+        ("pytest", False),
+        ("claude_wrangler", False),
+    ],
+)
+def test_the_python_39_stdlib_fallback_classifies_modules(
+    name: str, expected: bool
+) -> None:
+    assert _is_stdlib_module(name) is expected
+
+
 @pytest.mark.parametrize("module", FETCH_AND_VERIFY_MODULES)
 def test_fetch_and_verify_modules_import_only_the_standard_library(
     module: str,
 ) -> None:
     stdlib = getattr(sys, "stdlib_module_names", None)
-    if stdlib is None:
-        pytest.skip("sys.stdlib_module_names needs Python 3.10+")
+    is_stdlib = (
+        (lambda name: name in stdlib) if stdlib is not None else _is_stdlib_module
+    )
     path = PACKAGE_DIR / "{}.py".format(module)
     tree = ast.parse(path.read_text(encoding="utf-8"))
     outside: List[str] = []
@@ -239,7 +311,7 @@ def test_fetch_and_verify_modules_import_only_the_standard_library(
         else:
             continue
         outside.extend(
-            root for root in roots if root not in stdlib and root != "__future__"
+            root for root in roots if not is_stdlib(root) and root != "__future__"
         )
     assert outside == [], "{} imports {}".format(module, outside)
 
@@ -254,19 +326,23 @@ def test_the_scanner_catches_known_python_310_constructs() -> None:
         "    hashlib.file_digest(x, 'sha256')\n"
         "    isinstance(x, int | str)\n"
         "    int.from_bytes(b'x')\n"
-        "    match x:\n"
-        "        case _:\n"
-        "            pass\n"
     )
-    found = {description for _line, description in python310_findings(sample)}
-    assert found >= {
+    expected = {
         "runtime X | Y annotation",
         "zip(strict=) is 3.10+",
         "3.10+ attribute hashlib.file_digest",
         "isinstance with X | Y",
         "from_bytes without byteorder",
-        "Match statement",
         "3.10+ typing.TypeAlias",
     }
-    with pytest.raises(SyntaxError):
-        ast.parse(sample, feature_version=(3, 9))
+    # The scanner parses with the running interpreter's grammar, so the
+    # match statement joins the sample only where it can be parsed.
+    has_match = sys.version_info >= (3, 10)
+    if has_match:
+        sample += "    match x:\n        case _:\n            pass\n"
+        expected.add("Match statement")
+    found = {description for _line, description in python310_findings(sample)}
+    assert found >= expected
+    if has_match:
+        with pytest.raises(SyntaxError):
+            ast.parse(sample, feature_version=(3, 9))

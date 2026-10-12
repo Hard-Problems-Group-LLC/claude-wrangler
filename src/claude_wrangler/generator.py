@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import launcher_core
 from .atomicio import atomic_write_bytes, atomic_write_text
@@ -56,6 +56,7 @@ from .rendering import (
     launcher_core_source,
 )
 from .runtime import eprint
+from .slots import is_link_like
 
 LF = "\n"
 CRLF = "\r\n"
@@ -92,12 +93,16 @@ def _encode(text: str, newline: str, encoding: str = "utf-8") -> bytes:
 
 
 def planned_files(
-    config: Config, legacy: Optional[LegacyLaunch] = None
+    config: Config, legacy: Optional[LegacyLaunch] = None, *, strict: bool = True
 ) -> List[GeneratedFile]:
     """Return every generated file in publication order.
 
     Files inside the runtime root come first; the launcher shims and the
     README follow, so a published shim never points at a missing core.
+    With ``strict`` (the default) a file that cannot be rendered (a
+    non-ASCII path in an ASCII-only cmd file) raises; without it that file
+    is left out, so uninstall, inspect, and selftest still work for a
+    layout that could never be installed.
     """
 
     layout = config.layout
@@ -107,59 +112,52 @@ def planned_files(
         legacy_version=legacy.version if legacy is not None else None,
     )
     shim_dir = layout.shim_dir
-    return [
-        GeneratedFile(
-            "launch_py",
-            layout.launch_core_path,
-            launcher_core_source(),
-            False,
-            True,
-            (),
-        ),
-        GeneratedFile(
+    specs: List[Tuple[str, Path, Callable[[], bytes], bool, bool, Tuple[str, ...]]] = [
+        ("launch_py", layout.launch_core_path, launcher_core_source, False, True, ()),
+        (
             "launch_json",
             layout.launch_config_path,
-            _encode(launch_config_text(launch), LF),
+            lambda: _encode(launch_config_text(launch), LF),
             False,
             True,
             (),
         ),
-        GeneratedFile(
+        (
             "path_shim_sh",
             shim_dir / PATH_SHIM_NAME,
-            _encode(build_path_shim_sh(config), LF),
+            lambda: _encode(build_path_shim_sh(config), LF),
             True,
             True,
             (SCRIPT_MARKER,),
         ),
-        GeneratedFile(
+        (
             "path_shim_cmd",
             shim_dir / (PATH_SHIM_NAME + ".cmd"),
-            _encode(build_path_shim_cmd(config), CRLF, "ascii"),
+            lambda: _encode(build_path_shim_cmd(config), CRLF, "ascii"),
             False,
             True,
             (SCRIPT_MARKER,),
         ),
-        GeneratedFile(
+        (
             "launcher_sh",
             layout.launcher_path,
-            _encode(build_posix_shim(config), LF),
+            lambda: _encode(build_posix_shim(config), LF),
             True,
             False,
             (SCRIPT_MARKER,),
         ),
-        GeneratedFile(
+        (
             "launcher_cmd",
             layout.launcher_cmd_path,
-            _encode(build_cmd_shim(config), CRLF, "ascii"),
+            lambda: _encode(build_cmd_shim(config), CRLF, "ascii"),
             False,
             False,
             (SCRIPT_MARKER,),
         ),
-        GeneratedFile(
+        (
             "readme",
             layout.readme_path,
-            _encode(
+            lambda: _encode(
                 build_local_readme_content(config, legacy_pending=legacy is not None),
                 LF,
             ),
@@ -168,6 +166,41 @@ def planned_files(
             (README_MARKER,),
         ),
     ]
+    files: List[GeneratedFile] = []
+    for key, path, render, executable, owned, markers in specs:
+        try:
+            data = render()
+        except (ClaudeWranglerError, UnicodeEncodeError) as exc:
+            if strict:
+                if isinstance(exc, ClaudeWranglerError):
+                    raise
+                raise ClaudeWranglerError(
+                    "{} cannot be written as ASCII: {}".format(path, exc)
+                ) from exc
+            eprint("[claude-wrangler] Warning: skipping {} ({}).".format(path, exc))
+            continue
+        files.append(GeneratedFile(key, path, data, executable, owned, markers))
+    return files
+
+
+def legacy_pending_alternatives(config: Config) -> Dict[str, bytes]:
+    """Return the migration-pending renderings of files outside the runtime root.
+
+    `--update` and the settings toggles render the README with a
+    "migration pending" note while an npm-era layout is in charge. That
+    file is claude-wrangler's own output, so uninstall accepts it as proof
+    of ownership alongside the native rendering. Empty without a legacy
+    layout.
+    """
+
+    if config.legacy is None:
+        return {}
+    pending = LegacyLaunch("", config.legacy.version)
+    return {
+        item.key: item.data
+        for item in planned_files(config, pending, strict=False)
+        if not item.owned_by_runtime
+    }
 
 
 def _write_generated(item: GeneratedFile, config: Config) -> None:
@@ -175,6 +208,16 @@ def _write_generated(item: GeneratedFile, config: Config) -> None:
 
     if item.owned_by_runtime:
         if item.path.is_file() and item.path.read_bytes() == item.data:
+            # Unchanged bytes can still have lost the execute bit (a copy
+            # through a tool that drops modes); a non-executable PATH shim
+            # would make nested `claude` calls fall through to a global one.
+            if (
+                item.executable
+                and os.name != "nt"
+                and not config.dry_run
+                and not os.access(str(item.path), os.X_OK)
+            ):
+                os.chmod(str(item.path), 0o755)
             return
         if config.dry_run:
             eprint("[claude-wrangler] Would write: {}".format(item.path))
@@ -196,13 +239,48 @@ def _write_generated(item: GeneratedFile, config: Config) -> None:
 
 
 def check_config_settings(path: Path) -> None:
-    """Refuse early when `<config dir>/settings.json` is malformed.
+    """Refuse early when `<config dir>/settings.json` cannot be merged.
 
     Called before any runtime change so a malformed file never leaves an
-    operation half-published.
+    operation half-published. A symbolic link (or other non-regular entry)
+    that still lacks the suppression keys is refused here too: the merge
+    never writes through a link, because that would change a file shared
+    outside the project, so it would otherwise fail after promotion. A
+    linked file that already carries every key is left alone.
     """
 
-    _read_settings(path)
+    payload = _read_settings(path)
+    if not os.path.lexists(str(path)):
+        return
+    if is_link_like(path) or not path.is_file():
+        if _merged_settings(path, payload)[1]:
+            raise SettingsFileError(
+                "{} is a symbolic link or not a regular file, and it lacks the "
+                "self-update suppression settings claude-wrangler must add. "
+                "claude-wrangler never writes through a link (that would change "
+                "a file shared outside this project). Replace the link with a "
+                "regular copy of the file in the config dir, then rerun.".format(path)
+            )
+
+
+def _merged_settings(
+    path: Path, payload: Dict[str, Any]
+) -> Tuple[Dict[str, Any], bool]:
+    """Return the settings with the suppression keys merged and whether they changed."""
+
+    merged = dict(payload)
+    env = dict(merged.get("env") or {})
+    changed = not os.path.lexists(str(path))
+    for name, value in SELF_UPDATE_SUPPRESSION_ENV:
+        if env.get(name) != value:
+            env[name] = value
+            changed = True
+    if "env" not in merged or merged.get("env") != env:
+        merged["env"] = env
+    if merged.get(DEEP_LINK_SETTING_KEY) != DEEP_LINK_SETTING_VALUE:
+        merged[DEEP_LINK_SETTING_KEY] = DEEP_LINK_SETTING_VALUE
+        changed = True
+    return merged, changed
 
 
 def _read_settings(path: Path) -> Dict[str, Any]:
@@ -244,18 +322,7 @@ def merge_config_settings(path: Path, dry_run: bool = False) -> bool:
     when the file changed.
     """
 
-    payload = _read_settings(path)
-    env = dict(payload.get("env") or {})
-    changed = not path.exists()
-    for name, value in SELF_UPDATE_SUPPRESSION_ENV:
-        if env.get(name) != value:
-            env[name] = value
-            changed = True
-    if "env" not in payload or payload.get("env") != env:
-        payload["env"] = env
-    if payload.get(DEEP_LINK_SETTING_KEY) != DEEP_LINK_SETTING_VALUE:
-        payload[DEEP_LINK_SETTING_KEY] = DEEP_LINK_SETTING_VALUE
-        changed = True
+    payload, changed = _merged_settings(path, _read_settings(path))
     if not changed:
         return False
     action = "Would update" if dry_run else "Updating"
@@ -302,12 +369,17 @@ def write_generated_files(
 
 
 def generated_file_status(
-    config: Config, legacy: Optional[LegacyLaunch] = None
+    config: Config, legacy: Optional[LegacyLaunch] = None, *, strict: bool = False
 ) -> Dict[str, Dict[str, Any]]:
-    """Report, per generated file, whether it exists and is byte-for-byte fresh."""
+    """Report, per generated file, whether it exists and is byte-for-byte fresh.
+
+    On POSIX an executable file (the launcher and the PATH shim) counts as
+    fresh only while it keeps its execute permission. A file that cannot be
+    rendered for this layout is left out unless ``strict`` is set.
+    """
 
     report: Dict[str, Dict[str, Any]] = {}
-    for item in planned_files(config, legacy):
+    for item in planned_files(config, legacy, strict=strict):
         exists = item.path.is_file()
         fresh = False
         if exists:
@@ -315,25 +387,41 @@ def generated_file_status(
                 fresh = item.path.read_bytes() == item.data
             except OSError:
                 fresh = False
+            if fresh and item.executable and os.name != "nt":
+                fresh = os.access(str(item.path), os.X_OK)
         report[item.key] = {"path": str(item.path), "exists": exists, "fresh": fresh}
     return report
 
 
 def remove_generated_files(
-    config: Config, legacy: Optional[LegacyLaunch] = None
+    config: Config, legacy: Optional[LegacyLaunch] = None, *, strict: bool = True
 ) -> List[str]:
     """Remove the generated files outside the runtime root after ownership checks.
 
     Files inside the runtime root go away with the runtime root itself. A
     launcher or README that does not match its expected content is kept
-    unless it carries the managed marker and `--force` is given.
+    unless it carries the managed marker and `--force` is given. The
+    migration-pending rendering (``legacy_pending_alternatives``) proves
+    ownership too. Without ``strict`` a file that cannot be rendered for
+    this layout is skipped.
     """
 
+    alternatives = legacy_pending_alternatives(config)
     removed: List[str] = []
-    for item in planned_files(config, legacy):
+    for item in planned_files(config, legacy, strict=strict):
         if item.owned_by_runtime:
             continue
         expected = item.data.decode("utf-8")
+        alternative = alternatives.get(item.key)
+        if alternative is not None and item.path.is_file():
+            try:
+                current = item.path.read_bytes().decode("utf-8", "replace")
+            except OSError:
+                current = None
+            if current is not None and normalize_newlines(
+                current, LF
+            ) == normalize_newlines(alternative.decode("utf-8"), LF):
+                expected = alternative.decode("utf-8")
         if remove_file_if_managed(
             item.path,
             expected,

@@ -1,9 +1,10 @@
 """Injectable side-effect services for maintenance operations.
 
 Every operation that touches the network, runs a candidate binary, looks at
-the process table, or reads the clock goes through one `Services` object, so
-tests can replace each effect with an offline fake while the slot store,
-promotion, metadata, and generated files stay real.
+the process table, asks git which files it tracks, or reads the clock goes
+through one `Services` object, so tests can replace each effect with an
+offline fake while the slot store, promotion, metadata, and generated files
+stay real.
 
 The default implementations here also own two pieces of policy from
 `native_runtime_distribution_and_verification.md`:
@@ -28,6 +29,7 @@ import ntpath
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -375,6 +377,60 @@ def probe_settings_rejections(
     return rejected
 
 
+GIT_LS_FILES_TIMEOUT_SECONDS = 30.0
+
+
+def list_tracked_files(project_root: Path, paths: Sequence[Path]) -> List[str]:
+    """Return the files git tracks under ``paths`` (relative to the project).
+
+    Runs `git --literal-pathspecs -C <project root> ls-files -z -- <paths>`
+    with `core.fsmonitor` switched off, so a `.git/config` that came with an
+    untrusted checkout cannot make the query run a command. When git is
+    missing, the project is not inside a work tree, or git fails, nothing
+    can be tracked there and the result is empty; a timeout is reported and
+    treated the same way.
+    """
+
+    relative: List[str] = []
+    for path in paths:
+        try:
+            spelled = os.path.relpath(str(path), str(project_root))
+        except ValueError:
+            continue
+        if spelled == os.curdir or spelled.split(os.sep)[0] == os.pardir:
+            continue
+        relative.append(spelled.replace(os.sep, "/"))
+    if not relative:
+        return []
+    command = ["git", "-c", "core.fsmonitor=false", "--literal-pathspecs"]
+    command += ["-C", str(project_root), "ls-files", "-z", "--"] + relative
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=GIT_LS_FILES_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "[claude-wrangler] Warning: `git ls-files` did not finish within {:g} "
+            "seconds; could not check whether git tracks managed files.".format(
+                GIT_LS_FILES_TIMEOUT_SECONDS
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+    except OSError:
+        return []
+    if completed.returncode != 0:
+        return []
+    names = completed.stdout.decode("utf-8", "replace").split("\0")
+    return sorted({name for name in names if name})
+
+
 def default_release_source(
     base_url: str, timeout_seconds: float, ca_bundle: Optional[str]
 ) -> ReleaseSource:
@@ -421,6 +477,8 @@ class Services:
     * ``host_os`` is the host's platform-key prefix.
     * ``progress(label)`` returns a ``download_to`` progress callback.
     * ``environ`` is the base environment for scratch and launcher runs.
+    * ``tracked_files(project_root, paths)`` lists files git tracks under
+      ``paths``.
     """
 
     release_source: Callable[[str, float, Optional[str]], ReleaseSource] = (
@@ -448,6 +506,7 @@ class Services:
         lambda label: stderr_progress(label)
     )
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    tracked_files: Callable[[Path, Sequence[Path]], List[str]] = list_tracked_files
 
 
 def default_services() -> Services:

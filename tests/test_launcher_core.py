@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -95,8 +96,13 @@ class Project:
         subcommands: Optional[Sequence[str]] = ("mcp", "doctor", "plugin"),
         binary_name: str = "claude",
         record_overrides: Optional[Dict[str, Any]] = None,
+        stamp: bool = True,
     ) -> Path:
-        """Write a complete slot and return its binary path."""
+        """Write a complete slot and return its binary path.
+
+        With ``stamp`` the slot also gets the verification stamp maintenance
+        writes after a full verification, so the launcher runs it.
+        """
 
         slot = self.runtime / "slots" / name
         binary = slot / key / binary_name
@@ -127,7 +133,20 @@ class Project:
             record["subcommands"] = list(subcommands)
         record.update(record_overrides or {})
         (slot / ".complete.json").write_text(json.dumps(record), encoding="utf-8")
+        if stamp:
+            self.stamp_slot(name, key, binary)
         return binary
+
+    def stamp_slot(self, name: str, key: str, binary: Path) -> None:
+        """Write the verification stamp for ``binary`` as it is now."""
+
+        payload = {
+            "schema": core.VERIFICATION_STAMP_SCHEMA,
+            "binaries": {key: core._binary_identity(os.stat(str(binary)))},
+        }
+        (self.runtime / "slots" / name / core.VERIFICATION_STAMP_NAME).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
 
     def set_pointer(self, value: Any) -> None:
         """Write the active-slot pointer (str gets the LF appended)."""
@@ -1968,3 +1987,96 @@ def test_ring1_on_windows_creates_appdata_directories(project: Project) -> None:
     home = Path(paths.home_dir_fs)
     assert (home / "AppData" / "Roaming").is_dir()
     assert (home / "AppData" / "Local").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Verification stamp (ab_runtime_slots.md requirement 8)
+# ---------------------------------------------------------------------------
+
+
+def test_slot_without_a_verification_stamp_never_runs(project: Project) -> None:
+    project.install_slot("a", "2.1.250", stamp=False)
+    (project.runtime / "slots" / "a" / core.VERIFICATION_STAMP_NAME).unlink()
+
+    outcome = run(project, [])
+
+    assert outcome.code == 1
+    assert not outcome.launched
+    assert "no verification stamp" in outcome.stderr
+    assert "--repair-install" in outcome.stderr
+
+
+def test_binary_replaced_after_its_stamp_falls_back_to_the_verified_slot(
+    project: Project,
+) -> None:
+    project.install_slot("b", "2.1.240")
+    binary = project.runtime / "slots" / "a" / KEY / "claude"
+    data = b"y" * binary.stat().st_size
+    time.sleep(0.05)
+    # A clone or pull writes a new file with the same size.
+    incoming = binary.with_name("incoming")
+    incoming.write_bytes(data)
+    os.replace(str(incoming), str(binary))
+
+    outcome = run(project, ["-p", "x"])
+
+    assert outcome.code == 0
+    assert outcome.execs[0][0] == str(project.runtime / "slots" / "b" / KEY / "claude")
+    assert "changed after claude-wrangler last verified it" in outcome.stderr
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "{not json",
+        json.dumps({"schema": 2, "binaries": {}}),
+        json.dumps({"schema": 1, "binaries": {KEY: "nope"}}),
+        json.dumps({"schema": 1, "binaries": {"darwin-arm64": {"size": 1}}}),
+    ],
+)
+def test_a_malformed_or_foreign_stamp_counts_as_missing(
+    project: Project, stamp: str
+) -> None:
+    (project.runtime / "slots" / "a" / core.VERIFICATION_STAMP_NAME).write_text(
+        stamp, encoding="utf-8"
+    )
+
+    check = core.check_slot(str(project.runtime), "a", KEY)
+
+    assert not check.ok
+    assert "verification stamp" in check.reason
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 short names")
+def test_long_path_spelling_expands_an_8_3_spelling(tmp_path: Path) -> None:
+    from claude_wrangler.rendering import _windows_short_path
+
+    directory = tmp_path / "long-project-name" / "runtime-root"
+    directory.mkdir(parents=True)
+    short = _windows_short_path(str(directory))
+    if short is None or "~" not in short:
+        pytest.skip("8.3 short names are disabled on this volume")
+
+    expanded = core.long_path_spelling(short)
+
+    assert os.path.normcase(expanded) == os.path.normcase(str(directory))
+    assert core.long_path_spelling(str(directory)) == str(directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_session_directories_are_created_private(project: Project) -> None:
+    # A config dir and home the launcher creates hold transcripts and
+    # credentials, so they are private to the operator whatever the umask.
+    project.write_config(config_dir=".local/session", home_dir=".local/session/HOME")
+    previous = os.umask(0o022)
+    try:
+        outcome = run(project, ["-p", "x"])
+    finally:
+        os.umask(previous)
+
+    assert outcome.code == 0
+    for path in (
+        project.root / ".local" / "session",
+        project.root / ".local" / "session" / "HOME",
+    ):
+        assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0, path

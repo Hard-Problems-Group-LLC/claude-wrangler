@@ -135,6 +135,9 @@ where practical.
   claude-wrangler rollback caveat, TLS and proxies, and known
   limitations.
 - Windows and macOS operating-system classifiers in `pyproject.toml`.
+- `--allow-tracked-state`, which lets install, upgrade, repair,
+  `--update`, and `--rollback` proceed when git tracks managed runtime,
+  session-state, or launcher files.
 
 ### Changed
 
@@ -245,6 +248,54 @@ where practical.
   variables redirected so none can write into the real user profile.
 - `scripts/git_commit_with_changelog.py` no longer falls back to
   `sys.argv` when given an explicit empty argument list.
+- `--dry-run` with `--stop-background-sessions` no longer runs
+  `claude daemon stop --any` for `--uninstall` or `--rollback`; it
+  reports the stop it would run.
+- A partly failed uninstall keeps the ownership metadata (binaries go
+  first, metadata last), so a plain `--uninstall` rerun finishes
+  instead of demanding `--force`; uninstall also accepts the
+  migration-pending README that `--update` or a toggle rendered.
+- The Windows in-use check expands an 8.3 short image path, and the
+  launcher starts the binary by its long path, so a session started
+  through a short path can no longer have its slot displaced.
+- A non-ASCII `--local-dir` is refused before anything is downloaded,
+  and such a layout can always be uninstalled, inspected, and
+  self-tested; a `--local-dir` naming another project's directory is
+  refused.
+- The stale-state guard now digests the metadata the command actually
+  parsed, so a publish that lands while a command reads its state can
+  no longer be reverted by that command.
+- After an interrupted publish, a plain install or repair activates the
+  release the inactive slot already holds instead of downloading it
+  again, and the failure message says to rerun the same command.
+- npm-era discovery no longer follows a link or junction and requires
+  claude-wrangler's own metadata or managed `package.json`, so install
+  and uninstall can no longer delete another directory's `package.json`
+  or `node_modules`.
+- A symbolically linked `<config dir>/settings.json` that lacks the
+  suppression keys is refused before any download instead of failing
+  after promotion.
+- `bin/claude-local.cmd` leaves cmd.exe on its launch line, so an
+  upgrade that rewrites it during a session no longer makes cmd run
+  fragments of the new file or lose Claude Code's exit code.
+- Uninstall never deletes a maintenance lock another maintainer holds,
+  and on POSIX a maintainer refuses a lock file replaced while it was
+  being taken; a filesystem without file locks is reported as such
+  instead of as "another maintenance operation is already running".
+- macOS in-use detection uses `libproc`'s `proc_pidpath`, which follows
+  directory renames and symbolic links; `ps` is only a fallback.
+- The generated `sh` shims ignore an exported `CDPATH` and quote every
+  managed path, so `$`, backticks, and quotes in `--local-dir` stay
+  literal; `scripts/install_prerequisites.sh` ignores `CDPATH` too.
+- A byte-identical PATH shim that lost its execute bit is repaired, and
+  inspect and selftest report it.
+- `scripts/install_prerequisites.py` no longer counts the macOS Command
+  Line Tools stub `/usr/bin/git` as Git, and `--dev` refuses an
+  interpreter older than Python 3.12 instead of failing inside pip.
+- Python 3.9 on Windows: owned dangling launcher links are recognized
+  and removed, and a dangling link pointing out of the project is
+  refused by the containment checks (`Path.resolve()` does not follow
+  such links there).
 
 ### Security
 
@@ -275,3 +326,27 @@ where practical.
 - On native Windows, ring 1 no longer leaves `USERPROFILE`, `APPDATA`,
   and `LOCALAPPDATA` pointing at the real profile, and installers check
   every advertised home variable before writing user-scoped state.
+- A repository-supplied runtime is never trusted as verified. Install,
+  migration, the toggles, `--skip-install`, `--update`, rollback, and
+  repair re-verify a slot fully offline (both signatures, the manifest
+  hash, every binary's SHA-256, and the slot's exact file set) before
+  they keep or reuse it, and a slot that fails is never reused. The
+  launcher now runs a binary only while it matches the verification
+  stamp written after its last full verification
+  (`slots/<x>/.verified.json`: size, modification time, and on POSIX
+  inode), so a binary planted by a clone or replaced by a `git pull`
+  is refused. A copied checkout needs one `--repair-install`.
+- Install, upgrade, repair, `--update`, and `--rollback` refuse when git
+  tracks files under the runtime root, the config dir, the redirected
+  home, the npm-era layout, or the launchers (`--allow-tracked-state`
+  overrides); inspect and selftest report such files.
+- A slot that holds anything beyond its record, stamp, evidence, and
+  binaries (for example a DLL beside `claude.exe`) fails verification,
+  selftest, and repair, and loses its stamp.
+- `--update` renders a migration-pending launcher only for an npm-era
+  binary that matches the signed manifest; the offline toggles and
+  `--skip-install` render one only where a claude-wrangler launcher
+  already exists.
+- A non-default release host recorded in metadata is named before it is
+  contacted and in the install summary.
+- On POSIX the config dir and redirected home are kept at mode 0700.

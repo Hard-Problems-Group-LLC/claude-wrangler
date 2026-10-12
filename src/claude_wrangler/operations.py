@@ -11,6 +11,12 @@ the command again. The managed `.gitignore` block is written under the
 lock too. Side effects that leave the machine
 or run binaries go through a `services.Services` object so tests run fully
 offline. Inspection and self-test live in `inspection.py`.
+
+Nothing a repository can supply is trusted as verified: every operation
+that keeps, reuses, or activates a slot re-verifies it fully offline and
+records the verification stamp the launcher checks, and install-like
+operations refuse when the runtime, session state, or launchers are
+tracked by git (`--allow-tracked-state` overrides).
 """
 
 from __future__ import annotations
@@ -22,15 +28,22 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 import uuid
 
-from .atomicio import atomic_write_text
+from .atomicio import atomic_write_text, retry_on_windows_lock
 from .constants import (
+    FALLBACK_FILENAME,
+    LAUNCH_CONFIG_FILENAME,
+    LAUNCH_CORE_FILENAME,
     LEGACY_LOCAL_DIR,
     LEGACY_SCHEMA_VERSION,
     METADATA_FILENAME,
+    PATH_SHIM_DIRNAME,
+    SCRIPT_MARKER,
     SCRIPT_NAME,
     SCRIPT_VERSION,
+    UPDATE_CHECK_FILENAME,
 )
 from .distribution import (
+    DEFAULT_RELEASE_BASE_URL,
     VERSION_FLOOR,
     DistributionError,
     channel_deprecation_message,
@@ -51,6 +64,7 @@ from .generator import (
     check_config_settings,
     generated_file_status,
     launcher_session_environment,
+    legacy_pending_alternatives,
     planned_files,
     remove_generated_files,
     write_generated_files,
@@ -59,6 +73,7 @@ from .migration import (
     build_projection,
     cleanup_legacy_tree,
     discover_legacy,
+    find_adoptable_binary,
     legacy_binary_candidates,
     legacy_dir_candidates,
     legacy_dir_from_launcher,
@@ -67,7 +82,12 @@ from .migration import (
     select_legacy_launch_binary,
 )
 from .layout import managed_state_fingerprint
-from .models import ClaudeWranglerError, Config, LegacyState
+from .models import (
+    ClaudeWranglerError,
+    Config,
+    LegacyState,
+    ManagedStateChangedError,
+)
 from .releases import (
     apply_catalog,
     newer_release_note,
@@ -84,7 +104,12 @@ from .runtime import eprint, format_utc
 from .services import Services, default_services
 from .slots import (
     LOCK_NAME,
+    POINTER_NAME,
+    RETIRED_DIR_NAME,
     SLOT_NAMES,
+    SLOTS_DIR_NAME,
+    STAGING_DIR_NAME,
+    MaintenanceLockError,
     PointerError,
     RuntimeStore,
     check_runtime_root_placement,
@@ -105,7 +130,7 @@ from .transaction import (
     require_idle,
     select_platform_key,
     slot_binaries,
-    verify_slot_offline,
+    verify_and_stamp,
 )
 
 # Re-exported for the CLI and tests.
@@ -119,14 +144,8 @@ __all__ = [
     "update_operation",
 ]
 
-
-class ManagedStateChangedError(ClaudeWranglerError):
-    """Raised under the lock when another maintainer changed the state read.
-
-    The command derived its configuration before taking the maintenance
-    lock. It stops before changing anything, and `cli.main` re-reads the
-    state and runs the command again.
-    """
+# How many tracked paths a refusal names before summarizing the rest.
+TRACKED_PATHS_SHOWN = 10
 
 
 def require_unchanged_state(config: Config) -> None:
@@ -191,6 +210,148 @@ def check_runtime_placement(config: Config, environ: Mapping[str, str]) -> None:
         config_dir=layout.config_dir,
         extra_bases=extra,
     )
+    _refuse_foreign_runtime_root(layout.local_dir)
+
+
+# Entry names a claude-wrangler runtime root can hold; a non-empty directory
+# with none of them is someone else's (uninstall empties the runtime root).
+RUNTIME_ROOT_ENTRY_NAMES = (
+    METADATA_FILENAME,
+    LOCK_NAME,
+    POINTER_NAME,
+    SLOTS_DIR_NAME,
+    STAGING_DIR_NAME,
+    RETIRED_DIR_NAME,
+    LAUNCH_CORE_FILENAME,
+    LAUNCH_CONFIG_FILENAME,
+    PATH_SHIM_DIRNAME,
+    FALLBACK_FILENAME,
+    UPDATE_CHECK_FILENAME,
+)
+
+
+def _refuse_foreign_runtime_root(root: Path) -> None:
+    """Refuse a `--local-dir` that names an existing directory of other files.
+
+    Uninstall empties the runtime root, so installing into a directory that
+    already holds unrelated files (for example `--local-dir web`) would put
+    those files at risk later.
+    """
+
+    try:
+        if is_link_like(root) or not root.is_dir():
+            return
+        names = [name for name in os.listdir(str(root)) if name != ".DS_Store"]
+    except OSError:
+        return
+    if names and not any(name in RUNTIME_ROOT_ENTRY_NAMES for name in names):
+        raise ClaudeWranglerError(
+            "The runtime root {} already holds files that are not claude-wrangler's "
+            "({}). Choose a new or empty --local-dir.".format(
+                root, ", ".join(sorted(names)[:TRACKED_PATHS_SHOWN])
+            )
+        )
+
+
+def tracked_state_paths(config: Config) -> List[Path]:
+    """Return the managed paths a repository must not track.
+
+    The runtime root, the pinned config dir, the redirected home, the
+    generated launchers, and the npm-era legacy directory. A tracked file
+    there is one a clone or pull can replace with content claude-wrangler
+    never verified.
+    """
+
+    layout = config.layout
+    paths = [
+        layout.local_dir,
+        layout.config_dir,
+        layout.claude_home_dir,
+        layout.launcher_path,
+        layout.launcher_cmd_path,
+    ]
+    if config.legacy is not None:
+        paths.append(config.legacy.dir)
+    unique: List[Path] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def require_untracked_state(config: Config, services: Services) -> None:
+    """Refuse to act on runtime or session state that git tracks.
+
+    A repository that commits `.local/claude/...` (even past the managed
+    `.gitignore` block, with `git add -f`) supplies the binary, its
+    completion record, the settings, and the metadata pin a later run would
+    otherwise trust. `--allow-tracked-state` overrides the refusal for an
+    operator who tracks these files deliberately; the paths are still named.
+    """
+
+    tracked = services.tracked_files(config.project_root, tracked_state_paths(config))
+    if not tracked:
+        return
+    shown = ", ".join(tracked[:TRACKED_PATHS_SHOWN])
+    if len(tracked) > TRACKED_PATHS_SHOWN:
+        shown += ", and {} more".format(len(tracked) - TRACKED_PATHS_SHOWN)
+    if config.allow_tracked_state:
+        eprint(
+            "[claude-wrangler] Warning: git tracks managed runtime or session "
+            "files ({}); continuing because --allow-tracked-state was given.".format(
+                shown
+            )
+        )
+        return
+    raise ClaudeWranglerError(
+        "Refusing to continue: git tracks managed runtime, session-state, or "
+        "launcher files in this project: {}. A clone or pull can replace them "
+        "with content claude-wrangler never verified. Remove them from the "
+        "repository (for example `git rm -r --cached <path>`) or, if you track "
+        "them on purpose, rerun with --allow-tracked-state.".format(shown)
+    )
+
+
+def announce_release_source(config: Config) -> None:
+    """Name a non-default release host taken from recorded metadata.
+
+    Printed before any network call, so a host that came from a planted or
+    stale metadata file is visible before it is contacted. Signatures still
+    bind every byte to Anthropic's compiled-in keys.
+    """
+
+    url = config.release_base_url
+    if not url or url == DEFAULT_RELEASE_BASE_URL or config.release_base_url_explicit:
+        return
+    eprint(
+        "[claude-wrangler] Note: this project's metadata records the release "
+        "host {} instead of the default {}; pass --release-base-url to change "
+        "it.".format(url, DEFAULT_RELEASE_BASE_URL)
+    )
+
+
+def check_renderable(config: Config) -> None:
+    """Refuse a layout whose generated files cannot be written, before any change.
+
+    The cmd launcher is ASCII-only, so a non-ASCII `--local-dir` (or other
+    managed path) would otherwise fail after download and promotion.
+    """
+
+    planned_files(config)
+
+
+def _managed_launcher_exists(config: Config) -> bool:
+    """Return True when this checkout already has a claude-wrangler launcher."""
+
+    for path in (config.layout.launcher_path, config.layout.launcher_cmd_path):
+        try:
+            if is_link_like(path) or not path.is_file():
+                continue
+            if SCRIPT_MARKER in path.read_bytes().decode("utf-8", "replace"):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _launcher_env_factory(
@@ -275,27 +436,102 @@ def _publish_native(
     return config
 
 
-def _publish_legacy_mode(
+def _host_key_or_none(config: Config, services: Services) -> Optional[str]:
+    """Return the host platform key, warning and returning None when unknown."""
+
+    try:
+        return select_platform_key(services, config.platform_override)
+    except ClaudeWranglerError as exc:
+        eprint("[claude-wrangler] Warning: {}".format(exc))
+        return None
+
+
+def _structural_legacy_binary(
     config: Config, services: Services, legacy: LegacyState
+) -> Optional[str]:
+    """Return the npm-era binary that passes the structural check, if any.
+
+    Offline operations cannot hash it against a signed manifest, so they use
+    it only to keep an existing npm-era checkout's launcher running
+    (`legacy_npm_layout_migration.md` requirement 6).
+    """
+
+    key = _host_key_or_none(config, services)
+    if key is None:
+        return None
+    return select_legacy_launch_binary(
+        config.project_root, legacy, key, services.check_structure
+    )
+
+
+def _verified_legacy_binary(
+    config: Config, services: Services, legacy: LegacyState, source: object
+) -> Tuple[Optional[str], str]:
+    """Return the npm-era binary whose size and SHA-256 match the signed manifest.
+
+    `--update` contacts the release host anyway, so it fetches and verifies
+    the manifest for the version the npm-era layout pins and hashes each
+    candidate binary against it, as migration's adopt-in-place does; the
+    match must also pass the structural check. Returns the repo-relative
+    POSIX path, or None and the reason.
+    """
+
+    key = _host_key_or_none(config, services)
+    if key is None:
+        return None, "this host's platform could not be determined"
+    if legacy.version is None:
+        return None, "the npm-era layout does not record an exact version"
+    try:
+        check_version_floor(legacy.version)
+        bundle = source.fetch_manifest_bundle(legacy.version)
+        artifact = artifact_for(bundle, key)
+    except ClaudeWranglerError as exc:
+        return None, "its signed manifest could not be verified ({})".format(exc)
+    adoption = find_adoptable_binary(
+        legacy_binary_candidates(legacy.dir, key), artifact.size, artifact.checksum
+    )
+    for note in adoption.notes:
+        eprint("[claude-wrangler] {}".format(note))
+    if adoption.source is None:
+        return (
+            None,
+            "no runnable Claude Code binary in {} matches the signed manifest "
+            "for {}".format(legacy.dir, legacy.version),
+        )
+    try:
+        services.check_structure(adoption.source, key)
+    except (ClaudeWranglerError, OSError) as exc:
+        return (
+            None,
+            "no runnable Claude Code binary in {} passes the structural check "
+            "({})".format(legacy.dir, exc),
+        )
+    try:
+        relative = Path(
+            os.path.relpath(str(adoption.source), str(config.project_root))
+        ).as_posix()
+    except ValueError:
+        return None, "the npm-era binary is not inside the project"
+    return relative, ""
+
+
+def _publish_legacy_mode(
+    config: Config,
+    services: Services,
+    legacy: LegacyState,
+    binary: Optional[str],
+    reason: str = "",
 ) -> bool:
     """Render the Node-free legacy launcher and persist legacy metadata.
 
-    Returns False (and writes no launcher) when no runnable legacy binary
-    exists, so a launcher never points at a runtime that does not exist.
+    ``binary`` is the repo-relative npm-era binary the launcher runs; the
+    caller decides how it was vetted (hashed against the signed manifest by
+    `--update`, structurally checked by offline toggles on a checkout that
+    already has a claude-wrangler launcher). Returns False, and writes no
+    launcher, when ``binary`` is None, so a launcher never points at a
+    runtime that does not exist or was not vetted.
     """
 
-    key = None
-    try:
-        key = select_platform_key(services, config.platform_override)
-    except ClaudeWranglerError as exc:
-        eprint("[claude-wrangler] Warning: {}".format(exc))
-    binary = (
-        select_legacy_launch_binary(
-            config.project_root, legacy, key, services.check_structure
-        )
-        if key is not None
-        else None
-    )
     stamp = format_utc(services.clock())
     write_metadata(
         legacy.dir / METADATA_FILENAME,
@@ -304,9 +540,12 @@ def _publish_legacy_mode(
     )
     if binary is None:
         eprint(
-            "[claude-wrangler] Warning: migration pending and no runnable Claude "
-            "Code binary was found in {}; the launcher was not rewritten. Run "
-            "`{} .` to install the native runtime.".format(legacy.dir, SCRIPT_NAME)
+            "[claude-wrangler] Warning: migration pending and {}; the launcher "
+            "was not rewritten. Run `{} .` to install the native runtime.".format(
+                reason
+                or "no runnable Claude Code binary was found in {}".format(legacy.dir),
+                SCRIPT_NAME,
+            )
         )
         return False
     write_generated_files(config, LegacyLaunch(binary, legacy.version))
@@ -543,11 +782,24 @@ def _migrate(
     interrupted = False
     key = host_key
     active_record = store.slot_record(active) if active is not None else None
-    if active_record is not None and active_record.version == version:
+    reuse = False
+    if active is not None and active_record is not None:
+        if active_record.version == version:
+            # A slot a repository supplied is never trusted on its record
+            # alone: reuse only what verifies fully offline.
+            verification = verify_and_stamp(store, active, services, host_key)
+            reuse = verification.ok
+            if not reuse:
+                eprint(
+                    "[claude-wrangler] Slot {} records Claude Code {} but failed "
+                    "full offline verification ({}); not reusing it".format(
+                        active, version, verification.problem
+                    )
+                )
+    if reuse:
         eprint(
-            "[claude-wrangler] Slot {} already holds Claude Code {}; reusing it".format(
-                active, version
-            )
+            "[claude-wrangler] Slot {} already holds verified Claude Code {}; "
+            "reusing it".format(active, version)
         )
     else:
         _slot, interrupted, key = _install_release(
@@ -644,6 +896,9 @@ def _repair_runtime(
     verified slot whose version matches metadata. When the active slot is
     corrupt but the other slot verifies, the pointer moves to it first so
     the corrupt slot becomes the inactive one a re-download replaces.
+    Each slot that verifies gets a fresh verification stamp (so a moved or
+    restored checkout launches again without a download), and each slot
+    that fails loses its stamp, so no launcher falls back to it.
     Returns the report and the slot that should be active, if any.
     """
 
@@ -658,7 +913,7 @@ def _repair_runtime(
     if store.root.is_dir():
         _cleanup_runtime(store, services)
     verifications = {
-        name: verify_slot_offline(store, name, services, host_key)
+        name: verify_and_stamp(store, name, services, host_key, dry_run=config.dry_run)
         for name in SLOT_NAMES
     }
     for name, result in verifications.items():
@@ -716,14 +971,59 @@ def _needs_release(
     return store.slot_problem(active, key) is not None
 
 
+def _activate_verified_slot(
+    config: Config,
+    services: Services,
+    store: RuntimeStore,
+    *,
+    version: str,
+    host_key: str,
+    slot: Optional[str],
+) -> bool:
+    """Make ``slot`` active when it already holds a verified ``version``.
+
+    A release the inactive slot already holds (for example after an
+    interrupted upgrade, or a plain install returning to the pin) is
+    re-verified offline and activated by a pointer flip, which displaces
+    nothing, instead of being downloaded again. Returns True when the
+    pointer moved.
+    """
+
+    pointer = read_pointer_quietly(store)
+    if slot is None or slot == pointer:
+        return False
+    record = store.slot_record(slot)
+    if record is None or record.version != version:
+        return False
+    if host_key not in record.platforms:
+        return False
+    verification = verify_and_stamp(store, slot, services, host_key)
+    if not verification.ok:
+        eprint(
+            "[claude-wrangler] Slot {} records Claude Code {} but failed full "
+            "offline verification ({}); downloading instead".format(
+                slot, version, verification.problem
+            )
+        )
+        return False
+    store.set_active(slot)
+    eprint(
+        "[claude-wrangler] Slot {} already holds verified Claude Code {}; made it "
+        "active without downloading".format(slot, version)
+    )
+    return True
+
+
 def _install_locked(
     config: Config, services: Services, store: RuntimeStore
 ) -> InstallOutcome:
     """Install, upgrade, or repair with the maintenance lock held.
 
-    A plain install keeps the pinned version (downloading it only when the
-    active slot lacks it); `--channel`, `--version`, and `--upgrade` choose
-    a new target. A new release always goes into the inactive slot.
+    A plain install keeps the pinned version (downloading it only when no
+    verified slot holds it); `--channel`, `--version`, and `--upgrade`
+    choose a new target. A new release always goes into the inactive slot.
+    The active slot is reused only after a full offline verification, so a
+    slot a repository supplied is never trusted on its record alone.
     """
 
     store.validate()
@@ -734,6 +1034,7 @@ def _install_locked(
         if isinstance(config.existing_metadata, dict)
         else None
     )
+    pointer_before = read_pointer_quietly(store)
 
     repair: Optional[RepairReport] = None
     verified_active: Optional[str] = None
@@ -743,8 +1044,11 @@ def _install_locked(
     if legacy_is_authoritative(legacy, native_complete, native_generated_at):
         return _migrate(config, services, store, legacy)
 
+    active_verified = False
     if config.repair_install:
+        # _repair_runtime verified and stamped it already.
         active = verified_active
+        active_verified = active is not None
     else:
         try:
             active = store.active_slot()
@@ -752,16 +1056,35 @@ def _install_locked(
             raise ClaudeWranglerError(
                 "{} Run `{} --repair-install .`.".format(exc, SCRIPT_NAME)
             ) from exc
+        if active is not None:
+            # Integrity only: a slot that merely lacks this host's platform
+            # is intact, and _needs_release below adds the platform.
+            verification = verify_and_stamp(store, active, services)
+            active_verified = verification.ok
+            if not active_verified:
+                eprint(
+                    "[claude-wrangler] Warning: the active slot {} failed full "
+                    "offline verification ({}); it will not be reused or run. A "
+                    "verified release goes into the other slot.".format(
+                        active, verification.problem
+                    )
+                )
 
     working = config
     keeps_pin = config.operation == "install" and not (
         config.channel_explicit or config.version_explicit
     )
-    if keeps_pin and not config.claude_version and active is not None:
-        # No recorded pin (for example, lost metadata): keep what is active.
+    if keeps_pin and not config.claude_version and active_verified:
+        # No recorded pin (for example, lost metadata): keep what is active,
+        # but only a version a verified slot holds.
         record = store.slot_record(active)
         if record is not None:
             working = replace(working, claude_version=record.version)
+    if keeps_pin and working.claude_version:
+        eprint(
+            "[claude-wrangler] Keeping the pinned Claude Code {} (version source: "
+            "{})".format(working.claude_version, working.version_source)
+        )
 
     version, source = _resolve_target(
         working,
@@ -772,23 +1095,41 @@ def _install_locked(
     channel = working.claude_channel or "stable"
     interrupted = False
     key = host_key
-    if _needs_release(store, active, version, host_key):
+    if not active_verified or _needs_release(store, active, version, host_key):
         target_slot: Optional[str] = None
+        pointer = read_pointer_quietly(store)
         if config.repair_install:
-            pointer = read_pointer_quietly(store)
             target_slot = other_slot(pointer) if pointer is not None else SLOT_NAMES[0]
-        _slot, interrupted, key = _install_release(
+        if _activate_verified_slot(
             working,
             services,
             store,
             version=version,
-            channel=channel,
-            source=source,
-            platform_key=host_key,
-            allow_invalid_pointer=config.repair_install,
-            target_slot=target_slot,
-        )
-        summary = "installed Claude Code {} for {}".format(version, key)
+            host_key=host_key,
+            slot=(
+                target_slot
+                if target_slot is not None
+                else (other_slot(pointer) if pointer is not None else None)
+            ),
+        ):
+            summary = (
+                "activated the verified Claude Code {} already installed for {}".format(
+                    version, key
+                )
+            )
+        else:
+            _slot, interrupted, key = _install_release(
+                working,
+                services,
+                store,
+                version=version,
+                channel=channel,
+                source=source,
+                platform_key=host_key,
+                allow_invalid_pointer=config.repair_install,
+                target_slot=target_slot,
+            )
+            summary = "installed Claude Code {} for {}".format(version, key)
     else:
         summary = "Claude Code {} already installed for {} (slot {})".format(
             version, key, active
@@ -802,7 +1143,20 @@ def _install_locked(
         platform_key=key,
     )
     stamp = format_utc(services.clock())
-    _publish_native(final, services, generated_at=stamp)
+    try:
+        _publish_native(final, services, generated_at=stamp)
+    except (OSError, ClaudeWranglerError) as exc:
+        pointer_now = read_pointer_quietly(store)
+        if pointer_now is None or pointer_now == pointer_before:
+            raise
+        # The pointer flip already committed the new runtime; say how to
+        # finish rather than leaving the operator to guess.
+        raise ClaudeWranglerError(
+            "Slot {} (Claude Code {}) is now active, but publishing the metadata "
+            "and launchers failed: {}. Rerun the same command to finish "
+            "publishing; a plain `{} .` instead returns to the version the "
+            "metadata still pins.".format(pointer_now, version, exc, SCRIPT_NAME)
+        ) from exc
     _retry_legacy_cleanup(final, services, legacy, stamp)
     _cleanup_runtime(store, services)
     notes: List[str] = []
@@ -882,7 +1236,15 @@ def _print_plan(config: Config, services: Services) -> int:
 def _reconfigure(
     config: Config, services: Services, store: RuntimeStore
 ) -> InstallOutcome:
-    """Rewrite managed files from stored state (toggles and --skip-install)."""
+    """Rewrite managed files from stored state (toggles and --skip-install).
+
+    Nothing is downloaded. The active slot is re-verified offline (and
+    re-stamped) before a launcher for it is written. In a migration-pending
+    checkout the npm-era binary cannot be hashed offline, so its launcher is
+    rendered only where a claude-wrangler launcher already exists: legacy
+    mode keeps an existing npm-era checkout running and is never offered to
+    a fresh clone.
+    """
 
     store.validate()
     legacy = _rediscover_legacy(config)
@@ -898,11 +1260,33 @@ def _reconfigure(
         else None
     )
     if legacy_is_authoritative(legacy, native_complete, generated_at):
-        _publish_legacy_mode(config, services, legacy)
+        if not _managed_launcher_exists(config):
+            raise ClaudeWranglerError(
+                "Migration pending: {} holds an npm-era layout but this checkout "
+                "has no claude-wrangler launcher yet, so no launcher is rendered "
+                "for its unverified binary. Run `{} .` to migrate; it hashes the "
+                "binary against the signed manifest or downloads a verified "
+                "one.".format(legacy.dir, SCRIPT_NAME)
+            )
+        _publish_legacy_mode(
+            config,
+            services,
+            legacy,
+            _structural_legacy_binary(config, services, legacy),
+        )
         return InstallOutcome(config, "migration pending; managed files rewritten")
     working = config
     active = active_slot_for(store, host_key) if host_key else None
     if active is not None:
+        verification = verify_and_stamp(store, active, services, host_key)
+        if not verification.ok:
+            raise ClaudeWranglerError(
+                "The active runtime slot {} failed full offline verification ({}); "
+                "no managed file was rewritten, and its verification stamp was "
+                "removed so no launcher runs it. Run `{} --repair-install .`.".format(
+                    active, verification.problem, SCRIPT_NAME
+                )
+            )
         record = store.slot_record(active)
         if record is not None:
             working = replace(
@@ -918,6 +1302,9 @@ def install_like_operation(config: Config, services: Optional[Services] = None) 
     services = services or default_services()
     eprint("[claude-wrangler] Target project root: {}".format(config.project_root))
     eprint("[claude-wrangler] Operation: {}".format(config.operation))
+    check_renderable(config)
+    require_untracked_state(config, services)
+    announce_release_source(config)
     if config.dry_run:
         ensure_gitignore_block(config)
         return _print_plan(config, services)
@@ -953,6 +1340,9 @@ def update_operation(config: Config, services: Optional[Services] = None) -> int
         )
     eprint("[claude-wrangler] Target project root: {}".format(config.project_root))
     eprint("[claude-wrangler] Operation: update")
+    check_renderable(config)
+    require_untracked_state(config, services)
+    announce_release_source(config)
     eprint("[claude-wrangler] Refreshing stable and latest from signed manifests")
     if config.dry_run:
         ensure_gitignore_block(config)
@@ -964,6 +1354,34 @@ def update_operation(config: Config, services: Optional[Services] = None) -> int
     with store.lock():
         require_unchanged_state(config)
         ensure_gitignore_block(config)
+        legacy = _rediscover_legacy(config)
+        host_key = None
+        try:
+            host_key = select_platform_key(services, config.platform_override)
+        except ClaudeWranglerError:
+            host_key = None
+        generated_at = (
+            config.existing_metadata.get("generated_at")
+            if isinstance(config.existing_metadata, dict)
+            else None
+        )
+        legacy_mode = legacy_is_authoritative(
+            legacy, native_runtime_complete(store, host_key), generated_at
+        )
+        active = (
+            None if legacy_mode or not host_key else active_slot_for(store, host_key)
+        )
+        if active is not None:
+            # Verified before anything is written, so a launcher is only
+            # ever republished for a slot that verifies.
+            verification = verify_and_stamp(store, active, services, host_key)
+            if not verification.ok:
+                raise ClaudeWranglerError(
+                    "The active runtime slot {} failed full offline verification "
+                    "({}); nothing was refreshed, and its verification stamp was "
+                    "removed so no launcher runs it. Run `{} --repair-install "
+                    ".`.".format(active, verification.problem, SCRIPT_NAME)
+                )
         source = services.release_source(
             config.release_base_url, config.download_timeout_seconds, config.ca_bundle
         )
@@ -987,23 +1405,12 @@ def update_operation(config: Config, services: Optional[Services] = None) -> int
             config.layout.update_check_path,
             json.dumps(cache, indent=2, sort_keys=True) + "\n",
         )
-        legacy = _rediscover_legacy(config)
-        host_key = None
-        try:
-            host_key = select_platform_key(services, config.platform_override)
-        except ClaudeWranglerError:
-            host_key = None
-        generated_at = (
-            config.existing_metadata.get("generated_at")
-            if isinstance(config.existing_metadata, dict)
-            else None
-        )
-        if legacy_is_authoritative(
-            legacy, native_runtime_complete(store, host_key), generated_at
-        ):
-            _publish_legacy_mode(updated, services, legacy)
+        if legacy_mode and legacy is not None:
+            # The npm-era binary runs only after it hashes to the signed
+            # manifest for the version the layout pins.
+            binary, reason = _verified_legacy_binary(updated, services, legacy, source)
+            _publish_legacy_mode(updated, services, legacy, binary, reason)
         else:
-            active = active_slot_for(store, host_key) if host_key else None
             if active is not None:
                 record = store.slot_record(active)
                 if record is not None:
@@ -1047,6 +1454,8 @@ def rollback_operation(config: Config, services: Optional[Services] = None) -> i
                 store.root
             )
         )
+    check_renderable(config)
+    require_untracked_state(config, services)
     check_config_settings(config.layout.config_settings_path)
     host_key = select_platform_key(services, config.platform_override)
     with store.lock():
@@ -1082,7 +1491,9 @@ def rollback_operation(config: Config, services: Optional[Services] = None) -> i
             stop_binaries=slot_binaries(store, active) + slot_binaries(store, target),
             launcher_env=_launcher_env_factory(config, services),
         )
-        verification = verify_slot_offline(store, target, services, host_key)
+        verification = verify_and_stamp(
+            store, target, services, host_key, dry_run=config.dry_run
+        )
         if not verification.ok:
             raise ClaudeWranglerError(
                 "Refusing to roll back: {}".format(verification.problem)
@@ -1149,19 +1560,20 @@ def _outermost_missing_dir(path: Path, stop_at: Path) -> Optional[Path]:
 
 
 def _discard_lock_scaffolding(store: RuntimeStore, created: Optional[Path]) -> None:
-    """Remove a runtime root that only the uninstall's lock created.
+    """Remove the empty directories that only the uninstall's lock created.
 
     Taking the lock creates the runtime root when it is absent (an npm-era
     layout has none). When uninstall then stops, that empty scaffolding is
-    removed again so a refused uninstall leaves nothing behind.
+    removed again so a refused uninstall leaves nothing behind. The lock
+    file itself is never deleted here: the caller deletes its own lock
+    through `MaintenanceLock.release(delete=True)` while it still owns it,
+    so a lock another maintainer holds is never removed. A directory that
+    is not empty (another maintainer's lock or staging) stops the cleanup.
     """
 
     if created is None:
         return
     try:
-        lock_file = store.root / LOCK_NAME
-        if os.path.lexists(str(lock_file)):
-            lock_file.unlink()
         current = store.root
         while True:
             current.rmdir()
@@ -1175,17 +1587,29 @@ def _discard_lock_scaffolding(store: RuntimeStore, created: Optional[Path]) -> N
 def _uninstall_preflight(
     config: Config, services: Services, store: RuntimeStore
 ) -> List[Path]:
-    """Prove ownership and that nothing runs; return the roots to remove."""
+    """Prove ownership and that nothing runs; return the roots to remove.
 
-    status = generated_file_status(config)
-    for item in planned_files(config):
+    A file claude-wrangler itself rendered for a migration-pending layout
+    (the README carrying the migration note) proves ownership as well as
+    the native rendering does.
+    """
+
+    status = generated_file_status(config, strict=False)
+    alternatives = legacy_pending_alternatives(config)
+    for item in planned_files(config, strict=False):
         if item.owned_by_runtime or not item.path.exists():
             continue
         if status[item.key]["fresh"]:
             continue
         content = item.path.read_bytes().decode("utf-8", "replace")
-        expected = item.data.decode("utf-8")
-        if normalize_newlines(content, "\n") == normalize_newlines(expected, "\n"):
+        accepted = [item.data] + (
+            [alternatives[item.key]] if item.key in alternatives else []
+        )
+        if any(
+            normalize_newlines(content, "\n")
+            == normalize_newlines(expected.decode("utf-8"), "\n")
+            for expected in accepted
+        ):
             continue
         marked = any(marker in content for marker in item.markers)
         if not (marked and config.force):
@@ -1214,35 +1638,88 @@ def _uninstall_preflight(
     return roots
 
 
+def _runtime_removal_order(entry: Path) -> Tuple[int, str]:
+    """Sort key for uninstall: binaries first, the ownership proof last.
+
+    Staging, retired, and slot trees hold the binaries most likely to be
+    locked, so they go first; while they cannot be deleted the launcher
+    core and the metadata survive, the project still launches, and a rerun
+    of `--uninstall` still proves ownership. The metadata goes last.
+    """
+
+    if entry.name in (STAGING_DIR_NAME, RETIRED_DIR_NAME):
+        return 0, entry.name
+    if entry.name == SLOTS_DIR_NAME:
+        return 1, entry.name
+    if entry.name == METADATA_FILENAME:
+        return 3, entry.name
+    return 2, entry.name
+
+
+def _remove_legacy_tree(directory: Path) -> None:
+    """Remove an npm-era directory, keeping its ownership proof until last.
+
+    The npm tree goes first, then `package.json`, then the schema-1
+    metadata, so a partial failure still leaves what a rerun of
+    `--uninstall` needs to recognize the directory as claude-wrangler's.
+    """
+
+    if is_link_like(directory):
+        remove_runtime_tree(directory)
+        return
+
+    def order(entry: Path) -> Tuple[int, str]:
+        """Sort the ownership evidence after everything else."""
+
+        if entry.name == METADATA_FILENAME:
+            return 2, entry.name
+        if entry.name == "package.json":
+            return 1, entry.name
+        return 0, entry.name
+
+    for entry in sorted(directory.iterdir(), key=order):
+        remove_runtime_tree(entry)
+    retry_on_windows_lock(lambda: os.rmdir(str(directory)))
+
+
 def _uninstall_locked(config: Config, store: RuntimeStore) -> int:
     """Remove the runtime, legacy tree, generated files, and session state.
 
     Runs with the maintenance lock held, so everything goes except the lock
-    file and the directories that lead to it. If a binary cannot be deleted
-    the operation stops before session state (requirement 12).
+    file and the directories that lead to it. Binaries go first and the
+    metadata (the ownership proof a rerun needs) last. If a binary cannot be
+    deleted the operation stops before session state (requirement 12).
     """
 
     layout = config.layout
     legacy = config.legacy
+    metadata: Optional[Path] = None
     try:
         if store.root.is_dir() and not is_link_like(store.root):
-            for entry in sorted(store.root.iterdir()):
+            for entry in sorted(store.root.iterdir(), key=_runtime_removal_order):
                 if entry.name == LOCK_NAME:
+                    continue
+                if entry.name == METADATA_FILENAME:
+                    metadata = entry
                     continue
                 remove_runtime_tree(entry)
         if legacy is not None and legacy.dir.is_dir():
-            remove_runtime_tree(legacy.dir)
+            _remove_legacy_tree(legacy.dir)
             eprint("[claude-wrangler] Removed legacy npm layout {}".format(legacy.dir))
+        if metadata is not None:
+            remove_runtime_tree(metadata)
     except OSError as exc:
         eprint(
             "[claude-wrangler] ERROR: could not delete part of the runtime ({}). "
-            "Stopping before session state; the .gitignore block is kept. Close "
-            "any running Claude Code and rerun --uninstall.".format(exc)
+            "Stopping before session state; the .gitignore block and the "
+            "ownership metadata are kept, so rerunning --uninstall finishes the "
+            "removal once nothing holds the file (close any running Claude "
+            "Code first).".format(exc)
         )
         return 1
 
     try:
-        remove_generated_files(config)
+        remove_generated_files(config, strict=False)
         if not config.shared_home:
             remove_tree(
                 layout.claude_home_dir,
@@ -1266,15 +1743,51 @@ def _uninstall_locked(config: Config, store: RuntimeStore) -> int:
     return 0
 
 
+def _remove_emptied_runtime_root(store: RuntimeStore) -> Optional[str]:
+    """Remove the runtime root once only its (deleted) lock remained.
+
+    Returns a problem description when the root still holds anything: then
+    another maintainer created its own lock or staging after this uninstall
+    released the lock, and nothing of theirs is touched. A lock file left
+    behind (Windows refused to delete it) is deleted only after taking the
+    lock once more, so a lock another run holds is never removed.
+    """
+
+    root = store.root
+    if not root.is_dir() or is_link_like(root):
+        return None
+    names = sorted(os.listdir(str(root)))
+    if names == [LOCK_NAME]:
+        probe = store.lock()
+        try:
+            probe.acquire()
+        except MaintenanceLockError:
+            return "another claude-wrangler run holds the maintenance lock {}".format(
+                root / LOCK_NAME
+            )
+        probe.release(delete=True)
+        names = sorted(os.listdir(str(root)))
+    if names:
+        return "{} still holds {}; another claude-wrangler run may have started".format(
+            root, ", ".join(names)
+        )
+    retry_on_windows_lock(lambda: os.rmdir(str(root)))
+    eprint("[claude-wrangler] Removed runtime root {}".format(root))
+    return None
+
+
 def _uninstall_finish(config: Config, store: RuntimeStore) -> int:
-    """After the lock is released: delete the runtime root, then empty dirs."""
+    """After the lock file is deleted: remove the runtime root, then empty dirs."""
 
     layout = config.layout
     try:
-        if store.root.is_dir() and not is_link_like(store.root):
-            # Only the lock file and empty directories remain.
-            remove_runtime_tree(store.root)
-            eprint("[claude-wrangler] Removed runtime root {}".format(store.root))
+        problem = _remove_emptied_runtime_root(store)
+        if problem is not None:
+            eprint(
+                "[claude-wrangler] ERROR: {}. The .gitignore block is kept; rerun "
+                "--uninstall once that run has finished.".format(problem)
+            )
+            return 1
         remove_tree(
             layout.config_dir,
             label="managed Claude config directory",
@@ -1331,7 +1844,7 @@ def uninstall_operation(config: Config, services: Optional[Services] = None) -> 
         roots = _uninstall_preflight(config, services, store)
         for root in roots:
             eprint("[claude-wrangler] Would remove {}".format(root))
-        remove_generated_files(config)
+        remove_generated_files(config, strict=False)
         if not config.shared_home:
             remove_tree(
                 layout.claude_home_dir,
@@ -1354,6 +1867,8 @@ def uninstall_operation(config: Config, services: Optional[Services] = None) -> 
     try:
         lock.acquire()
     except BaseException:
+        # The lock may be another maintainer's: only empty directories this
+        # run created are removed, never the lock file.
         _discard_lock_scaffolding(store, created)
         raise
     try:
@@ -1361,13 +1876,15 @@ def uninstall_operation(config: Config, services: Optional[Services] = None) -> 
         _uninstall_preflight(config, services, store)
         code = _uninstall_locked(config, store)
     except BaseException:
-        lock.release()
+        # A lock file this run created is deleted while still held.
+        lock.release(delete=created is not None)
         _discard_lock_scaffolding(store, created)
         raise
-    lock.release()
     if code != 0:
+        lock.release(delete=created is not None)
         _discard_lock_scaffolding(store, created)
         return code
+    lock.release(delete=True)
     return _uninstall_finish(config, store)
 
 

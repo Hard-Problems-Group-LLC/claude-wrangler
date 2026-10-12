@@ -318,12 +318,21 @@ def launcher_path(
     return bin_dir / launcher_name
 
 
+def _real_path(path: Path) -> Path:
+    """Return ``path`` with links resolved, following dangling links too.
+
+    On Windows, Python 3.9's `Path.resolve()` does not follow a link whose
+    target is missing, so an owned launcher link to a deleted venv would
+    not be recognized; `os.path.realpath` follows it on every version.
+    """
+
+    return Path(os.path.realpath(str(path)))
+
+
 def _symlink_points_to(link: Path, target: Path) -> bool:
     """Return True when `link` is a symlink that resolves to `target`."""
 
-    return link.is_symlink() and link.resolve(strict=False) == target.resolve(
-        strict=False
-    )
+    return link.is_symlink() and _real_path(link) == _real_path(target)
 
 
 def _same_file_contents(left: Path, right: Path) -> bool:

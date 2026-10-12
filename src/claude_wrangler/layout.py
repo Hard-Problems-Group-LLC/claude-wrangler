@@ -30,6 +30,27 @@ RECORDED_PATH_KEYS = (
 )
 
 
+def real_path(path: Path) -> Path:
+    """Return ``path`` with every symbolic link and junction resolved.
+
+    `os.path.realpath` follows a link even when its target is missing. On
+    Windows, Python 3.9's `Path.resolve()` does not follow such a dangling
+    link, so a containment check built on it could accept a link that
+    points outside the project.
+    """
+
+    text = os.path.realpath(str(path))
+    if os.name == "nt":
+        # realpath keeps the extended-length prefix when it cannot prove the
+        # plain spelling equivalent (long paths); containment checks compare
+        # against plain spellings, so drop it as Path.resolve() does.
+        if text.startswith("\\\\?\\UNC\\"):
+            text = "\\\\" + text[8:]
+        elif text.startswith("\\\\?\\"):
+            text = text[4:]
+    return Path(text)
+
+
 def resolve_project_root(raw_path: str) -> Path:
     """Resolve and validate the target project directory."""
 
@@ -56,8 +77,16 @@ def resolve_relative_within_root(
     on Windows, because it is recorded in metadata and embedded in the
     `.gitignore` block and generated launcher files, all of which must
     read the same on every operating system that shares a checkout.
+    Control characters (a newline would end a line of a generated shell
+    script) are refused.
     """
 
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw_relative_path):
+        raise ClaudeWranglerError(
+            "{} may not contain control characters: {!r}".format(
+                label, raw_relative_path
+            )
+        )
     relative_path = Path(raw_relative_path)
     # On Windows, `\foo` (rooted, no drive) and `C:foo` (drive-relative)
     # are not "absolute" to pathlib yet would not stay under the project
@@ -75,7 +104,7 @@ def resolve_relative_within_root(
             "{} may not resolve to the project root itself.".format(label)
         )
 
-    resolved = (project_root / normalized_relative).resolve()
+    resolved = real_path(project_root / normalized_relative)
     try:
         resolved.relative_to(project_root)
     except ValueError as exc:

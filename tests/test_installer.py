@@ -159,7 +159,9 @@ def test_ensure_launcher_replaces_existing_file(tmp_path, require_symlinks):
 
     assert created == launcher
     assert launcher.is_symlink()
-    assert launcher.resolve() == target.resolve()
+    # os.path.realpath follows the dangling link on every Python version;
+    # Python 3.9's Path.resolve() does not on Windows.
+    assert Path(os.path.realpath(str(launcher))) == Path(os.path.realpath(str(target)))
 
 
 def test_ensure_launcher_copies_exe_on_windows(tmp_path):
@@ -376,6 +378,27 @@ def test_remove_launcher_if_owned_keeps_unrelated_target(tmp_path, require_symli
     assert removed is False
     assert launcher.exists()
     assert launcher.resolve() == other_target.resolve()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_remove_launcher_if_owned_removes_a_dangling_owned_symlink(
+    tmp_path, require_symlinks, windows
+):
+    # Venv-only uninstall deletes the venv before the launcher: the owned
+    # link then dangles, and it must still be recognized and removed.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    target = tmp_path / "venv" / "bin" / "claude-wrangler"
+    launcher = bin_dir / "claude-wrangler"
+    launcher.symlink_to(target)
+    assert not target.exists()
+
+    removed = remove_launcher_if_owned(
+        bin_dir, "claude-wrangler", target, windows=windows
+    )
+
+    assert removed is True
+    assert not os.path.lexists(str(launcher))
 
 
 def test_remove_launcher_if_owned_removes_matching_copy_on_windows(tmp_path):
