@@ -63,6 +63,15 @@ standard home for checkout-local operator state:
    Managed npm operations must set `NPM_CONFIG_CACHE` to
    `.local/claude/npm/.npm-cache` so package installs and npm scratch
    writes stay inside the project.
+5a. Self-update suppression
+   The launcher must export `DISABLE_UPDATES=1`,
+   `DISABLE_AUTOUPDATER=1`, and `DISABLE_INSTALLATION_CHECKS=1` before
+   executing Claude Code at every ring. Claude Code's updater and
+   installer write to `HOME`-relative locations rather than beside the
+   running binary, so without these exports a ring-0 session can
+   replace, downgrade, or delete the operator's global install, and an
+   npm-layout session can run a global `npm install -g`. Updates for a
+   managed install are claude-wrangler's responsibility.
 6. Coexistence with codex-wrangler
    `claude-wrangler` must be able to manage a repository that also
    carries a `codex-wrangler` install. Managed paths
@@ -80,7 +89,8 @@ standard home for checkout-local operator state:
 ## Validation
 
 - Launcher tests must cover the pinned config dir, the redirected home
-  and XDG paths, and both ring 0 escape hatches.
+  and XDG paths, both ring 0 escape hatches, and the self-update
+  suppression exports.
 - Operations tests must cover npm cache containment and direct local
   binary execution.
 - Inspection tests must cover the reported launcher environment.

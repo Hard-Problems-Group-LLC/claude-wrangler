@@ -42,6 +42,18 @@ NPM_INSTALL_LOGLEVELS = (
     "silly",
 )
 
+# Environment the launcher exports so Claude Code never updates or
+# reinstalls itself. Its updater targets HOME-relative paths rather than
+# the running binary, so at ring 0 it would rewrite the operator's global
+# install. DISABLE_UPDATES (Claude Code 2.1.118+) also blocks manual
+# `claude update` and `claude install`; DISABLE_AUTOUPDATER covers older
+# builds; DISABLE_INSTALLATION_CHECKS silences install-location nags.
+SELF_UPDATE_SUPPRESSION_ENV = (
+    ("DISABLE_UPDATES", "1"),
+    ("DISABLE_AUTOUPDATER", "1"),
+    ("DISABLE_INSTALLATION_CHECKS", "1"),
+)
+
 GITIGNORE_BEGIN = "# BEGIN managed by claude-wrangler"
 GITIGNORE_END = "# END managed by claude-wrangler"
 README_MARKER = "<!-- managed by claude-wrangler -->"

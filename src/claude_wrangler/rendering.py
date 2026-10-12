@@ -17,6 +17,7 @@ from .constants import (
     SCRIPT_NAME,
     SCRIPT_VERSION,
     SCRIPT_MARKER,
+    SELF_UPDATE_SUPPRESSION_ENV,
 )
 from .models import Config, Layout
 from .releases import CHANNEL_TO_SELECTOR
@@ -389,6 +390,11 @@ def build_launcher_content(config: Config) -> str:
         "# project-local home directory (ring 1); pass --shared-home or set",
         "# CLAUDE_LOCAL_SHARED_HOME=1 for one ring-0 session with the real",
         "# HOME.",
+        "#",
+        "# Claude Code's own updater and installer write wherever HOME points,",
+        "# not next to the running binary, so at ring 0 they would replace or",
+        "# delete the operator's global install. claude-wrangler owns updates",
+        "# for this project, so self-update and install checks stay disabled.",
         "",
         'repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
         'local_prefix="$repo_root/{}"'.format(config.layout.local_dir_relative),
@@ -397,8 +403,12 @@ def build_launcher_content(config: Config) -> str:
         'export CLAUDE_CONFIG_DIR="$repo_root/{}"'.format(
             config.layout.config_dir_relative
         ),
-        "",
     ]
+    lines.extend(
+        'export {}="{}"'.format(name, value)
+        for name, value in SELF_UPDATE_SUPPRESSION_ENV
+    )
+    lines.append("")
     lines.extend(build_launcher_home_lines(config))
     lines.extend([""])
     lines.extend(build_launcher_preflight_lines())

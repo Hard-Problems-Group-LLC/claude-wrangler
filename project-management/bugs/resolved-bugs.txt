@@ -6,3 +6,14 @@ include the ISO 8601 timestamp for when the fix was recorded, a short symptom
 summary, `Root cause:` analysis, and `Resolution:` notes. Add commit or test
 references when they help trace the fix. Keep any detailed closure records
 aligned under `closed/`.
+
+*
+
+2026-10-12T00:35:00-07:00 Launcher let Claude Code self-update outside
+the project; at ring 0 it could rewrite or delete the operator's global
+install. Root cause: Claude Code's updater targets HOME-relative paths,
+and the launcher never exported its update kill switches. Resolution:
+the launcher exports DISABLE_UPDATES, DISABLE_AUTOUPDATER, and
+DISABLE_INSTALLATION_CHECKS; spec requirement 5a and a launcher test
+cover it. Record:
+`closed/2026-10-12-launcher-self-update-escapes-project.md`.

@@ -202,6 +202,23 @@ def test_build_launcher_content_pins_config_dir_and_ring_selection(
     assert 'export HOME="$repo_root/.local/claude/HOME"' in launcher
 
 
+def test_build_launcher_content_disables_claude_self_update(
+    tmp_path,
+    config_factory,
+):
+    config = config_factory(tmp_path)
+
+    launcher = build_launcher_content(config)
+
+    assert 'export DISABLE_UPDATES="1"' in launcher
+    assert 'export DISABLE_AUTOUPDATER="1"' in launcher
+    assert 'export DISABLE_INSTALLATION_CHECKS="1"' in launcher
+    # The exports must precede the exec so every session inherits them.
+    assert launcher.index('export DISABLE_UPDATES="1"') < launcher.index(
+        'exec "$local_claude_bin"'
+    )
+
+
 def test_build_launcher_content_includes_reasonable_permissions_override_scan(
     tmp_path,
     config_factory,

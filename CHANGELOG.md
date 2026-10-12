@@ -39,3 +39,11 @@ where practical.
 
 
 ### Fixed
+
+- The generated `bin/claude-local` launcher now exports
+  `DISABLE_UPDATES=1`, `DISABLE_AUTOUPDATER=1`, and
+  `DISABLE_INSTALLATION_CHECKS=1`. Claude Code's self-updater targets
+  `HOME`-relative paths rather than the running binary, so a ring-0
+  session could previously rewrite or delete the operator's global
+  Claude Code install. Rerun `--update` to regenerate existing
+  launchers.
