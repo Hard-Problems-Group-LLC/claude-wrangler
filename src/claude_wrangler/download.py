@@ -319,8 +319,16 @@ def describe_tls_failure(
     detail: str,
     issuer: Optional[str] = None,
     platform: Optional[str] = None,
+    url: Optional[str] = None,
 ) -> str:
-    """Return the operator-facing message for a TLS verification failure."""
+    """Return the operator-facing message for a TLS verification failure.
+
+    On Windows, Python's ``ssl`` trusts only the root certificates already
+    in the Windows store, and a newly installed Windows downloads most roots
+    on first use through its own TLS stack. A missing issuer there usually
+    means no Windows program has reached that host yet, so the message
+    names the one request that makes Windows fetch the root.
+    """
 
     current_platform = sys.platform if platform is None else platform
     lines = [
@@ -337,6 +345,16 @@ def describe_tls_failure(
             "On macOS with a python.org Python, run 'Install "
             "Certificates.command' from the /Applications/Python 3.x/ "
             "folder to install a CA bundle for Python."
+        )
+    if current_platform == "win32" and "unable to get local issuer" in detail:
+        lines.append(
+            "On a newly installed Windows, Python trusts only the root "
+            "certificates Windows has already downloaded. One request "
+            "through Windows' own TLS fetches the missing root: powershell "
+            '-NoProfile -Command "Invoke-WebRequest -UseBasicParsing {} '
+            '| Out-Null", then run this command again.'.format(
+                url or "https://{}/".format(host)
+            )
         )
     return " ".join(lines)
 
@@ -599,7 +617,7 @@ class HttpsFetcher:
         if isinstance(inner, ssl.SSLCertVerificationError):
             detail = getattr(inner, "verify_message", None) or str(inner)
             return DownloadError(
-                describe_tls_failure(host, detail, self._presented_issuer(url))
+                describe_tls_failure(host, detail, self._presented_issuer(url), url=url)
             )
         if isinstance(inner, (socket.timeout, TimeoutError)):
             return _RetryableFailure(

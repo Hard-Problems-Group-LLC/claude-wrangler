@@ -4,6 +4,26 @@ Record completed tasks with newest entries at the top. Use asterisk-plus-blank
 line formatting. Include concise outcomes, owners, blocker resolution notes,
 and ISO 8601 timestamps.
 
+* Live end-to-end and Windows Sandbox verification
+  (`feature/windows-platform-support`, operator-approved downloads
+  2026-10-12T13:15:00-07:00). A scratch-only harness drove the
+  checkout's claude-wrangler against the real release host with every
+  home redirected: install 2.1.287, upgrade, offline rollbacks, a failed
+  offline upgrade, launch-time fallback, SHA-256 catches, re-download and
+  offline repair, no-valid-slot refusal with a decoy claude on PATH,
+  in-use refusals, the kill-on-close job, a copied checkout under a path
+  with a space, uninstall, credential removal and passthrough, and a
+  real-profile fingerprint before and after. An independent audit of the
+  harness tightened weak checks before the final runs. Windows Sandbox
+  showed: a fresh Windows lacks the release host's root until one
+  Windows-TLS request (now explained in the error); the launcher refuses
+  `update`; suppression holds without the launcher's environment through
+  the config-dir settings; a project `.claude/settings.json` env block
+  re-enables the updater for a launcher-less nested call, which then
+  installs only into the project's redirected HOME; ring-1 and ring-0
+  launches left the VM account's profile and a simulated global install
+  untouched. Owner: AI (Claude). Completed 2026-10-12T14:20:00-07:00.
+
 * Inherited credentials removed by default
   (`feature/windows-platform-support`, operator decision
   2026-10-12T13:16:00-07:00: "do not inherit API keys"). The launcher

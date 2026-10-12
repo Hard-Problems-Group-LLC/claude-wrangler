@@ -408,6 +408,27 @@ def test_describe_tls_failure_adds_macos_hint_only_on_darwin():
     assert "CN=X" in darwin
     assert "Install Certificates" not in windows
     assert HOST in windows
+    # A self-signed certificate is not the fresh-Windows missing-root case.
+    assert "Invoke-WebRequest" not in windows
+
+
+def test_describe_tls_failure_explains_a_missing_root_on_windows():
+    # Seen on a fresh Windows (Windows Sandbox): Python failed until one
+    # PowerShell request made Windows fetch GlobalSign Root CA.
+    url = BASE + "/stable"
+    windows = describe_tls_failure(
+        HOST, "unable to get local issuer certificate", "CN=WR3", "win32", url=url
+    )
+    assert "newly installed Windows" in windows
+    assert "Invoke-WebRequest -UseBasicParsing {} | Out-Null".format(url) in windows
+    linux = describe_tls_failure(
+        HOST, "unable to get local issuer certificate", "CN=WR3", "linux", url=url
+    )
+    assert "Invoke-WebRequest" not in linux
+    fallback = describe_tls_failure(
+        HOST, "unable to get local issuer certificate", None, "win32"
+    )
+    assert "https://{}/".format(HOST) in fallback
 
 
 def _der(tag: int, content: bytes) -> bytes:

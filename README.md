@@ -601,6 +601,14 @@ the signed size and SHA-256 exactly.
   server presented. On macOS with a python.org Python, run
   `Install Certificates.command` from the `/Applications/Python 3.x/`
   folder first.
+- Newly installed Windows: Python trusts only the root certificates
+  Windows has already downloaded, and a fresh Windows fetches most
+  roots on first use. Until some Windows program has reached
+  `downloads.claude.ai`, a download can fail with "unable to get local
+  issuer certificate". The error then names the fix: one request
+  through Windows' own TLS, such as
+  `powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing https://downloads.claude.ai/claude-code-releases/stable | Out-Null"`,
+  after which the command works.
 - Mirrors: `--release-base-url <https URL>` points at a mirror of the
   release distribution. Its host joins the allowlist, and the launcher's
   update checks use it too. Signatures are still checked against the

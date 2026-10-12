@@ -231,6 +231,13 @@ where practical.
 
 ### Fixed
 
+- On a newly installed Windows, a download that fails with "unable to
+  get local issuer certificate" now explains the cause (Python trusts
+  only roots Windows has already fetched) and names the one PowerShell
+  request that makes Windows fetch the missing root, instead of only
+  suggesting a TLS-inspecting proxy. Found in Windows Sandbox, where
+  `downloads.claude.ai`'s GlobalSign root was absent until such a
+  request.
 - The generated `bin/claude-local` launcher now exports
   `DISABLE_UPDATES=1`, `DISABLE_AUTOUPDATER=1`, and
   `DISABLE_INSTALLATION_CHECKS=1`. Claude Code's self-updater targets
