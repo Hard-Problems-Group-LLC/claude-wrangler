@@ -491,11 +491,16 @@ def selftest_operation(config: Config, services: Optional[Services] = None) -> i
         bool(report["state"]["metadata_exists"]),
         "schema-2 metadata at {}".format(config.layout.metadata_path),
     )
+    pending = bool(legacy_state["migration_pending"])
     record(
         "migration_not_pending",
-        not legacy_state["migration_pending"],
-        "the npm-era layout still needs migration; run `{} .`".format(SCRIPT_NAME),
-        warning=bool(legacy_state["migration_pending"]),
+        not pending,
+        (
+            "the npm-era layout still needs migration; run `{} .`".format(SCRIPT_NAME)
+            if pending
+            else "no npm-era layout awaits migration"
+        ),
+        warning=pending,
     )
 
     pointer = report["runtime"]["pointer"]

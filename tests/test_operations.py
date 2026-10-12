@@ -985,6 +985,9 @@ def test_selftest_passes_for_a_healthy_install(installed, capsys):
     assert "[PASS] slot_a_verified" in output
     assert "[PASS] launch_core_matches_package" in output
     assert "[PASS] active_binary_version_runs" in output
+    # The passing line describes the passing state, not the failure.
+    assert "[PASS] migration_not_pending - no npm-era layout awaits migration" in output
+    assert "still needs migration" not in output
 
 
 @pytest.mark.parametrize("shared", [False, True])

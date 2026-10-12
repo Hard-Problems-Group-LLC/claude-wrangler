@@ -231,6 +231,9 @@ where practical.
 
 ### Fixed
 
+- `--selftest` no longer says "the npm-era layout still needs
+  migration" on the passing `migration_not_pending` line of a project
+  with nothing to migrate.
 - On a newly installed Windows, a download that fails with "unable to
   get local issuer certificate" now explains the cause (Python trusts
   only roots Windows has already fetched) and names the one PowerShell
