@@ -128,22 +128,24 @@ the FieldManual items above: exec with `"$@"` directly (main never
 shifts) or use `${stage_2_args[@]+"${stage_2_args[@]}"}`, apply
 `CDPATH= cd --` to the managed root scripts' `cd "$(dirname ...)"`
 lines, and add a macOS CI step that runs `/bin/bash install.sh` with no
-arguments against a stub stage 2. Blockers: FieldManual availability.
+arguments against a stub stage 2. The request is drafted as
+`ECRs/TheKnowledge/open/install-sh-bash32-empty-array-and-cdpath.md`
+(2026-10-12T07:50:00-07:00). Blockers: FieldManual availability (or a
+writable TheKnowledge checkout for the ECR).
 
 *
 
-Correct the cross-platform CI proposal draft (review CI-1, added
-2026-10-12T05:40:00-07:00). In
-`proposals/under-review/github-actions-cross-platform-ci.md` the prose
-promises a Python 3.9 job for the launcher core and verifier, but the
-YAML only runs `python -m compileall` on `scripts` and `signing.py`.
-Before approval: run the full suite on Python 3.9 on ubuntu-latest and
-on macOS (3.9 mirrors Apple's 3.9.6); run every job through
-`python scripts/run_tests_isolated.py -q --timeout 180` rather than bare
-`pytest`; add an Alpine (musl) container leg and an ubuntu arm64 leg;
-lint the workflow with actionlint; and make the prose and the YAML
-agree. On this Windows host the full suite now passes on CPython 3.9.13
-with short temporary paths. Blockers: operator approval of the proposal.
+Review the corrected cross-platform CI proposal (review CI-1, added
+2026-10-12T05:40:00-07:00; draft corrected 2026-10-12T07:46:00-07:00).
+`proposals/under-review/github-actions-cross-platform-ci.md` now runs
+the full suite on Python 3.9 and 3.12 on ubuntu, macOS, and Windows
+through `python scripts/run_tests_isolated.py -q --timeout 180`, adds an
+Alpine (musl) container leg and an ubuntu arm64 leg where available,
+lints the workflow with actionlint, pins actions by full SHA (to be
+refreshed when adopted), keeps `submodules: false`, and its prose and
+YAML agree. Remaining: operator review, then refresh the SHAs and pin
+the Alpine image by digest when adopting it. Blockers: operator approval
+of the proposal.
 
 *
 
@@ -205,3 +207,82 @@ specifies, and the error tells the operator to rerun the same command.
 Decide whether maintenance should instead roll forward to the slot the
 pointer names (journal the intended pin before the flip), which would
 need a spec change. Blockers: operator decision.
+
+*
+
+Per-project credential stripping in the launcher (WIN-F1 follow-up,
+added 2026-10-12T07:55:00-07:00). The launcher now drops another Claude
+Code session's identity, messaging, and secure-storage variables and
+names inherited credential variables (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`CLAUDE_CODE_USE_BEDROCK`/`VERTEX`) once per session, but leaves them in
+place. Add an opt-in per-project switch (for example
+`--set-credential-env strip|keep`, recorded in metadata and
+`launch.json`) that removes them, plus the matching `AWS_*` and
+`GOOGLE_*` companions, for projects whose login must come only from the
+pinned config dir. Stripping by default would break legitimate direnv
+setups. Blockers: operator decision on the default and the flag name.
+
+*
+
+Redirect Claude Code's temporary tree at ring 1 (WIN-G2 follow-up,
+added 2026-10-12T07:55:00-07:00). `TEMP` and `TMP` stay shared, so
+Claude Code's per-project temporary trees land in the operator's
+`%TEMP%\claude`. Evaluate setting `CLAUDE_CODE_TMPDIR` (which 2.1.296
+reads) under the redirected home at ring 1 without changing `TEMP`/`TMP`
+for the tools Claude Code runs, and document the result. Blockers:
+confirming the variable's semantics without running a real session
+(operator-run).
+
+*
+
+Programmatic Windows entry point that keeps every launcher layer
+(WIN-A1 option 2, added 2026-10-12T07:55:00-07:00). Nested calls on
+Windows now reach the slot's `claude.exe` directly and skip the
+launcher's per-invocation layers (`--settings`, interception, the
+permission default, the stamp check); programs that call
+`bin\claude-local.cmd` meet cmd's argument re-parsing and should run
+`launch.py` with an argument list. If programmatic use of the
+top-level entry point matters, consider generating
+`bin\claude-local.exe` (and possibly `shim\claude.exe`) from a script
+launcher that passes the command line through verbatim. Costs: the
+launcher binds an absolute interpreter, needs per-architecture launcher
+blobs (vendored, with their antivirus false-positive history), and must
+be regenerated when the interpreter changes. Never generate a
+same-basename `.ps1`. Blockers: operator decision.
+
+*
+
+Report Windows session-directory ACLs in inspect and selftest (WIN-G1
+follow-up, added 2026-10-12T07:55:00-07:00). Maintenance now makes the
+config dir and redirected home private on Windows and warns about a
+checkout writable by broad groups. `--inspect` and `--selftest` should
+report the same: whether each directory's DACL is private, and whether
+the checkout root grants Users, Authenticated Users, or Everyone write
+access. Blockers: none.
+
+*
+
+Self-location of the root batch entry points (WIN-A3 follow-up, added
+2026-10-12T07:58:00-07:00). `install.cmd` and
+`scripts/install_prerequisites.cmd` still derive their helper paths from
+a top-level `%~dp0`, which names the caller's current directory when cmd
+finds the file through PATH by a quoted bare name. The generated
+launchers now use a called label instead, but these two files must stay
+label-free (they must parse with LF endings). They are normally run by
+path from the checkout, so the exposure needs the checkout root on PATH.
+Consider refusing when `%~f0` does not exist or `%~x0` is empty, and
+document that the entry points are run by path. Blockers: none.
+
+*
+
+Git Bash and the generated cmd shims under a checkout path with spaces
+(Windows recheck follow-up, added 2026-10-12T08:50:00-07:00). The
+recheck saw Git Bash fail to start `bin\claude-local.cmd` and
+`shim\claude.cmd` from a checkout whose path contains spaces; the error
+comes from MSYS quoting before the batch file runs, and the same case
+was not tried against the previous release. Git Bash users normally run
+the sh launcher (`bin/claude-local`), and nested calls now reach the
+slot's `claude.exe`, so the exposure is narrow. Reproduce against HEAD,
+then document it or route Git Bash callers to the sh shim. Blockers:
+none.

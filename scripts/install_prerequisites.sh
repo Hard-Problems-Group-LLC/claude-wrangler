@@ -37,6 +37,11 @@ find_python() {
 }
 
 python_install_hint() {
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    # /usr/bin/python3 is a Command Line Tools stub until the tools exist;
+    # installing them provides Apple's Python 3.9.
+    echo "  xcode-select --install"
+  fi
   if command -v apt-get >/dev/null 2>&1; then
     echo "  sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip"
   elif command -v dnf >/dev/null 2>&1; then

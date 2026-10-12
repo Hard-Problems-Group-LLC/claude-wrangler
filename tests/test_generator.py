@@ -7,6 +7,14 @@ Git Bash when present, from a checkout path containing spaces, non-ASCII
 characters, `&`, `%`, and parentheses; on POSIX through `sh`. On Windows the
 fake binary is a small C# console program compiled at test time with the
 .NET Framework compiler (the tests skip when csc.exe is absent).
+
+The Windows tests at the end cover nested `claude` calls from a launched
+session (every caller must reach the slot's `claude.exe` with verbatim
+arguments), quoted bare names found through PATH, `.bat` interpreter
+shims, inherited session variables, and killing the launcher. Any test
+that resolves a bare `claude` builds PATH explicitly, so the operator's
+own Claude Code can never run; argument tests use only a benign
+marker-file command.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -80,24 +89,106 @@ def config(tmp_path: Path):
     return make_config(project)
 
 
-def test_cmd_shim_is_ascii_crlf_label_free_and_forwards_args_last(config):
+SELF_LABEL_BLOCK = {
+    "launcher_cmd": [
+        ":claude_local_self",
+        'set "CLAUDE_LOCAL_SELF=%~dp0"',
+        "exit /b 0",
+        "",
+    ],
+    "path_shim_cmd": [
+        ":claude_local_self",
+        'set "CLAUDE_LOCAL_SHIM_SELF=%~dp0"',
+        "exit /b 0",
+        "",
+    ],
+}
+
+
+def test_cmd_shim_is_ascii_crlf_and_forwards_args_last_before_its_only_label(config):
     item = next(i for i in planned_files(config) if i.key == "launcher_cmd")
     data = item.data
     data.decode("ascii")
     assert b"\r\n" in data and data.count(b"\n") == data.count(b"\r\n")
     lines = data.decode("ascii").split("\r\n")
-    assert not [line for line in lines if line.lstrip().startswith(":")]
     assert "goto" not in data.decode("ascii").lower()
     with_args = [index for index, line in enumerate(lines) if "%*" in line]
     assert len(with_args) == 1
     final = lines[with_args[0]]
     assert final.startswith('"%CLAUDE_LOCAL_PY%" %CLAUDE_LOCAL_PYARG% -I ')
-    assert lines[with_args[0] + 1 :] == [
-        'set "CMD_EXIT=%ERRORLEVEL%"',
-        "exit /b %CMD_EXIT%",
-        "",
+    # The launch line exits; only the self-location label follows the
+    # CMD_EXIT fallback, and it is reached by `call` before the launch.
+    assert (
+        lines[with_args[0] + 1 :]
+        == [
+            'set "CMD_EXIT=%ERRORLEVEL%"',
+            "exit /b %CMD_EXIT%",
+        ]
+        + SELF_LABEL_BLOCK["launcher_cmd"]
+    )
+    labels = [index for index, line in enumerate(lines) if line.startswith(":")]
+    assert len(labels) == 1 and labels[0] > with_args[0]
+    calls = [index for index, line in enumerate(lines) if line.startswith("call ")]
+    assert [lines[index] for index in calls] == ["call :claude_local_self"]
+    assert calls[0] < with_args[0]
+    # %~dp0 is read only inside the called label.
+    assert [line for line in lines if "%~dp0" in line] == [
+        'set "CLAUDE_LOCAL_SELF=%~dp0"'
     ]
     assert "managed by claude-wrangler" in lines[1]
+
+
+def test_cmd_shims_probe_only_exe_interpreters_without_auto_install(config):
+    text = build_cmd_shim(config)
+    lines = text.split("\n")
+    for name in ("py.exe -3 -I -c", "python3.exe -I -c", "python.exe -I -c"):
+        assert any(line.strip().startswith(name) for line in lines), name
+    assert not any(
+        line.strip().startswith(("py -3", "python3 -I", "python -I")) for line in lines
+    )
+    inner = lines.index("setlocal")
+    assert lines[inner + 1] == 'set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"'
+    restore = next(
+        index for index, line in enumerate(lines) if line.startswith("endlocal & ")
+    )
+    probes = [index for index, line in enumerate(lines) if " -I -c " in line]
+    launch = next(index for index, line in enumerate(lines) if "%*" in line)
+    assert inner < min(probes) and max(probes) < restore < launch
+    # The caller's value is never expanded, only restored by endlocal.
+    assert "%PYTHON_MANAGER_AUTOMATIC_INSTALL%" not in text
+
+
+def test_sh_shim_probes_run_without_auto_install(config):
+    text = build_posix_shim(config)
+    probes = [
+        line for line in text.split("\n") if '-I -c "$claude_local_probe"' in line
+    ]
+    assert len(probes) == 3
+    for line in probes:
+        assert "PYTHON_MANAGER_AUTOMATIC_INSTALL=false " in line
+    assert not [
+        line
+        for line in text.split("\n")
+        if line.strip().startswith("exec") and "PYTHON_MANAGER" in line
+    ]
+
+
+def test_path_shim_cmd_locates_itself_through_its_label(config):
+    item = next(i for i in planned_files(config) if i.key == "path_shim_cmd")
+    lines = item.data.decode("ascii").split("\r\n")
+    assert lines[4:13] == [
+        "setlocal EnableExtensions DisableDelayedExpansion",
+        'set "CLAUDE_LOCAL_SHIM_SELF="',
+        "call :claude_local_self",
+        "if not defined CLAUDE_LOCAL_SHIM_SELF (",
+        "  >&2 echo claude: cannot find its own directory. Rerun claude-wrangler "
+        "--repair-install to regenerate it.",
+        "  exit /b 1",
+        ")",
+        '"%CLAUDE_LOCAL_SHIM_SELF%..\\..\\..\\..\\bin\\claude-local.cmd" %*',
+        "exit /b",
+    ]
+    assert lines[13:] == SELF_LABEL_BLOCK["path_shim_cmd"]
 
 
 def test_posix_shim_is_lf_sh_with_probed_fallbacks(config):
@@ -119,13 +210,13 @@ def test_shims_for_a_nested_launcher_climb_to_the_repository(tmp_path):
     assert '$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)' in build_posix_shim(
         config
     )
-    assert 'for %%I in ("%~dp0..\\..") do' in build_cmd_shim(config)
+    assert 'for %%I in ("%CLAUDE_LOCAL_SELF%..\\..") do' in build_cmd_shim(config)
     assert (
         '"$(dirname -- "$0")"/\'../../../../tools/x/claude-local\''
         in build_path_shim_sh(config)
     )
     assert (
-        '"%~dp0..\\..\\..\\..\\tools\\x\\claude-local.cmd" %*'
+        '"%CLAUDE_LOCAL_SHIM_SELF%..\\..\\..\\..\\tools\\x\\claude-local.cmd" %*'
         in build_path_shim_cmd(config)
     )
 
@@ -318,6 +409,18 @@ class Launched:
 
         return str(self.project / ".local" / "claude")
 
+    @property
+    def shim_dir(self) -> Path:
+        """Return the nested-claude PATH shim directory."""
+
+        return self.project / ".local" / "claude" / "wrangler" / "shim"
+
+    @property
+    def slot_platform_dir(self) -> str:
+        """Return slot a's directory for this host's platform key."""
+
+        return os.path.join(self.config_dir, "wrangler", "slots", "a", host_key())
+
 
 def assert_ring1_launch(
     launched: Launched, completed, args: List[str]
@@ -344,9 +447,17 @@ def assert_ring1_launch(
     else:
         path_value = env["PATH"]
     shim_dir = os.path.join(launched.config_dir, "wrangler", "shim")
-    assert path_value.split(os.pathsep)[0] == shim_dir
+    entries = path_value.split(os.pathsep)
+    if WINDOWS:
+        # Nested `claude` reaches the slot's claude.exe first, then the shim.
+        assert entries[:2] == [launched.slot_platform_dir, shim_dir]
+        assert child["image"] == os.path.join(launched.slot_platform_dir, "claude.exe")
+    else:
+        assert entries[0] == shim_dir
     assert "MSYS_NO_PATHCONV" not in env
     assert "CLAUDE_LOCAL_MSYS_ARGS" not in env
+    for name in ("CLAUDE_LOCAL_CORE", "CLAUDE_LOCAL_PY", "CLAUDE_LOCAL_SELF"):
+        assert name not in env, name
     return child
 
 
@@ -797,3 +908,338 @@ def test_cmd_shim_refuses_a_double_quote_in_a_managed_path(tmp_path):
 
     with pytest.raises(ClaudeWranglerError, match="double quote"):
         build_cmd_shim(config)
+
+
+# ---------------------------------------------------------------------------
+# Windows: nested calls, shim self-location, interpreter probes, process tree
+# ---------------------------------------------------------------------------
+
+
+def system32() -> Path:
+    """Return the Windows System32 directory."""
+
+    return Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+
+
+def explicit_path(*entries: Path) -> str:
+    """Return a PATH of the given directories plus System32, and nothing else.
+
+    Tests that resolve a bare `claude` must never inherit the caller's PATH,
+    which may hold the operator's own Claude Code.
+    """
+
+    return ";".join([str(entry) for entry in entries] + [str(system32())])
+
+
+def nested_arguments(marker: Path) -> List[str]:
+    """Return arguments that cmd.exe would re-parse if it saw them.
+
+    A quote break followed by a benign command that only creates
+    ``marker``, a percent-variable token, a caret, and a JSON document with
+    quotes and an ampersand.
+    """
+
+    quote_break = 'q x" & type nul > ' + str(marker) + ' & rem "'
+    document = json.dumps({"mcpServers": {"x": {"command": "a&b", "args": ["c d"]}}})
+    return [quote_break, "%" + "OS" + "%", "a^b", document]
+
+
+def powershell_command(args: List[str]) -> str:
+    """Return a PowerShell command that calls bare `claude` with ``args``."""
+
+    literal = ",".join("'{}'".format(arg.replace("'", "''")) for arg in args)
+    return "& claude @({}); exit $LASTEXITCODE".format(literal)
+
+
+NESTED_DRIVER = """\
+import shutil, subprocess, sys
+mode, args = sys.argv[1], sys.argv[2:]
+target = {"bare": "claude", "which": shutil.which("claude"),
+          "which-exe": shutil.which("claude.exe")}[mode]
+sys.exit(subprocess.run([target] + args).returncode)
+"""
+
+
+def base_interpreter() -> Optional[str]:
+    """Return the base interpreter behind this (venv) test run, if any."""
+
+    candidate = Path(sys.base_prefix) / "python.exe"
+    return str(candidate) if candidate.is_file() else None
+
+
+@windows_only
+def test_nested_claude_calls_reach_the_slot_binary_with_verbatim_arguments(
+    launched, tmp_path, fake_claude_bytes
+):
+    # A stand-in for a global Claude Code later on PATH must never run, and
+    # no caller may reach a batch file that re-parses the arguments.
+    global_bin = tmp_path / "global-bin"
+    global_bin.mkdir()
+    (global_bin / "claude.exe").write_bytes(fake_claude_bytes)
+    marker = tmp_path / "mk" / "marker.txt"
+    marker.parent.mkdir()
+    if any(char in str(marker) for char in ' &()^%!"'):
+        pytest.skip("the temporary path cannot carry the marker command")
+    completed = launched.run(
+        'cmd /d /s /c ""bin\\claude-local.cmd" seed"',
+        env=launched.env(PATH=explicit_path(global_bin)),
+    )
+    assert completed.returncode == 7, completed.stderr
+    session = launched.child()["env"]
+    slot_image = os.path.join(launched.slot_platform_dir, "claude.exe")
+    assert session["PATH"].split(";")[:3] == [
+        launched.slot_platform_dir,
+        str(launched.shim_dir),
+        str(global_bin),
+    ]
+    driver = tmp_path / "nested_driver.py"
+    driver.write_text(NESTED_DRIVER, encoding="utf-8")
+    args = nested_arguments(marker)
+
+    def nested(command: Any, verbatim: bool) -> None:
+        """Run one caller form from the session environment and check it."""
+
+        if launched.report.exists():
+            launched.report.unlink()
+        result = subprocess.run(
+            command,
+            cwd=str(tmp_path),
+            env=session,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 7, (command, result.stderr)
+        child = launched.child()
+        assert os.path.normcase(child["image"]) == os.path.normcase(slot_image), command
+        assert not marker.exists(), command
+        if verbatim:
+            assert child["argv"] == args, command
+
+    for mode in ("bare", "which", "which-exe"):
+        nested([sys.executable, "-I", str(driver), mode] + args, True)
+    for shell, verbatim in (
+        ("pwsh.exe", True),
+        (str(system32() / "WindowsPowerShell" / "v1.0" / "powershell.exe"), False),
+    ):
+        # PowerShell 5.1 applies its own legacy quoting to native arguments.
+        resolved = shell if os.path.isabs(shell) else shutil.which(shell)
+        if resolved and os.path.isfile(resolved):
+            nested(
+                [resolved, "-NoProfile", "-NonInteractive", "-Command"]
+                + [powershell_command(args)],
+                verbatim,
+            )
+    if launched.report.exists():
+        launched.report.unlink()
+    plain = subprocess.run(
+        "cmd /d /s /c claude plain",
+        cwd=str(tmp_path),
+        env=session,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    assert plain.returncode == 7, plain.stderr
+    assert os.path.normcase(launched.child()["image"]) == os.path.normcase(slot_image)
+    assert launched.child()["argv"] == ["plain"]
+    bash = git_bash()
+    if bash is not None:
+        nested(
+            [str(bash), "--noprofile", "--norc", "-c", 'claude "$@"', "bash"] + args,
+            True,
+        )
+
+
+@windows_only
+@pytest.mark.parametrize("target", ["path_shim", "launcher"])
+def test_quoted_bare_names_found_through_path_run_this_project(
+    launched, tmp_path, target
+):
+    # cmd.exe sets a top-level %~dp0 from the caller's current directory when
+    # it finds a batch file through PATH by a quoted bare name; a tree laid
+    # out around that directory must not supply the launcher or its core.
+    decoy = tmp_path / "decoy"
+    marker = tmp_path / "decoy-ran.txt"
+    (decoy / "bin").mkdir(parents=True)
+    (decoy / "bin" / "claude-local.cmd").write_bytes(
+        '@echo off\r\ntype nul > "{}"\r\nexit /b 0\r\n'.format(marker).encode("ascii")
+    )
+    decoy_core = decoy / ".local" / "claude" / "wrangler" / "launch.py"
+    decoy_core.parent.mkdir(parents=True)
+    decoy_core.write_text("open({!r}, 'w').close()\n".format(str(marker)), "utf-8")
+    if target == "path_shim":
+        cwd = decoy / "l1" / "l2" / "l3" / "l4"
+        directory = launched.shim_dir
+        names = ['"claude"', '"claude.cmd"']
+    else:
+        cwd = decoy / "sub"
+        directory = launched.project / "bin"
+        names = ['"claude-local"', '"claude-local.cmd"']
+    cwd.mkdir(parents=True)
+    env = launched.env(PATH=explicit_path(directory))
+    for name in names:
+        for command in (
+            'cmd /d /s /c "{} plain"'.format(name),
+            "cmd /d /c {} plain".format(name),
+        ):
+            if launched.report.exists():
+                launched.report.unlink()
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            assert not marker.exists(), command
+            assert completed.returncode == 7, (command, completed.stderr)
+            child = launched.child()
+            assert child["argv"][-1] == "plain"
+            assert child["image"] == os.path.join(
+                launched.slot_platform_dir, "claude.exe"
+            )
+
+
+@windows_only
+def test_path_shim_keeps_its_variables_to_itself(launched):
+    completed = launched.run(
+        'cmd /d /s /c ""{}" x & set CLAUDE_LOCAL_"'.format(
+            launched.shim_dir / "claude.cmd"
+        )
+    )
+    assert b"CLAUDE_LOCAL_SHIM_SELF" not in completed.stdout
+    assert b"CLAUDE_LOCAL_SELF" not in completed.stdout
+    assert launched.child()["argv"][-1] == "x"
+
+
+@windows_only
+@pytest.mark.parametrize("shim", ["launcher", "path_shim"])
+def test_cmd_shims_never_run_a_bat_interpreter_shim(launched, tmp_path, shim):
+    # pyenv-win style python.bat shims would take over the batch file and
+    # exit 0 without launching anything.
+    from dataclasses import replace
+
+    if any((system32() / name).exists() for name in ("py.exe", "python.exe")):
+        pytest.skip("System32 holds a Python interpreter")
+    stubs = tmp_path / "bat stubs"
+    stubs.mkdir()
+    for name in ("py.bat", "python3.bat", "python.bat"):
+        (stubs / name).write_bytes(b"@echo off\r\nexit /b 0\r\n")
+    config = replace(
+        make_config(
+            launched.project,
+            "--set-update-checks",
+            "off",
+            "--set-windows-sandbox-warning",
+            "off",
+        ),
+        launcher_python="C:\\missing\\python.exe",
+    )
+    write_generated_files(config)
+    target = (
+        launched.project / "bin" / "claude-local.cmd"
+        if shim == "launcher"
+        else launched.shim_dir / "claude.cmd"
+    )
+    completed = launched.run(
+        'cmd /d /s /c ""{}" x"'.format(target),
+        env=launched.env(PATH=explicit_path(stubs)),
+    )
+    assert completed.returncode == 127, completed.stdout
+    assert b"no Python 3.9+ interpreter was found" in completed.stderr
+    assert not launched.report.exists()
+
+
+@windows_only
+@pytest.mark.parametrize("value", [None, "true"])
+def test_cmd_shim_keeps_the_callers_python_manager_setting(launched, value):
+    env = launched.env()
+    env.pop("PYTHON_MANAGER_AUTOMATIC_INSTALL", None)
+    if value is not None:
+        env["PYTHON_MANAGER_AUTOMATIC_INSTALL"] = value
+    completed = launched.run('cmd /d /s /c ""bin\\claude-local.cmd" x"', env=env)
+    assert completed.returncode == 7, completed.stderr
+    assert launched.child()["env"].get("PYTHON_MANAGER_AUTOMATIC_INSTALL") == value
+
+
+@windows_only
+def test_another_sessions_variables_never_reach_this_project(launched):
+    env = launched.env(
+        CLAUDECODE="1",
+        CLAUDE_CODE_SESSION_ID="other-session",
+        CLAUDE_CODE_CHILD_SESSION="1",
+        CLAUDE_CODE_MESSAGING_SOCKET="other-pipe",
+        CLAUDE_CODE_MESSAGING_TOKEN="other-token",
+        CLAUDE_CODE_SSE_PORT="4321",
+        ANTHROPIC_API_KEY="dummy-value-for-test",
+    )
+    completed = launched.run('cmd /d /s /c ""bin\\claude-local.cmd" x"', env=env)
+    assert completed.returncode == 7, completed.stderr
+    child_env = launched.child()["env"]
+    for name in (
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SSE_PORT",
+    ):
+        assert name not in child_env, name
+    # Credentials are named, never echoed, and left for the operator to unset.
+    assert child_env["ANTHROPIC_API_KEY"] == "dummy-value-for-test"
+    assert b"ANTHROPIC_API_KEY" in completed.stderr
+    assert b"dummy-value-for-test" not in completed.stderr
+
+
+@windows_only
+@pytest.mark.parametrize("interpreter", ["base", "venv"])
+def test_killing_the_launcher_also_ends_claude(launched, tmp_path, interpreter):
+    python = base_interpreter() if interpreter == "base" else sys.executable
+    if python is None:
+        pytest.skip("no base interpreter next to this one")
+    started = tmp_path / "started"
+    env = launched.env(FAKE_CLAUDE_STARTED=str(started), FAKE_CLAUDE_SLEEP_MS="2500")
+    core = launched.project / ".local" / "claude" / "wrangler" / "launch.py"
+    process = subprocess.Popen(
+        [python, "-I", str(core), "work"],
+        cwd=str(launched.project),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert started.exists(), "the fake never started"
+    finally:
+        # TerminateProcess on the launcher only, as a tool timeout would.
+        process.kill()
+        process.wait(timeout=60)
+    time.sleep(5)
+    assert not launched.report.exists(), "Claude Code outlived its launcher"
+
+
+@windows_only
+@pytest.mark.parametrize("shim", ["launcher", "path_shim"])
+def test_a_cmd_shim_without_its_label_refuses_instead_of_guessing(launched, shim):
+    # If the label cannot be found (a copy saved with LF endings, or an edit),
+    # the shim must not resolve paths against the caller's directory.
+    target = (
+        launched.project / "bin" / "claude-local.cmd"
+        if shim == "launcher"
+        else launched.shim_dir / "claude.cmd"
+    )
+    text = target.read_bytes().decode("ascii")
+    # Cut at the label line itself, not at the `call` that names it.
+    cut = text.index("\r\n:claude_local_self\r\n") + 2
+    target.write_bytes(text[:cut].encode("ascii"))
+    completed = launched.run('cmd /d /s /c ""{}" x"'.format(target))
+    assert completed.returncode == 1
+    assert b"cannot find its own directory" in completed.stderr
+    assert not launched.report.exists()

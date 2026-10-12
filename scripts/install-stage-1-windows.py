@@ -75,9 +75,9 @@ Default behavior:
 
 Options:
   -h, --help, /?         Show this help, then the current stage-2 options.
-  --allow-isolated-home  Install even though HOME or USERPROFILE is a
-                         repo-local isolated home (consumed here, not
-                         passed to stage 2).
+  --allow-isolated-home  Install even though HOME, USERPROFILE, or
+                         HOMEDRIVE/HOMEPATH is a repo-local isolated home
+                         (consumed here, not passed to stage 2).
 
 Environment:
   THEKNOWLEDGE_BOOTSTRAP_PYTHON       Interpreter install.cmd must use.
@@ -272,13 +272,65 @@ def comparable_windows_path(value: str) -> str:
     return ntpath.normcase(normalized).rstrip("\\")
 
 
-def isolated_home_hit(env: Mapping[str, str]) -> Optional[Tuple[str, str]]:
-    """Return (variable, value) when HOME or USERPROFILE is an isolated home."""
+HOMEDRIVE_HOMEPATH = "HOMEDRIVE/HOMEPATH"
 
+
+def native_home(env: Mapping[str, str]) -> Optional[Tuple[str, str]]:
+    """Return (source, value) for the home stage 2's Path.home() will use.
+
+    Mirrors ``ntpath.expanduser``: ``USERPROFILE`` when it is set, even to
+    an empty string, else ``HOMEDRIVE`` plus ``HOMEPATH`` when ``HOMEPATH``
+    is set (a missing ``HOMEDRIVE`` counts as empty), else None.
+    """
+
+    if "USERPROFILE" in env:
+        return "USERPROFILE", env["USERPROFILE"]
+    if "HOMEPATH" in env:
+        return HOMEDRIVE_HOMEPATH, env.get("HOMEDRIVE", "") + env["HOMEPATH"]
+    return None
+
+
+def advertised_homes(env: Mapping[str, str]) -> List[Tuple[str, str]]:
+    """Return (source, value) for HOME, USERPROFILE, and HOMEDRIVE/HOMEPATH.
+
+    Empty values are left out; ``empty_userprofile_refusal`` handles an
+    empty ``USERPROFILE``.
+    """
+
+    homes: List[Tuple[str, str]] = []
     for name in ("HOME", "USERPROFILE"):
         value = env.get(name)
-        if not value:
-            continue
+        if value:
+            homes.append((name, value))
+    if env.get("HOMEPATH"):
+        homes.append((HOMEDRIVE_HOMEPATH, env.get("HOMEDRIVE", "") + env["HOMEPATH"]))
+    return homes
+
+
+def empty_userprofile_refusal(env: Mapping[str, str]) -> Optional[str]:
+    """Explain the refusal when USERPROFILE is set but empty, else None.
+
+    Stage 2 resolves the home with Path.home(), which turns an empty
+    USERPROFILE into the current directory.
+    """
+
+    if "USERPROFILE" in env and not env["USERPROFILE"]:
+        return (
+            "USERPROFILE is set but empty, so the installer would resolve your "
+            "home to the current directory. Set it to your profile directory "
+            "or remove it, then rerun."
+        )
+    return None
+
+
+def isolated_home_hit(env: Mapping[str, str]) -> Optional[Tuple[str, str]]:
+    """Return (source, value) when an advertised home is an isolated home.
+
+    HOME, USERPROFILE, and HOMEDRIVE/HOMEPATH are all checked: stage 2's
+    Path.home() falls back to HOMEDRIVE/HOMEPATH when USERPROFILE is unset.
+    """
+
+    for name, value in advertised_homes(env):
         parts = tuple(
             part.lower() for part in PureWindowsPath(windows_path_text(value)).parts
         )
@@ -296,15 +348,21 @@ def managed_home_mismatch(
     Inside a claude-local or codex-local session (marker variable set), a
     HOME or USERPROFILE that differs from the Windows profile means the
     session redirected the home, possibly to a custom layout that the tail
-    check cannot recognize. Ring-0 sessions keep the real profile and pass.
+    check cannot recognize. HOMEDRIVE/HOMEPATH is compared only when it is
+    the home stage 2 will use (USERPROFILE unset), because domain accounts
+    often point it at a network home drive that legitimately differs.
+    Ring-0 sessions keep the real profile and pass.
     """
 
     marker = next((name for name in MANAGED_BY_VARIABLES if env.get(name)), None)
     if marker is None:
         return None
     expected = comparable_windows_path(str(profile))
-    for name in ("HOME", "USERPROFILE"):
-        value = env.get(name)
+    candidates = [(name, env.get(name)) for name in ("HOME", "USERPROFILE")]
+    effective = native_home(env)
+    if effective is not None and effective[0] == HOMEDRIVE_HOMEPATH:
+        candidates.append(effective)
+    for name, value in candidates:
         if value and comparable_windows_path(value) != expected:
             return marker, name, value
     return None
@@ -330,6 +388,9 @@ def policy_refusal(
             "--mode {} is not supported on native Windows (stage 2 provisions "
             "POSIX pyenv and direnv). {}".format(mode, DEVELOPMENT_HINT)
         )
+    empty = empty_userprofile_refusal(host.env)
+    if empty is not None:
+        return empty
     if allow_isolated_home:
         return None
     hit = isolated_home_hit(host.env)
@@ -357,9 +418,16 @@ def policy_refusal(
 
 
 def install_target_home(host: Host) -> str:
-    """Return the home stage 2 will install under (Path.home() on Windows)."""
+    """Return the home stage 2 will install under (Path.home() on Windows).
 
-    return host.env.get("USERPROFILE") or str(host.profile)
+    That is USERPROFILE, else HOMEDRIVE plus HOMEPATH (``native_home``);
+    the token's profile is reported only when neither is set.
+    """
+
+    effective = native_home(host.env)
+    if effective is not None and effective[1]:
+        return effective[1]
+    return str(host.profile)
 
 
 def confirm_elevated(host: Host, ask: Callable[[str], str] = input) -> bool:

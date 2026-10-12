@@ -131,9 +131,12 @@ Code's housekeeping prunes those), or the config dir's `local/`,
    the inode it locked, so none ever proceeds on an orphaned inode. A
    lock attempt that fails for a reason other than contention (`ENOLCK`,
    `EINVAL`, or `ENOTSUP` on a filesystem without locks) is reported as
-   such, not as another maintainer. A runtime root that is a link or
-   junction makes uninstall fail with the lock error before anything is
-   removed.
+   such, not as another maintainer. Nobody can hold a lock there, so
+   when such an uninstall created the runtime root itself, it also
+   deletes the lock file that attempt created before removing the empty
+   directories; a lock file that existed before is kept. A runtime root
+   that is a link or junction makes uninstall fail with the lock error
+   before anything is removed.
 
 5. **Inactive-only preparation**
 
@@ -260,7 +263,12 @@ Code's housekeeping prunes those), or the config dir's `local/`,
     block, and a plain rerun (without `--force`) finishes the removal.
     A file that cannot be rendered for the layout (a non-ASCII path in
     the ASCII-only cmd launcher) never blocks uninstall, inspect, or
-    selftest.
+    selftest. On Windows, uninstall (and its dry run) ends with a note
+    that Claude Code may keep the project's login in Windows Credential
+    Manager under a generic credential whose name is derived from the
+    exact config-dir path; uninstall cannot see or remove it, and a
+    later checkout at the same path would find it, so the note points
+    to Claude Code's `/logout` and to Credential Manager.
 
 13. **Windows file semantics**
 
@@ -306,21 +314,33 @@ Code's housekeeping prunes those), or the config dir's `local/`,
       whose integrity fails loses its whole stamp; a slot that is intact
       but lacks this host's platform keeps it.
     - The launcher runs a binary only while its identity equals the
-      stamp. A clone or `git pull` writes new files with a fresh
-      modification time and inode, so a planted or later-replaced binary
+      stamp. A git clone or `git pull` writes new files with a fresh
+      modification time and inode, so a binary it planted or replaced
       cannot match. Windows inode values differ between Python versions
       on ReFS, so the Windows stamp holds size and modification time
-      only. A copied or restored checkout fails the check until
-      `--repair-install` re-verifies and re-stamps it offline. Each
-      operating system stamps only its own keys, so after maintenance on
-      one side of a shared WSL checkout, the other side runs a plain
-      install (or repair) once before it launches.
-    - Install-like operations, `--update`, and rollback refuse when
+      only; an archive or copy tool that preserves modification times
+      could therefore restore a same-size binary together with a
+      matching stamp, which is why tracked runtime state is refused
+      (below) and repair re-verifies in full. A copied or restored
+      checkout whose tool writes new modification times fails the check
+      until `--repair-install` re-verifies and re-stamps it offline.
+      Each operating system stamps only its own keys, so after
+      maintenance on one side of a shared WSL checkout, the other side
+      runs a plain install (or repair) once before it launches.
+    - Install-like operations (including the settings toggles and
+      `--skip-install`), `--update`, and rollback refuse when
       `git ls-files` reports tracked files under the runtime root, the
       config dir, the redirected home, the npm-era directory, or the
       launchers, unless `--allow-tracked-state` is given; inspect and
-      selftest report them. Without git, or outside a work tree, nothing
-      can be tracked and the check passes.
+      selftest report them. Each pathspec carries `literal` magic, and
+      on a case-insensitive filesystem (Windows, default macOS, or a
+      project root whose `.git` answers to `.GIT`) also `icase`, because
+      there a tracked `.LOCAL/Claude/...` is the managed
+      `.local/claude/...` while git compares pathspecs by case. Git's
+      global pathspec variables are cleared for the query, since
+      `GIT_LITERAL_PATHSPECS` would make every pathspec match nothing.
+      Without git, or outside a work tree, nothing can be tracked and
+      the check passes.
     - A release host other than the default that came from recorded
       metadata (not from `--release-base-url` on the command line) is
       named before it is contacted and in the install summary.

@@ -381,9 +381,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Proceed even when git tracks files under the runtime root, the "
             "config dir, the redirected HOME, the npm-era layout, or the "
-            "launchers. By default install, upgrade, repair, update, and "
-            "rollback refuse, because a clone or pull can replace such files "
-            "with content claude-wrangler never verified."
+            "launchers. By default install, upgrade, repair, --update, "
+            "--rollback, the settings toggles, and --skip-install refuse, "
+            "because a clone or pull can replace such files with content "
+            "claude-wrangler never verified."
         ),
     )
     parser.add_argument(
@@ -577,7 +578,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     ):
         parser.error(
             "--allow-tracked-state is only valid for install, upgrade, repair, "
-            "update, and rollback."
+            "--update, --rollback, the settings toggles, and --skip-install."
         )
     if args.release_base_url is not None:
         try:

@@ -34,6 +34,7 @@ from claude_wrangler.layout import build_layout
 from claude_wrangler.models import Config
 
 REAL_HOME_ENV_MARKER = "real_home_env"
+LAUNCHER_SESSION_MARKERS = ("CLAUDE_LOCAL_MANAGED_BY", "CODEX_LOCAL_MANAGED_BY")
 
 # XDG base directories redirected under the per-test home, relative to it.
 XDG_BASE_DIRECTORIES = (
@@ -94,14 +95,19 @@ def redirected_home(request, monkeypatch, tmp_path_factory) -> Optional[Path]:
     """Redirect home-like variables to a per-test directory; return it.
 
     The directory comes from `tmp_path_factory`, not `tmp_path`, so a
-    test's own `tmp_path` stays empty. Returns None for tests marked
-    `real_home_env`.
+    test's own `tmp_path` stays empty. The launcher session markers are
+    removed too. Returns None for tests marked `real_home_env`.
     """
 
     if request.node.get_closest_marker(REAL_HOME_ENV_MARKER) is not None:
         return None
     home = tmp_path_factory.mktemp("home")
     redirect_home_environment(monkeypatch, home)
+    # A suite started from a claude-local or codex-local session inherits
+    # the launcher marker, which makes installers compare the (redirected)
+    # home with the account's real one and refuse.
+    for name in LAUNCHER_SESSION_MARKERS:
+        monkeypatch.delenv(name, raising=False)
     return home
 
 

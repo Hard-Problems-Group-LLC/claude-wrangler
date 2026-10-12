@@ -82,10 +82,25 @@ the most privileged, and privilege decreases as the number increases.
    in `AGENTS.md` on 2026-10-12, native Windows defaults to ring 1. The
    launcher warns once per session that commands run unsandboxed and
    that isolation covers Claude's state and redirected-home tools but not
-   per-user Windows stores (Credential Manager, the registry, and
-   `HKCU\SOFTWARE\Policies`). A project may turn the warning off for
-   personal work. Client work that needs ring 3 should use WSL2 or a
-   separate Windows account.
+   per-user Windows stores (Credential Manager, the registry,
+   `HKCU\SOFTWARE\Policies`, and OpenSSH keys and agent). A project may
+   turn the warning off for personal work. Client work that needs ring 3
+   should use WSL2 or a separate Windows account.
+
+   Ring 1 also shares these, as it does on Linux, where OpenSSH reads
+   the password-database home and agents and keyrings are per user:
+   Windows OpenSSH keys, config, and the `ssh-agent` service (OpenSSH
+   finds `~\.ssh` from the account profile in the registry, not from
+   `USERPROFILE`); programs that ask Windows for known folders
+   (`SHGetKnownFolderPath`, .NET `Environment.GetFolderPath`), which
+   return the real profile; the PowerShell module path; machine-wide
+   managed settings (`C:\Program Files\ClaudeCode`); and credentials
+   passed in environment variables, which the launcher names once per
+   session (`cross_platform_launcher.md` requirement 3). Claude Code may
+   also keep a login in Windows Credential Manager under a name derived
+   from the config-dir path, which outlives `--uninstall` and would be
+   found by a later checkout at the same path
+   (`ab_runtime_slots.md` requirement 12).
 9. Self-update suppression
    At every ring the launcher disables Claude Code's self-update and
    installer, because they write to `HOME`-relative locations and at

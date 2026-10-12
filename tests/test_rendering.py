@@ -117,6 +117,21 @@ def test_readme_documents_the_native_runtime(config):
     assert "next" not in text.split("## Installed Version")[1].split("##")[0]
 
 
+def test_readme_names_shared_ring1_stores_and_cmd_reparsing(config):
+    text = build_local_readme_content(config)
+    for snippet in (
+        "OpenSSH keys, config, and",
+        "PowerShell module path",
+        "machine-wide managed settings",
+        "credentials passed in environment variables",
+        "`ANTHROPIC_API_KEY`-style credential variables",
+        "cmd.exe re-parses the arguments of every `.cmd` file",
+        "`.local/claude/wrangler/launch.py`",
+        "a nested `claude` runs this project's",
+    ):
+        assert snippet in text, snippet
+
+
 def test_readme_flags_a_pending_migration(config):
     assert "Migration pending" in build_local_readme_content(
         config, legacy_pending=True

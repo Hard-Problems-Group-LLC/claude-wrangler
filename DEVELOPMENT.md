@@ -124,7 +124,10 @@ Repository entry points and scripts:
 - `install.cmd` and `scripts/install-stage-1-windows.py`
   The native-Windows entry point and its policy helper, which then runs
   the unchanged stage 2. ASCII and CRLF, no labels, and `%*` kept out
-  of parenthesized blocks and `for` lists.
+  of parenthesized blocks and `for` lists; `python.exe` candidates run
+  without `call`, and `PATH` is scanned from a quote-stripped copy.
+  (The generated `.cmd` launchers do use one trailing label, to find
+  their own directory; see `cross_platform_launcher.md`.)
 - `scripts/install_prerequisites.py`, `.sh`, and `.cmd`
   Project-owned installer for missing prerequisites (Python, Git, Git
   for Windows' bash) through winget, brew, apt, or dnf, plus the `--dev`
@@ -342,7 +345,18 @@ The tests stay offline and light on external side effects:
   with every home-like variable redirected into scratch.
 - On Windows the shim tests compile a fake Claude Code console program
   with the .NET Framework `csc.exe` and skip when it is absent; Git Bash
-  and PowerShell cases skip when those shells are missing.
+  and PowerShell cases skip when those shells are missing. The fake
+  reports its arguments, environment, and own image path, and can
+  write a start marker and sleep (`FAKE_CLAUDE_STARTED`,
+  `FAKE_CLAUDE_SLEEP_MS`) for the process-tree tests. A test that looks
+  up a bare `claude` builds `PATH` explicitly (the fake's directories
+  plus System32): the inherited `PATH` may hold the operator's own
+  Claude Code, which a test must never run. Argument-injection
+  regression tests use only a benign marker-file command.
+- The autouse fixture also removes `CLAUDE_LOCAL_MANAGED_BY` and
+  `CODEX_LOCAL_MANAGED_BY`, so a suite started from a launcher session
+  does not make the installers compare the redirected home with the
+  account's own home.
 - POSIX-only tests (`install.sh`, execute bits, file permissions) skip
   on Windows, and Windows-only tests skip elsewhere.
 - `tests/test_python39_compatibility.py` parses the shipped code with

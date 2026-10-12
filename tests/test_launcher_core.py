@@ -865,10 +865,65 @@ def test_self_update_subcommands_are_intercepted(
     assert "`claude-wrangler --upgrade --channel latest`" in outcome.stderr
 
 
-def test_interception_only_applies_to_the_first_argument(project: Project) -> None:
-    outcome = run(project, ["-p", "update"])
-    assert outcome.code == 0
-    assert outcome.argv[-2:] == ["-p", "update"]
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--verbose", "update"],
+        ["-d", "install"],
+        ["--model", "x", "upgrade"],
+        ["--", "update"],
+        ["-p", "install"],
+        ["--isolated-home", "--verbose", "install", "stable"],
+    ],
+)
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_self_update_subcommands_behind_leading_options_are_intercepted(
+    project: Project, args: List[str], os_name: str
+) -> None:
+    # Claude Code dispatches a subcommand that follows root options or "--".
+    outcome = run(project, args, os_name=os_name)
+    assert outcome.code == 2
+    assert not outcome.launched
+    assert "managed by claude-wrangler" in outcome.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-p", "please install the linter"],
+        ["plugin", "install", "formatter"],
+        ["--verbose", "mcp", "add", "update-helper"],
+        ["--model", "x", "plugin", "install", "y"],
+    ],
+)
+def test_words_inside_prompts_and_subcommand_operands_are_forwarded(
+    project: Project, args: List[str]
+) -> None:
+    project.install_slot(
+        "a", "2.1.250", subcommands=("mcp", "plugin", "plugins", "install", "update")
+    )
+    outcome = run(project, args)
+    assert outcome.code == 0, outcome.stderr
+    assert outcome.argv[-len(args) :] == args
+
+
+def test_intercepted_subcommand_stops_at_another_subcommand() -> None:
+    subs = ("mcp", "plugin", "update", "install")
+    assert core.intercepted_subcommand(["plugin", "install", "x"], subs) is None
+    assert core.intercepted_subcommand(["--verbose", "update"], subs) == "update"
+    assert core.intercepted_subcommand(["x", "--", "upgrade"], ()) == "upgrade"
+
+
+def test_unrecorded_subcommands_fall_back_to_the_built_in_stops() -> None:
+    # The npm-era layout records no subcommands; plugin and MCP operands
+    # still pass there, and self-update behind options is still refused.
+    assert core.intercepted_subcommand(["plugin", "install", "x"], ()) is None
+    assert core.intercepted_subcommand(["plugins", "install", "x"], ()) is None
+    assert core.intercepted_subcommand(["mcp", "update"], ()) is None
+    assert core.intercepted_subcommand(["--verbose", "update"], ()) == "update"
+    assert core.intercepted_subcommand(["-d", "install"], ()) == "install"
+    # A recorded list replaces the fallback entirely.
+    assert core.intercepted_subcommand(["mcp", "update"], ("plugin",)) == "update"
 
 
 @pytest.mark.parametrize(
@@ -2080,3 +2135,379 @@ def test_session_directories_are_created_private(project: Project) -> None:
         project.root / ".local" / "session" / "HOME",
     ):
         assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0, path
+
+
+# ---------------------------------------------------------------------------
+# Another Claude Code session's variables and inherited credentials
+# ---------------------------------------------------------------------------
+
+PARENT_SESSION_SAMPLE = {
+    "CLAUDECODE": "1",
+    "CLAUDE_CODE_SESSION_ID": "parent-session",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_CODE_SESSION_ATTENDED": "1",
+    "CLAUDE_CODE_EXECPATH": "C:\\elsewhere\\claude.exe",
+    "CLAUDE_CODE_ENTRYPOINT": "cli",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID": "bridge",
+    "CLAUDE_PID": "4242",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR": "C:\\elsewhere",
+    "CLAUDE_CODE_MESSAGING_SOCKET": "parent-pipe",
+    "CLAUDE_CODE_MESSAGING_TOKEN": "parent-token",
+    "CLAUDE_CODE_SSE_PORT": "4321",
+    "CLAUDE_EFFORT": "high",
+}
+
+
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_a_fresh_launch_drops_another_sessions_variables(os_name: str) -> None:
+    base = dict(base_environ(os_name), **PARENT_SESSION_SAMPLE)
+    env = session_env(os_name, shared_home=False, base=base)
+    for name in PARENT_SESSION_SAMPLE:
+        assert name not in env, name
+
+
+def test_windows_matches_parent_session_names_case_insensitively() -> None:
+    base = dict(base_environ("nt"), ClaudeCode="1", Claude_Code_Session_Id="x")
+    env = session_env("nt", shared_home=False, base=base)
+    assert "ClaudeCode" not in env and "Claude_Code_Session_Id" not in env
+
+
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_a_nested_launch_of_the_same_project_keeps_its_session_variables(
+    os_name: str,
+) -> None:
+    root = NT_ROOT if os_name == "nt" else POSIX_ROOT
+    config = load_config()
+    paths = core.build_repo_paths(root, config, os_name)
+    base = dict(
+        base_environ(os_name),
+        **PARENT_SESSION_SAMPLE,
+        **{core.NOTICES_SHOWN_VAR: paths.config_dir},
+    )
+    env = core.build_session_environment(
+        base, paths=paths, config=config, shared_home=False, os_name=os_name
+    )
+    for name, value in PARENT_SESSION_SAMPLE.items():
+        assert env[name] == value, name
+
+
+def test_ide_port_is_kept_unless_another_claude_session_started_us() -> None:
+    from_ide = session_env(
+        "posix",
+        shared_home=False,
+        base=dict(base_environ("posix"), CLAUDE_CODE_SSE_PORT="4321"),
+    )
+    assert from_ide["CLAUDE_CODE_SSE_PORT"] == "4321"
+    from_claude = session_env(
+        "posix",
+        shared_home=False,
+        base=dict(base_environ("posix"), CLAUDE_CODE_SSE_PORT="4321", CLAUDECODE="1"),
+    )
+    assert "CLAUDE_CODE_SSE_PORT" not in from_claude
+
+
+@pytest.mark.parametrize("name", ["CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT"])
+def test_host_variables_are_kept_unless_another_claude_session_started_us(
+    name: str,
+) -> None:
+    # An Agent SDK host or IDE extension sets these for the CLI it starts,
+    # with no CLAUDECODE; only a Claude Code parent session's copies go.
+    from_host = session_env(
+        "nt", shared_home=False, base=dict(base_environ("nt"), **{name: "sdk-py"})
+    )
+    assert from_host[name] == "sdk-py"
+    from_claude = session_env(
+        "nt",
+        shared_home=False,
+        base=dict(base_environ("nt"), **{name: "cli", "CLAUDECODE": "1"}),
+    )
+    assert name not in from_claude
+
+
+def test_cmd_shim_helper_variables_never_reach_claude() -> None:
+    base = dict(
+        base_environ("nt"),
+        CLAUDE_LOCAL_CORE="core",
+        CLAUDE_LOCAL_PY="py.exe",
+        CLAUDE_LOCAL_PYARG="-3",
+        CLAUDE_LOCAL_PROBE="probe",
+        CLAUDE_LOCAL_SELF="C:\\x\\",
+    )
+    env = session_env("nt", shared_home=False, base=base)
+    for name in core.SHIM_INTERNAL_VARS:
+        assert name not in env, name
+
+
+def test_inherited_credentials_are_named_once_per_session(project: Project) -> None:
+    secret = "dummy-value-for-test"
+    extra = {"ANTHROPIC_API_KEY": secret, "CLAUDE_CODE_USE_BEDROCK": "1"}
+    fresh = run(project, ["-p", "x"], extra_env=extra)
+    assert fresh.code == 0
+    notes = [line for line in fresh.stderr.splitlines() if "ANTHROPIC_API_KEY" in line]
+    assert len(notes) == 1
+    assert "CLAUDE_CODE_USE_BEDROCK" in notes[0]
+    assert secret not in fresh.stderr
+    # Credentials are left in place: stripping them would break deliberate
+    # per-project setups.
+    assert fresh.env["ANTHROPIC_API_KEY"] == secret
+    nested = run(
+        project,
+        ["-p", "x"],
+        extra_env=dict(extra, **{core.NOTICES_SHOWN_VAR: project.config_dir("posix")}),
+    )
+    assert "ANTHROPIC_API_KEY" not in nested.stderr
+
+
+def test_credential_note_grammar() -> None:
+    one = core.credential_note(["ANTHROPIC_API_KEY"], "/r/.local/claude")
+    assert "ANTHROPIC_API_KEY is set" in one and "unless it belongs" in one
+    two = core.credential_note(["A", "B"], "/r/.local/claude")
+    assert "A, B are set" in two and "unless they belong" in two
+
+
+# ---------------------------------------------------------------------------
+# Nested calls on Windows: the slot directory on PATH
+# ---------------------------------------------------------------------------
+
+
+def nt_selection(project: Project) -> core.SlotSelection:
+    """Return slot a's selection for a Windows platform key."""
+
+    project.install_slot("a", "2.1.250", key="win32-x64", binary_name="claude.exe")
+    return core.select_slot(str(project.runtime), "win32-x64")
+
+
+def test_windows_puts_the_slot_directory_before_the_shim(project: Project) -> None:
+    selection = nt_selection(project)
+    slot_dir = core.nested_claude_slot_dir(selection, load_config(), "nt")
+    assert slot_dir == os.path.dirname(selection.binary)
+    outcome = run(project, ["-p", "x"], os_name="nt", platform_key="win32-x64")
+    assert outcome.code == 0, outcome.stderr
+    entries = outcome.env["PATH"].split(";")
+    assert entries[:2] == [slot_dir, project.config_dir("nt") + "\\wrangler\\shim"]
+    assert entries[2:] == base_environ("nt")["PATH"].split(";")
+    assert "shim\\claude.cmd" not in outcome.stderr
+
+
+def test_slot_directory_with_other_files_is_not_put_on_path(project: Project) -> None:
+    selection = nt_selection(project)
+    extra = Path(selection.binary).parent / "helper.exe"
+    extra.write_bytes(b"x")
+    assert core.nested_claude_slot_dir(selection, load_config(), "nt") is None
+    # The launch still runs, but says that nested calls lost the direct route.
+    outcome = run(project, ["-p", "x"], os_name="nt", platform_key="win32-x64")
+    assert outcome.code == 0, outcome.stderr
+    assert outcome.env["PATH"].split(";")[0] == (
+        project.config_dir("nt") + "\\wrangler\\shim"
+    )
+    assert "go through shim\\claude.cmd" in outcome.stderr
+    assert "--repair-install" in outcome.stderr
+    nested = run(
+        project,
+        ["-p", "x"],
+        os_name="nt",
+        platform_key="win32-x64",
+        extra_env={core.NOTICES_SHOWN_VAR: project.config_dir("nt")},
+    )
+    assert "shim\\claude.cmd" not in nested.stderr
+
+
+def test_legacy_mode_on_windows_says_nested_calls_use_the_cmd_shim(
+    tmp_path: Path,
+) -> None:
+    project = Project(tmp_path / "repo")
+    write_legacy_binary(project)
+    outcome = run(project, ["-p", "x"], os_name="nt", node=(None, None))
+    assert "go through shim\\claude.cmd" in outcome.stderr
+    assert "npm-era layout is still in place" in outcome.stderr
+
+
+def test_slot_directory_is_never_used_on_posix_or_in_legacy_mode(
+    project: Project,
+) -> None:
+    selection = nt_selection(project)
+    assert core.nested_claude_slot_dir(selection, load_config(), "posix") is None
+    legacy = load_config(legacy={"binary": "a/b/claude.exe", "version": None})
+    assert core.nested_claude_slot_dir(selection, legacy, "nt") is None
+
+
+# ---------------------------------------------------------------------------
+# PATH separators and canonical Windows spellings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entry, os_name, bad",
+    [
+        ("C:\\work\\a;b\\shim", "nt", True),
+        ("C:\\work\\ab\\shim", "nt", False),
+        ("/srv/a:b/shim", "posix", True),
+        ("/srv/ab/shim", "posix", False),
+    ],
+)
+def test_path_entry_problem(entry: str, os_name: str, bad: bool) -> None:
+    assert (core.path_entry_problem(entry, os_name) is not None) is bad
+
+
+def test_a_root_containing_the_path_separator_is_refused(tmp_path: Path) -> None:
+    separator = ";" if os.name == "nt" else ":"
+    bare = Project(tmp_path / "re{}po".format(separator))
+    bare.install_slot("a", "2.1.250")
+    bare.set_pointer("a")
+    outcome = run(bare, ["-p", "x"], os_name=os.name)
+    assert outcome.code == 1
+    assert not outcome.launched
+    assert "PATH separator" in outcome.stderr
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("c:\\Work\\repo", "C:\\Work\\repo"),
+        ("C:\\Work\\repo", "C:\\Work\\repo"),
+        ("\\\\server\\share\\repo", "\\\\server\\share\\repo"),
+        ("d:/x", "D:/x"),
+    ],
+)
+def test_canonical_windows_root_upper_cases_the_drive(
+    value: str, expected: str
+) -> None:
+    assert core.canonical_windows_root(value) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive letters and 8.3 names")
+def test_launch_through_a_lower_case_drive_exports_the_canonical_spelling(
+    project: Project,
+) -> None:
+    spelling = str(project.root)
+    lowered = spelling[0].lower() + spelling[1:]
+    outcome = run(project, [], os_name="nt", extra_env={core.REPO_ROOT_VAR: lowered})
+    assert outcome.code == 0
+    assert outcome.env["CLAUDE_CONFIG_DIR"] == project.config_dir("nt")
+    assert outcome.env["HOME"].startswith(spelling[0].upper() + ":")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 short names")
+def test_launch_through_an_8_3_spelling_exports_long_names(tmp_path: Path) -> None:
+    from claude_wrangler.rendering import _windows_short_path
+
+    bare = Project(tmp_path / "long-project-name-here")
+    bare.install_slot("a", "2.1.250")
+    bare.set_pointer("a")
+    short = _windows_short_path(str(bare.root))
+    if short is None or "~" not in short:
+        pytest.skip("8.3 short names are disabled on this volume")
+    outcome = run(bare, [], os_name="nt", extra_env={core.REPO_ROOT_VAR: short})
+    assert outcome.code == 0
+    assert "~" not in outcome.env["CLAUDE_CONFIG_DIR"]
+    assert os.path.normcase(outcome.env["CLAUDE_CONFIG_DIR"]) == os.path.normcase(
+        bare.config_dir("nt")
+    )
+
+
+def test_forward_slash_spelling_is_not_canonicalized_further(project: Project) -> None:
+    project.write_config(config_dir_spelling="forward-slash")
+    outcome = run(project, [], os_name="nt")
+    assert outcome.env["CLAUDE_CONFIG_DIR"] == core.forward_slash_spelling(
+        project.config_dir("nt")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Windows ACLs and the kill-on-close job
+# ---------------------------------------------------------------------------
+
+USER_SID = "S-1-5-21-1-2-3-1001"
+OTHER_SID = "S-1-5-21-1-2-3-1002"
+ALLOW = core.ACCESS_ALLOWED_ACE_TYPE
+DENY = core.ACCESS_DENIED_ACE_TYPE
+
+
+def test_private_dacl_principals() -> None:
+    assert core.private_dacl_principals(USER_SID, USER_SID) == [
+        USER_SID,
+        core.LOCAL_SYSTEM_SID,
+        core.ADMINISTRATORS_SID,
+    ]
+    assert core.private_dacl_principals(USER_SID, OTHER_SID)[:2] == [
+        USER_SID,
+        OTHER_SID,
+    ]
+    # A group owner (Administrators, or anything broad) is never added.
+    assert "S-1-1-0" not in core.private_dacl_principals(USER_SID, "S-1-1-0")
+
+
+@pytest.mark.parametrize(
+    "entries, private",
+    [
+        ([(ALLOW, 3, 0x1F01FF, USER_SID), (ALLOW, 3, 0x1F01FF, "S-1-5-18")], True),
+        ([(ALLOW, 3, 0x1F01FF, "S-1-3-4"), (DENY, 0, 0x1, "S-1-1-0")], True),
+        ([(ALLOW, 3, 0x1200A9, "S-1-5-32-545")], False),
+        ([(ALLOW, 3, 0x1F01FF, OTHER_SID)], False),
+        ([(5, 3, 0x1F01FF, USER_SID)], False),
+    ],
+)
+def test_dacl_is_private(entries: Any, private: bool) -> None:
+    principals = core.private_dacl_principals(USER_SID, None)
+    assert core.dacl_is_private(entries, principals) is private
+
+
+def test_broad_write_grants_names_groups_that_can_change_a_checkout() -> None:
+    drive_root = [
+        (ALLOW, 0, 0x001200A9, "S-1-5-32-545"),
+        (ALLOW, 11, 0xE0010000, "S-1-5-11"),
+        (ALLOW, 0, 0x4, "S-1-5-11"),
+        (ALLOW, 3, 0x1F01FF, "S-1-5-18"),
+    ]
+    assert core.broad_write_grants(drive_root) == ["Authenticated Users"]
+    assert core.broad_write_grants([(ALLOW, 3, 0x1301BF, "S-1-1-0")]) == ["Everyone"]
+    assert core.broad_write_grants([(DENY, 3, 0x1F01FF, "S-1-1-0")]) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_launcher_creates_private_session_directories_on_windows(
+    project: Project,
+) -> None:
+    project.write_config(config_dir=".local/session", home_dir=".local/session/HOME")
+    outcome = run(project, ["-p", "x"], os_name="nt")
+    assert outcome.code == 0
+    user = core.windows_current_user_sid()
+    assert user is not None
+    for path in (
+        project.root / ".local" / "session",
+        project.root / ".local" / "session" / "HOME",
+    ):
+        summary = core.windows_security_summary(str(path))
+        assert summary is not None, path
+        sids = {sid for kind, _flags, _mask, sid in summary[1] if kind == ALLOW}
+        assert sids == {user, core.LOCAL_SYSTEM_SID, core.ADMINISTRATORS_SID}, path
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_existing_session_directories_keep_their_acl_at_launch(
+    project: Project,
+) -> None:
+    config_dir = project.root / ".local" / "claude"
+    before = core.windows_security_summary(str(config_dir))
+    outcome = run(project, ["-p", "x"], os_name="nt")
+    assert outcome.code == 0
+    assert core.windows_security_summary(str(config_dir)) == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job objects")
+def test_attach_kill_on_close_job_ends_the_child_when_closed() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        job = core.attach_kill_on_close_job(process.pid)
+        assert job is not None
+        assert process.poll() is None
+        core.close_job(job)
+        # Closing the last handle ends the child long before its sleep would.
+        process.wait(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)

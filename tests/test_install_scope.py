@@ -9,11 +9,13 @@ from claude_wrangler.constants import DEFAULT_HOME_DIR
 from claude_wrangler.install_scope import (
     CODEX_HOME_DIRNAME,
     LEGACY_CODEX_HOME_DIRNAME,
+    account_home_directory,
     current_home,
     default_pyenv_root,
     default_tool_venv,
     default_user_bin_dir,
     describe_user_home_source,
+    has_isolated_home_tail,
     home_candidates,
     is_repo_local_isolated_home,
     resolve_user_home,
@@ -31,6 +33,8 @@ def test_default_user_paths_follow_selected_home(tmp_path):
 
 
 def _expect_isolated_home_rejection(repo_root, **kwargs):
+    """Assert resolve_user_home refuses and names both escape hatches."""
+
     with pytest.raises(RuntimeError) as excinfo:
         resolve_user_home(repo_root, **kwargs)
 
@@ -41,6 +45,8 @@ def _expect_isolated_home_rejection(repo_root, **kwargs):
 
 
 def _make_home(repo_root, relative):
+    """Create and return an isolated-home directory inside repo_root."""
+
     home = repo_root / relative
     home.mkdir(parents=True)
     return home
@@ -284,3 +290,117 @@ def test_autouse_fixture_redirects_every_home_variable(redirected_home):
 @pytest.mark.real_home_env
 def test_real_home_env_marker_opts_out_of_redirection(redirected_home):
     assert redirected_home is None
+
+
+def test_another_checkouts_isolated_home_is_refused(tmp_path):
+    # Inside project A's ring-1 session, an installer started from checkout
+    # B sees A's redirected home, which B's own layout check cannot match.
+    this_checkout = tmp_path / "repo-b"
+    this_checkout.mkdir()
+    other_home = _make_home(tmp_path / "repo-a", DEFAULT_HOME_DIR)
+    environ = _windows_home_env(other_home)
+
+    message = _expect_isolated_home_rejection(
+        this_checkout, environ=environ, os_name="nt", account_home=None
+    )
+
+    assert "USERPROFILE" in message
+
+
+@pytest.mark.parametrize(
+    "relative", [DEFAULT_HOME_DIR, CODEX_HOME_DIRNAME, LEGACY_CODEX_HOME_DIRNAME]
+)
+def test_isolated_home_tails_are_recognized_in_any_checkout(tmp_path, relative):
+    assert has_isolated_home_tail(tmp_path / "other" / relative)
+    assert not has_isolated_home_tail(tmp_path / "other" / ".local")
+    upper = Path(str(tmp_path / "other" / relative).upper())
+    assert has_isolated_home_tail(upper, "nt")
+
+
+def test_a_redirected_launcher_home_is_refused_inside_a_session(tmp_path):
+    this_checkout = tmp_path / "repo-b"
+    this_checkout.mkdir()
+    custom_home = tmp_path / "repo-a" / ".local" / "custom-home"
+    custom_home.mkdir(parents=True)
+    profile = tmp_path / "operator"
+    profile.mkdir()
+    environ = _windows_home_env(custom_home, CLAUDE_LOCAL_MANAGED_BY="claude-wrangler")
+
+    _expect_isolated_home_rejection(
+        this_checkout, environ=environ, os_name="nt", account_home=profile
+    )
+    # Ring 0 keeps the real profile and passes.
+    ring0 = _windows_home_env(profile, CODEX_LOCAL_MANAGED_BY="codex-wrangler")
+    assert (
+        resolve_user_home(
+            this_checkout, environ=ring0, os_name="nt", account_home=profile
+        )
+        == profile.resolve()
+    )
+    # Outside a session a deliberate home elsewhere is the operator's choice.
+    assert (
+        resolve_user_home(
+            this_checkout,
+            environ=_windows_home_env(custom_home),
+            os_name="nt",
+            account_home=profile,
+        )
+        == custom_home.resolve()
+    )
+
+
+def test_a_network_homedrive_is_not_a_redirected_home(tmp_path):
+    # Domain accounts often point HOMEDRIVE/HOMEPATH at a network home that
+    # differs from the profile; with USERPROFILE set it is not the home used.
+    this_checkout = tmp_path / "repo"
+    this_checkout.mkdir()
+    profile = tmp_path / "operator"
+    network = tmp_path / "network-home"
+    for directory in (profile, network):
+        directory.mkdir()
+    drive, tail = os.path.splitdrive(str(network))
+    environ = {
+        "USERPROFILE": str(profile),
+        "HOMEDRIVE": drive,
+        "HOMEPATH": tail,
+        "CLAUDE_LOCAL_MANAGED_BY": "claude-wrangler",
+    }
+
+    assert (
+        resolve_user_home(
+            this_checkout, environ=environ, os_name="nt", account_home=profile
+        )
+        == profile.resolve()
+    )
+
+
+def test_posix_launcher_session_home_must_match_the_account(tmp_path):
+    this_checkout = tmp_path / "repo"
+    this_checkout.mkdir()
+    account = tmp_path / "home" / "operator"
+    redirected = tmp_path / "somewhere"
+    for directory in (account, redirected):
+        directory.mkdir(parents=True)
+
+    _expect_isolated_home_rejection(
+        this_checkout,
+        environ={"HOME": str(redirected), "CLAUDE_LOCAL_MANAGED_BY": "x"},
+        os_name="posix",
+        account_home=account,
+    )
+    assert (
+        resolve_user_home(
+            this_checkout,
+            environ={"HOME": str(account), "CLAUDE_LOCAL_MANAGED_BY": "x"},
+            os_name="posix",
+            account_home=account,
+        )
+        == account.resolve()
+    )
+
+
+def test_account_home_directory_names_this_account():
+    home = account_home_directory()
+    if home is None:
+        pytest.skip("the account database is not readable here")
+    assert home.is_dir()

@@ -42,7 +42,22 @@ This specification covers:
      requirement 7). A partially redirected environment is caught
      through whichever variable still points at an isolated home.
    Paths are compared after resolving them, with a same-file fallback,
-   so case, separator, and link differences do not hide a match.
+   so case, separator, and link differences do not hide a match. Two
+   further checks catch homes that belong to another checkout:
+   - any advertised home whose path ends like a recognized isolated home
+     (`.local/claude/HOME`, `.local/codex-home`, or `.codex-home`,
+     case-insensitively on Windows) counts, so an installer started from
+     checkout B inside project A's ring-1 session refuses A's home too;
+   - inside a launcher session (`CLAUDE_LOCAL_MANAGED_BY` or
+     `CODEX_LOCAL_MANAGED_BY` set), a home that differs from the
+     account's own home counts, which catches custom layouts. The
+     account's home comes from the logon token on Windows
+     (`GetUserProfileDirectoryW`) and from the password database on
+     POSIX, never from the environment. On Windows `HOMEDRIVE` plus
+     `HOMEPATH` takes part only when it is the effective home
+     (`USERPROFILE` unset), because domain accounts often point it at a
+     network home that legitimately differs. Ring-0 sessions keep the
+     real home and pass.
 3. Approved escape hatches
    User-scoped installer flows must support:
    - `--user-home PATH` to target some other user scope explicitly;
@@ -54,12 +69,18 @@ This specification covers:
      still names.
    On native Windows the stage-2 installer has no guard of its own, so
    `install.cmd`'s policy helper applies one before stage 2 runs. It
-   refuses when `HOME` or `USERPROFILE` ends in one of the recognized
-   isolated-home paths, or when `CLAUDE_LOCAL_MANAGED_BY` or
-   `CODEX_LOCAL_MANAGED_BY` is set and either variable differs from the
+   evaluates the home stage 2's `Path.home()` will use (`USERPROFILE`,
+   then `HOMEDRIVE` plus `HOMEPATH`) and refuses when `HOME`,
+   `USERPROFILE`, or `HOMEDRIVE`/`HOMEPATH` ends in one of the
+   recognized isolated-home paths, or when `CLAUDE_LOCAL_MANAGED_BY` or
+   `CODEX_LOCAL_MANAGED_BY` is set and `HOME`, `USERPROFILE`, or (when
+   it is the effective home) `HOMEDRIVE`/`HOMEPATH` differs from the
    logged-on user's Windows profile (read from the logon token, not
-   from `USERPROFILE`), which catches custom layouts. It consumes
-   `--allow-isolated-home` and does not forward it to stage 2.
+   from `USERPROFILE`), which catches custom layouts. A `USERPROFILE`
+   that is set but empty is refused outright, because `Path.home()`
+   would turn it into the current directory. The elevated-run prompt
+   names the same effective home. It consumes `--allow-isolated-home`
+   and does not forward it to stage 2.
 4. Scope preservation
    Existing install scopes remain:
    - `repo` for repo-local development state;
@@ -89,8 +110,14 @@ This specification covers:
   isolated-home rejection for all three recognized isolated-home
   layouts, with the Windows and POSIX variable orders tested on any
   host through an injected environment and operating-system name.
-- Policy-helper tests must cover the `install.cmd` refusals and the
-  consumed `--allow-isolated-home` flag.
+- Policy-helper tests must cover the `install.cmd` refusals (including
+  an isolated or redirected `HOMEDRIVE`/`HOMEPATH` with `USERPROFILE`
+  unset, and an empty `USERPROFILE`) and the consumed
+  `--allow-isolated-home` flag.
+- Unit tests must cover another checkout's isolated home and a
+  redirected launcher home inside a session, a network
+  `HOMEDRIVE`/`HOMEPATH` beside a set `USERPROFILE`, and the POSIX
+  account-home comparison.
 - Help text and docs must mention `--user-home` and
   `--allow-isolated-home`.
 - Installer success output must identify the selected user home and

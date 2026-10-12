@@ -37,15 +37,26 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
    - prerequisites are Python 3.9+, Git, and, on Windows, Git for
      Windows' bash (which Claude Code's Bash tool uses; optional, on by
      default, `--no-git-bash` skips it); Node.js is not a prerequisite;
-   - on macOS, `/usr/bin/git` and `/usr/bin/python3` are Command Line
-     Tools stubs that exist but only open the installer dialog, so they
-     count as installed only when `xcode-select -p` succeeds; otherwise
-     Git is reported missing with `xcode-select --install` as the fix;
+   - on macOS, `/usr/bin/git` is a Command Line Tools stub that exists
+     but only opens the installer dialog, so it counts as installed only
+     when `xcode-select -p` succeeds; otherwise Git is reported missing
+     with `xcode-select --install` as the fix. Python is judged by
+     running it, not by `xcode-select`: the wrappers' version probe
+     rejects the `/usr/bin/python3` stub, and on macOS the shell
+     wrapper's no-Python hint names `xcode-select --install` (which
+     provides Apple's Python 3.9) before the package-manager command;
    - package managers: `apt-get`, `dnf`/`yum`, `brew`, and on Windows
      `winget` with `--scope user` where the package supports it;
-   - `--dry-run` prints commands; `--yes` runs without prompting; without
-     `--yes` an interactive run asks once before installing and a
-     non-interactive run refuses;
+   - `--dry-run` prints commands, says how many prerequisites it would
+     install and that nothing was changed, never prints "Prerequisites
+     ready." while something is missing, and exits 0 for the dry run
+     itself; `--yes` runs without prompting; without `--yes` an
+     interactive run asks once before installing and a non-interactive
+     run refuses;
+   - after a real install the prerequisites are detected again; winget
+     changes only the registry `PATH`, so a tool the running process
+     still cannot see gets "open a new terminal ... then rerun to
+     confirm" instead of "ready";
    - `--dev` additionally creates the repo-local `.venv` (using
      `Scripts\python.exe` on Windows) and installs the project with
      development extras, so contributors on Windows have a development
@@ -76,6 +87,25 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
      `python.exe` on `PATH`, then the default python.org locations),
      skips the Microsoft Store alias, and never captures an interpreter
      path as text;
+   - it starts each `python.exe` candidate without `call`, which would
+     re-parse the line, doubling carets and expanding `%` a second
+     time, and so reject an interpreter under such a directory; only
+     `py` and an override that is not a `.exe` use `call`;
+   - it reads `PATH` only through delayed expansion, never with `%`,
+     because cmd parses a whole line before evaluating its `if` and
+     aborts the script when a parsed line passes 8,191 characters, even
+     when an earlier candidate already won. It removes the double quotes
+     first, so a quoted entry such as one under `Program Files (x86)`
+     cannot end the `for` list, and it measures the quoted entry list
+     before building it, because cmd crashes when a delayed replacement
+     passes 8,191 characters. A `PATH` whose list would pass 8,000
+     characters, or that is itself over 8,191 characters (delayed
+     expansion yields nothing for it), is not scanned, and the error
+     says so; `py -3`, the default locations, and
+     `THEKNOWLEDGE_BOOTSTRAP_PYTHON` still work. Each entry is tested
+     with delayed expansion off again, so entries containing `!` keep
+     their spelling, and the setlocal scopes stay balanced for callers
+     that use `call`;
    - when none is found it points to `scripts\install_prerequisites.cmd`;
    - it runs `scripts/install-stage-1-windows.py`, which applies policy
      and then runs the unchanged `scripts/install-stage-2.py` as a child,
@@ -92,15 +122,15 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
    - supports `--mode standard` only; `--system` and other modes exit 1
      with a message pointing to `install_prerequisites.cmd --dev` for
      development or WSL2 for the managed POSIX modes;
-   - refuses when `HOME` or `USERPROFILE` is a repo-local isolated home or
-     when `CLAUDE_LOCAL_MANAGED_BY` / `CODEX_LOCAL_MANAGED_BY` is set with
-     a home that differs from the Windows profile, unless
-     `--allow-isolated-home` is given (consumed, not forwarded). Known
-     gap: both checks examine only `HOME` and `USERPROFILE`, not
-     `HOMEDRIVE`/`HOMEPATH`, which `install_scope.py` consults after
-     `USERPROFILE` (`explicit_user_home_targeting_for_installers.md`);
-     a session that redirects only `HOMEDRIVE`/`HOMEPATH` is not
-     detected here;
+   - refuses when `HOME`, `USERPROFILE`, or `HOMEDRIVE`/`HOMEPATH` is a
+     repo-local isolated home or when `CLAUDE_LOCAL_MANAGED_BY` /
+     `CODEX_LOCAL_MANAGED_BY` is set with a home that differs from the
+     Windows profile, unless `--allow-isolated-home` is given (consumed,
+     not forwarded). It evaluates the home stage 2's `Path.home()` will
+     use (`USERPROFILE`, then `HOMEDRIVE` plus `HOMEPATH`), compares
+     `HOMEDRIVE`/`HOMEPATH` with the profile only when it is that
+     effective home, and refuses an empty `USERPROFILE` outright
+     (`explicit_user_home_targeting_for_installers.md`);
    - on an elevated token, prompts on a console and refuses without one
      unless `THEKNOWLEDGE_INSTALL_ALLOW_ELEVATED=1`;
    - sets `THEKNOWLEDGE_MANAGED_INSTALL_STAGE1=1` only in the child's
@@ -154,7 +184,16 @@ to TheKnowledge's successor without depending on TheKnowledge internals.
 - Windows-only tests that run `install.cmd` from a copied fake checkout
   under paths with spaces and non-ASCII characters, through cmd,
   PowerShell 5.1, PowerShell 7, and Git Bash, with a stub-only `PATH`,
-  a stub-first `PATH`, and an invalid override.
+  a stub-first `PATH`, and an invalid override; with a quoted `PATH`
+  entry containing parentheses (with and without an override) and a
+  quoted entry holding Python; and with interpreters under directories
+  containing a caret or a percent-variable token, found through `PATH`
+  and through the override. The same tests cover `PATH` values past
+  cmd's limits (in the band where only the quoted list passes 8,191
+  characters, and well beyond it) with the override, the default
+  locations, and no Python at all; a 7,000-character `PATH` that is
+  still scanned to its end; entries containing `!`; and a caller using
+  `call` that must see none of the scripts' variables afterwards.
 - Prerequisite-installer tests for command construction on every package
   manager, missing-only detection (including the macOS Command Line
   Tools stubs), `--dry-run`, the consent rules, `--dev`

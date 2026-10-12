@@ -159,10 +159,12 @@ scripts\install_prerequisites.cmd
   tool uses; `--no-git-bash` skips it). It uses
   `winget install --scope user` where the package supports it, asks once
   before installing (`--yes` skips the question, `--dry-run` only prints
-  the commands), and never elevates; a package that needs elevation is
-  printed for you to run. When no Python exists yet, it offers to
-  install Python through winget and then continues, or asks you to open
-  a new terminal and rerun.
+  the commands and what it would install), and never elevates; a
+  package that needs elevation is printed for you to run. When no
+  Python exists yet, it offers to install Python through winget and
+  then continues, or asks you to open a new terminal and rerun. After
+  installing it checks again and says "ready" only when the new tools
+  are visible; otherwise it asks you to open a new terminal.
 - `install.cmd` is the native-Windows peer of `install.sh`. It finds
   Python 3.9+ (`THEKNOWLEDGE_BOOTSTRAP_PYTHON`, `py -3`, each
   `python.exe` on `PATH`, then the default python.org, Python install
@@ -170,7 +172,10 @@ scripts\install_prerequisites.cmd
   the same stage-2 installer. The result is
   `%USERPROFILE%\.local\bin\claude-wrangler.exe` backed by a virtual
   environment in `%USERPROFILE%\.local\share\claude-wrangler\venv`.
-  `.\install.cmd --help` (or `/?`) shows the options.
+  `.\install.cmd --help` (or `/?`) shows the options. cmd cannot split a
+  `PATH` of roughly 8,000 characters or more, so such a `PATH` is not
+  scanned (the error says so); `py -3` and the default locations still
+  work, or set `THEKNOWLEDGE_BOOTSTRAP_PYTHON` to a `python.exe`.
 - PATH: if `%USERPROFILE%\.local\bin` is not on `PATH`, the installer
   prints a PowerShell command that adds it for your user. It never edits
   `PATH` or runs `setx` itself. Run the printed command, then open a new
@@ -352,16 +357,52 @@ Notes:
   launcher flags and are never passed to Claude Code.
 - `claude update`, `claude upgrade`, and `claude install` are
   intercepted: the launcher explains that `claude-wrangler` manages the
-  runtime and exits 2.
+  runtime and exits 2. Claude Code also dispatches these behind leading
+  options (`--verbose update`) or `--`, so any argument that is exactly
+  one of the three words is refused, up to the first other subcommand
+  (`claude plugin install <name>` still works). A one-word prompt such
+  as `-p install` is refused too; Claude Code would run its installer
+  for it.
 - A caller `--settings` flag is refused, because the launcher passes its
   own; put persistent settings in `.local/claude/settings.json`.
 - The launcher puts `.local/claude/wrangler/shim/` first on `PATH`, so
   hooks, scripts, `claude -p`, and background respawns that call
   `claude` run this project's pinned binary with this project's
-  environment instead of a global install.
+  environment instead of a global install. On native Windows the
+  active slot's own directory goes first, so a nested `claude` starts
+  the project's `claude.exe` directly, whether Python, Node, PowerShell,
+  cmd.exe, or Git Bash looks it up, and no cmd.exe re-parses its
+  arguments (Windows PowerShell 5.1 and Git Bash still apply their own
+  quoting rules, as for any native program). Such nested calls keep the
+  redirected homes, the pinned config dir, and the update-suppression
+  variables, but skip the launcher's own `--settings` layer,
+  interception, permission default, and checks; a project
+  `.claude/settings.json` whose `env` block clears `DISABLE_UPDATES`
+  (the launcher warns about one at startup) therefore re-enables Claude
+  Code's updater for them, into the redirected home at ring 1. When the
+  slot's directory cannot be used (the npm-era layout, or extra files
+  beside `claude.exe`), the launcher says so and nested calls fall back
+  to `shim\claude.cmd`; that fallback, and any caller that names
+  `claude.cmd` itself, get cmd.exe's re-parsing described below.
+- cmd.exe re-parses the arguments of every `.cmd` file (double quotes,
+  `%`, `^`, `&`, and line breaks), so a prompt typed after
+  `bin\claude-local` can change on its way in. Programs that start
+  Claude Code with arbitrary arguments should run
+  `python -I .local\claude\wrangler\launch.py <args...>` (any Python
+  3.9+) with an argument list instead.
+- A session started from inside another Claude Code session (your
+  global one, or another project's) does not inherit that session's
+  identity, messaging pipe, or token. Credentials in the environment
+  (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and the like) are
+  kept, because Claude Code prefers them to this project's own login,
+  and the launcher names them once per session so a user-wide key is
+  not mistaken for the project's account.
 - On Windows the launcher waits for Claude Code and returns its exit
   code. Ctrl+C is left to Claude Code, and a session that Ctrl+C ends
-  reports exit code 130, as on POSIX.
+  reports exit code 130, as on POSIX. Killing the launcher process
+  (for example a tool timeout) ends Claude Code as well; killing the
+  cmd.exe that runs `bin\claude-local.cmd` does not, so kill the
+  process tree or run `launch.py` directly from programs.
 
 ## Runtime Slots, Rollback, and Repair
 
@@ -389,11 +430,15 @@ maintainer fails fast and changes nothing.
   and that the slot holds nothing but its expected files. It then
   records each binary's size, modification time, and (on POSIX) inode
   in `slots/<a|b>/.verified.json`. The launcher runs a binary only while
-  it still matches that stamp, so a binary that a clone, a `git pull`,
-  or anything else replaced after verification is refused. A copied or
-  restored checkout gets new file identities: run
-  `claude-wrangler --repair-install .` once to re-verify and re-stamp it
-  offline, without a download.
+  it still matches that stamp, so a binary that a git clone or
+  `git pull` planted or replaced after verification is refused. On
+  Windows the stamp has no inode, so an archive or copy tool that keeps
+  modification times could restore a same-size binary together with a
+  matching stamp; treat runtime state from archives as untrusted and run
+  `claude-wrangler --repair-install .`, which re-verifies every byte. A
+  copied or restored checkout usually gets new file identities: run
+  `--repair-install` once to re-verify and re-stamp it offline, without
+  a download.
 - **`--rollback`** makes the other slot active after checking that
   nothing runs from it and re-verifying it fully offline (signatures and
   SHA-256 from its retained evidence).
@@ -406,10 +451,12 @@ maintainer fails fast and changes nothing.
   instead of being downloaded again. It never removes Claude session
   state.
 - **Tracked files are refused.** Install, upgrade, repair, `--update`,
-  and `--rollback` refuse when git tracks anything under the runtime
-  root, the config dir, the redirected home, the npm-era layout, or the
-  launchers, because a clone or pull could then replace them with
-  content `claude-wrangler` never verified. Remove such files from the
+  `--rollback`, the settings toggles, and `--skip-install` refuse when
+  git tracks anything under the runtime root, the config dir, the
+  redirected home, the npm-era layout, or the launchers, because a
+  clone or pull could then replace them with content `claude-wrangler`
+  never verified. On Windows and macOS the check ignores case, so a
+  tracked `.LOCAL/Claude/...` counts. Remove such files from the
   repository; `--allow-tracked-state` overrides the refusal for an
   operator who tracks them on purpose. `--inspect` and `--selftest`
   report them.
@@ -637,7 +684,10 @@ trust boundary.
   silently targeting the wrong scope, or `--allow-isolated-home` when
   an AI-local install is deliberate. On native Windows the home is read
   from `USERPROFILE` (then `HOMEDRIVE`/`HOMEPATH`, then `HOME`), and
-  each of those variables is checked.
+  each of those variables is checked. Another checkout's isolated home
+  counts too, and inside a `claude-local` or `codex-local` session any
+  home that differs from your account's own home counts, so a custom
+  launcher layout is caught as well.
 - System installs remain separate and still require
   `sudo ./install.sh --system` (not available on native Windows).
 
@@ -659,8 +709,14 @@ The tool is intentionally suspicious.
 - `--local-dir` must name a new, empty, or `claude-wrangler`-owned
   directory, and every managed path must be ASCII-safe for the cmd
   launcher; both are checked before anything is downloaded.
-- On POSIX the config dir and the redirected home are kept private to
-  you (mode 0700): they hold transcripts and credentials.
+- The config dir and the redirected home are kept private to you: mode
+  0700 on POSIX, and on Windows an ACL that grants only you, SYSTEM,
+  and Administrators (Claude Code keeps its Windows login in
+  `.local\claude\.credentials.json`). On Windows, install and repair
+  also warn when the checkout itself is writable by Users,
+  Authenticated Users, or Everyone, as folders created under a drive
+  root such as `C:\src` are by default; keep client work under your own
+  profile.
 - The generated launchers and the generated local README are
   content-checked; the launcher core must be a byte-for-byte copy of
   the packaged one.
@@ -678,7 +734,29 @@ The tool is intentionally suspicious.
   but Windows Credential Manager (including Git Credential Manager),
   the registry, and `HKCU\SOFTWARE\Policies` stay per user and are
   shared by every project. `HOMESHARE`, `TEMP`, and `TMP` are not
-  redirected.
+  redirected. As on Linux at ring 1, these are shared too: Windows
+  OpenSSH keys, config, and the `ssh-agent` service (OpenSSH finds
+  `~\.ssh` from the account profile, not `USERPROFILE`); programs that
+  ask Windows for known folders, such as .NET tools, which get the real
+  profile; the PowerShell module path; and machine-wide managed
+  settings under `C:\Program Files\ClaudeCode`.
+- **Credentials in the environment.** `ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and the Bedrock and
+  Vertex switches take precedence over a project's own login on every
+  operating system. The launcher names them once per session but does
+  not remove them.
+- **Windows Credential Manager outlives uninstall.** Claude Code may
+  keep a login there under a name derived from the config-dir path.
+  `--uninstall` cannot remove it and says so; run `/logout` in a project
+  session first, or delete the entry in Credential Manager, so a later
+  checkout at the same path does not find it.
+- **Shared checkouts on Windows.** A checkout writable by other local
+  accounts (any folder created under a drive root inherits that by
+  default) is open to them whatever `claude-wrangler` does; the private
+  session directories protect only the session state's
+  confidentiality. Keep work for different clients in checkouts only
+  you can write, or in separate Windows accounts with their own
+  checkouts.
 - **Ring-0 housekeeping.** Claude Code's daily cleanup prunes old
   versions in `~/.local/share/claude/versions` whatever the update
   settings say. A ring-0 session can therefore prune old versions of

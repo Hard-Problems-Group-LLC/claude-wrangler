@@ -261,11 +261,97 @@ def test_policy_allows_deliberate_home_outside_a_launcher_session(stage1, stage2
     )
 
 
+def bare_host(stage1, env: Dict[str, str], profile: str = r"C:\Users\Operator"):
+    """Build host facts whose environment is exactly ``env`` (no USERPROFILE)."""
+
+    return stage1.Host(
+        windows=True,
+        elevated=False,
+        interactive=False,
+        env=dict(env),
+        profile=Path(profile),
+    )
+
+
+@pytest.mark.parametrize(
+    "homepath",
+    [r"\work\repo\.local\claude\HOME", r"\work\repo\.codex-home"],
+)
+def test_policy_refuses_an_isolated_homedrive_homepath(stage1, stage2, homepath):
+    # With USERPROFILE unset, stage 2's Path.home() uses HOMEDRIVE/HOMEPATH.
+    host = bare_host(stage1, {"HOMEDRIVE": "C:", "HOMEPATH": homepath})
+
+    refusal = stage1.policy_refusal(
+        stage2.parse_args([]), stage1.supported_native_modes(stage2), host
+    )
+
+    assert refusal is not None
+    assert "HOMEDRIVE/HOMEPATH=C:" + homepath in refusal
+    assert stage1.install_target_home(host) == "C:" + homepath
+
+
+def test_policy_refuses_a_redirected_homedrive_homepath_in_a_session(stage1, stage2):
+    host = bare_host(
+        stage1,
+        {
+            "HOMEDRIVE": "D:",
+            "HOMEPATH": r"\custom\home",
+            "CLAUDE_LOCAL_MANAGED_BY": "claude-wrangler",
+        },
+    )
+
+    refusal = stage1.policy_refusal(
+        stage2.parse_args([]), stage1.supported_native_modes(stage2), host
+    )
+
+    assert refusal is not None
+    assert "HOMEDRIVE/HOMEPATH" in refusal
+
+
+def test_policy_ignores_a_network_homedrive_when_userprofile_is_set(stage1, stage2):
+    host = make_host(
+        stage1,
+        env={
+            "HOMEDRIVE": "H:",
+            "HOMEPATH": "\\",
+            "CLAUDE_LOCAL_MANAGED_BY": "claude-wrangler",
+        },
+    )
+
+    assert (
+        stage1.policy_refusal(
+            stage2.parse_args([]), stage1.supported_native_modes(stage2), host
+        )
+        is None
+    )
+    assert stage1.install_target_home(host) == r"C:\Users\Operator"
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_policy_refuses_an_empty_userprofile(stage1, stage2, allow):
+    # Path.home() would turn an empty USERPROFILE into the current directory.
+    host = bare_host(stage1, {"USERPROFILE": "", "HOME": r"C:\Users\Operator"})
+
+    refusal = stage1.policy_refusal(
+        stage2.parse_args([]),
+        stage1.supported_native_modes(stage2),
+        host,
+        allow_isolated_home=allow,
+    )
+
+    assert refusal is not None
+    assert "USERPROFILE is set but empty" in refusal
+
+
 def test_supported_modes_follow_stage2_declaration(stage1):
     class Declared:
+        """A stage 2 that declares two native modes."""
+
         NATIVE_WINDOWS_SUPPORTED_MODES = ("standard", "dev")
 
     class Malformed:
+        """A stage 2 whose declaration is not a sequence of names."""
+
         NATIVE_WINDOWS_SUPPORTED_MODES = "standard"
 
     assert stage1.supported_native_modes(Declared) == ("standard", "dev")
@@ -333,6 +419,8 @@ def test_main_help_prints_usage_then_stage2_help(stage1, token, capsys):
     shown: List[Path] = []
 
     def show_help(stage2_path: Path) -> int:
+        """Record which stage 2 the helper asked for help."""
+
         shown.append(stage2_path)
         return 0
 
@@ -443,6 +531,8 @@ def test_elevated_run_with_console_asks_once(stage1, answer, expected):
     prompts: List[str] = []
 
     def ask(prompt: str) -> str:
+        """Record the prompt and give the parametrized answer."""
+
         prompts.append(prompt)
         return answer
 
@@ -474,9 +564,13 @@ def test_elevated_prompt_end_of_input_and_ctrl_c(stage1):
     host = make_host(stage1, elevated=True, interactive=True)
 
     def end_of_input(prompt: str) -> str:
+        """Behave like input() at the end of standard input."""
+
         raise EOFError
 
     def interrupted(prompt: str) -> str:
+        """Behave like input() when Ctrl+C is pressed."""
+
         raise KeyboardInterrupt
 
     assert stage1.confirm_elevated(host, end_of_input) is False
@@ -917,6 +1011,8 @@ def run_powershell(
     """Run a batch file from PowerShell and return its exit code."""
 
     def quote(text: str) -> str:
+        """Quote text as a PowerShell single-quoted string."""
+
         return "'{}'".format(text.replace("'", "''"))
 
     command = "& {} {}; exit $LASTEXITCODE".format(
@@ -1277,3 +1373,271 @@ def test_prerequisites_cmd_continues_with_newly_installed_python(checkout):
         # Remove the junction itself, never what it points to.
         if os.path.lexists(str(junction)):
             os.rmdir(str(junction))
+
+
+# PATH quoting and interpreter paths with cmd metacharacters -----------------
+
+
+@pytest.mark.parametrize("path", BATCH_FILES, ids=lambda path: path.name)
+def test_batch_probes_start_python_exe_without_call(path):
+    # call re-parses its line: it doubles carets and expands percent signs a
+    # second time, so a python.exe under such a directory would be rejected.
+    for line in code_lines(path):
+        if 'python.exe" -c' in line:
+            assert not line.startswith("call "), line
+
+
+@pytest.mark.parametrize("path", BATCH_FILES, ids=lambda path: path.name)
+def test_batch_file_reads_path_only_through_delayed_expansion(path):
+    # cmd aborts the whole file when a parsed line passes 8191 characters,
+    # so PATH and its copy must never be expanded with percent signs.
+    lines = code_lines(path)
+    for line in lines:
+        assert not re.search(r"%(TK_)?PATH[:%]", line, re.IGNORECASE), line
+    assert "if not defined TK_PY setlocal EnableDelayedExpansion" in lines
+    assert any('set "TK_PATH=!PATH:"=!"' in line for line in lines)
+    # The quoted list is length-checked before cmd builds it.
+    assert any("!TK_LISTLEN! gtr 8000" in line for line in lines)
+    # Each entry is tested with delayed expansion off, and a hit leaves both
+    # scopes at once.
+    assert "setlocal DisableDelayedExpansion" in lines
+    assert any("(endlocal & endlocal & set " in line for line in lines)
+
+
+def run_entry(checkout, which: str, env: Dict[str, str]):
+    """Run install.cmd or install_prerequisites.cmd; return (result, record)."""
+
+    script = checkout.install_cmd if which == "install" else checkout.prereq_cmd
+    completed = run_cmd(script, "--skip-submodule-init", env)
+    record = (
+        checkout.read_stage2_record()
+        if which == "install"
+        else checkout.read_helper_record()
+    )
+    return completed, record
+
+
+QUOTED_PAREN_ENTRY = r'"C:\Quoted Tools (x86)\bin"'
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+def test_entry_points_survive_a_quoted_path_entry_with_parentheses(checkout, which):
+    real = base_python()
+    if real is None:
+        pytest.skip("no base python.exe next to this interpreter")
+    # With an override, the PATH scan line is still parsed.
+    env = checkout.environment(python=sys.executable)
+    env["PATH"] = ";".join([QUOTED_PAREN_ENTRY, str(system32())])
+    completed, record = run_entry(checkout, which, env)
+    assert completed.returncode == 0, text(completed.stderr)
+    assert record is not None
+    # Without one, the scan continues past the quoted entry.
+    env = checkout.environment(
+        path=[checkout.stub_dir, QUOTED_PAREN_ENTRY, real.parent, system32()]
+    )
+    completed, record = run_entry(checkout, which, env)
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.samefile(record["exe"], str(real))
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+def test_entry_points_find_python_in_a_quoted_path_entry(checkout, which):
+    real = base_python()
+    if real is None:
+        pytest.skip("no base python.exe next to this interpreter")
+    env = checkout.environment(
+        path=[checkout.stub_dir, '"{}"'.format(real.parent), system32()]
+    )
+    completed, record = run_entry(checkout, which, env)
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.samefile(record["exe"], str(real))
+
+
+@pytest.fixture(scope="module")
+def venv_python_files(tmp_path_factory):
+    """Return a pip-less venv's python.exe and pyvenv.cfg to copy elsewhere."""
+
+    if os.name != "nt":
+        pytest.skip("runs Windows shells")
+    base = base_python() or Path(sys.executable)
+    venv = tmp_path_factory.mktemp("venvsrc") / "venv"
+    subprocess.run(
+        [str(base), "-m", "venv", "--without-pip", str(venv)],
+        check=True,
+        capture_output=True,
+        timeout=180,
+    )
+    return venv / "Scripts" / "python.exe", venv / "pyvenv.cfg"
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+@pytest.mark.parametrize("source", ["path", "override"])
+@pytest.mark.parametrize("label", ["caret", "percent"])
+def test_entry_points_accept_interpreters_under_cmd_metacharacters(
+    checkout, tmp_path, venv_python_files, which, source, label
+):
+    # A venv launcher finds pyvenv.cfg beside itself, so a copy of both is a
+    # working interpreter at any path.
+    name = {"caret": "car^et dir", "percent": "pct %" + "OS" + "% dir"}[label]
+    directory = tmp_path / name
+    directory.mkdir()
+    for item in venv_python_files:
+        shutil.copy2(str(item), str(directory / item.name))
+    python = directory / "python.exe"
+    if source == "override":
+        env = checkout.environment(python=str(python))
+    else:
+        env = checkout.environment(path=[checkout.stub_dir, directory, system32()])
+
+    completed, record = run_entry(checkout, which, env)
+
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.normcase(record["exe"]) == os.path.normcase(str(python))
+
+
+# Long PATH values and delayed-expansion scope -------------------------------
+
+
+def junk_path_entries(total: int, width: int = 40) -> List[str]:
+    """Return absent directories whose joined length reaches `total`."""
+
+    entries: List[str] = []
+    while len(";".join(entries)) < total:
+        entries.append(r"C:\nonexistent\d{:05d}".format(len(entries)).ljust(width, "a"))
+    return entries
+
+
+def copy_venv_python(venv_python_files, directory: Path) -> Path:
+    """Copy a venv launcher and its pyvenv.cfg into `directory`."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    for item in venv_python_files:
+        shutil.copy2(str(item), str(directory / item.name))
+    return directory / "python.exe"
+
+
+# 8150 sits in the band where the quoted entry list passes 8191 characters
+# while PATH itself does not: cmd crashed there on a delayed replacement.
+LONG_PATH_LENGTHS = (8150, 8500, 20000)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+@pytest.mark.parametrize("length", LONG_PATH_LENGTHS)
+def test_entry_points_survive_a_path_too_long_for_cmd(
+    checkout, tmp_path, venv_python_files, which, length
+):
+    override = copy_venv_python(venv_python_files, tmp_path / "override")
+    default = copy_venv_python(
+        venv_python_files,
+        checkout.home / "AppData" / "Local" / "Programs" / "Python" / "Python399",
+    )
+    # System32 comes first: cmd cannot search a PATH this long for commands.
+    entries = [str(system32())] + junk_path_entries(length)
+
+    env = checkout.environment(path=entries, extra={})
+    env["THEKNOWLEDGE_BOOTSTRAP_PYTHON"] = str(override)
+    completed, record = run_entry(checkout, which, env)
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.normcase(record["exe"]) == os.path.normcase(str(override))
+
+    env = checkout.environment(path=entries)
+    completed, record = run_entry(checkout, which, env)
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.normcase(record["exe"]) == os.path.normcase(str(default))
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+@pytest.mark.parametrize("length", (8150, 20000))
+def test_entry_points_say_when_a_long_path_was_not_scanned(
+    checkout, tmp_path, which, length
+):
+    empty = tmp_path / "empty bin"
+    empty.mkdir()
+    env = checkout.environment(
+        path=[str(system32()), str(empty)] + junk_path_entries(length)
+    )
+
+    completed, record = run_entry(checkout, which, env)
+
+    assert completed.returncode == 1
+    assert record is None
+    assert "PATH was not scanned" in text(completed.stderr)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+def test_entry_points_scan_a_long_path_that_still_fits(
+    checkout, tmp_path, venv_python_files, which
+):
+    python = copy_venv_python(venv_python_files, tmp_path / "late dir")
+    entries = [checkout.stub_dir] + junk_path_entries(7000)
+    env = checkout.environment(path=entries + [str(python.parent), str(system32())])
+
+    completed, record = run_entry(checkout, which, env)
+
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.normcase(record["exe"]) == os.path.normcase(str(python))
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+@pytest.mark.parametrize("name", ["bang! dir", "b!PATH!c", "a !b! & (c)"])
+def test_entry_points_keep_path_entries_with_exclamation_marks(
+    checkout, tmp_path, venv_python_files, which, name
+):
+    python = copy_venv_python(venv_python_files, tmp_path / name)
+    env = checkout.environment(path=[checkout.stub_dir, python.parent, system32()])
+
+    completed, record = run_entry(checkout, which, env)
+
+    assert completed.returncode == 0, text(completed.stderr)
+    assert os.path.normcase(record["exe"]) == os.path.normcase(str(python))
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("which", ["install", "prereq"])
+@pytest.mark.parametrize("found", ["py-path", "default", "none"])
+def test_entry_points_leave_the_callers_console_unchanged(
+    checkout, tmp_path, venv_python_files, which, found
+):
+    # A caller that uses "call" shares the batch file's environment, so an
+    # unbalanced setlocal would leak the TK_ helpers and settings into it.
+    empty = tmp_path / "empty bin"
+    empty.mkdir()
+    path = [str(empty), str(system32())]
+    if found == "py-path":
+        path.insert(0, str(copy_venv_python(venv_python_files, tmp_path / "py").parent))
+    elif found == "default":
+        copy_venv_python(
+            venv_python_files,
+            checkout.home / "AppData" / "Local" / "Programs" / "Python" / "Python399",
+        )
+    env = checkout.environment(path=path)
+    for name in (
+        "NoDefaultCurrentDirectoryInExePath",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+    ):
+        env.pop(name, None)
+        env.pop(name.upper(), None)
+    script = checkout.install_cmd if which == "install" else checkout.prereq_cmd
+    command_line = (
+        'cmd.exe /d /s /c "call "{}" --skip-submodule-init 1>nul 2>nul'
+        ' & set TK_ & set NoDefaultCurrentDirectoryInExePath & set PYTHONUTF8"'
+    ).format(script)
+
+    completed = subprocess.run(
+        command_line,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert text(completed.stdout).strip() == ""

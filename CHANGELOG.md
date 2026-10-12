@@ -136,8 +136,9 @@ where practical.
   limitations.
 - Windows and macOS operating-system classifiers in `pyproject.toml`.
 - `--allow-tracked-state`, which lets install, upgrade, repair,
-  `--update`, and `--rollback` proceed when git tracks managed runtime,
-  session-state, or launcher files.
+  `--update`, `--rollback`, the settings toggles, and `--skip-install`
+  proceed when git tracks managed runtime, session-state, or launcher
+  files.
 
 ### Changed
 
@@ -296,6 +297,78 @@ where practical.
   and removed, and a dangling link pointing out of the project is
   refused by the containment checks (`Path.resolve()` does not follow
   such links there).
+- On Windows a nested `claude` inside a session (a Python list call,
+  Node or Bun spawn, PowerShell, cmd.exe, or Git Bash) now starts the
+  active slot's `claude.exe` directly: the launcher puts the slot's
+  directory ahead of the PATH shim. Before, `.exe`-only lookups skipped
+  the `.cmd` shim and ran the operator's global `claude.exe` against
+  the project's config dir. Such nested calls now skip the launcher's
+  per-invocation layers (`--settings`, interception, the permission
+  default, and its checks); the redirected homes, the pinned config dir,
+  and the update-suppression variables still apply. When the slot's
+  directory cannot be used (the npm-era layout, or extra files beside
+  `claude.exe`), the launcher warns that nested calls fall back to the
+  `.cmd` shim.
+- `bin\claude-local.cmd` and the nested `claude.cmd` find their own
+  directory through a called label, so a quoted bare name found through
+  `PATH` (from `shell=True` strings, Node `exec`, or npm scripts) no
+  longer makes them run a launcher or `launch.py` located relative to
+  the caller's current directory.
+- The cmd launcher probes `py.exe`, `python3.exe`, and `python.exe`
+  instead of bare names, so a pyenv-win `.bat` shim can no longer end
+  it with exit 0 before anything launched; it exits 127 with the
+  no-Python message instead. Its probes, and the `sh` launcher's, run
+  with `PYTHON_MANAGER_AUTOMATIC_INSTALL=false` (the caller's value is
+  restored for Claude Code), so the Windows Python install manager
+  never installs a runtime during a launch.
+- `install.cmd` and `scripts\install_prerequisites.cmd` no longer abort
+  with "was unexpected at this time" when `PATH` holds a quoted entry
+  with parentheses (such as one under `Program Files (x86)`), find a
+  Python in a quoted `PATH` entry, and accept an interpreter under a
+  directory containing `^` or `%`, through `PATH` or
+  `THEKNOWLEDGE_BOOTSTRAP_PYTHON`. They read `PATH` only through
+  delayed expansion and measure it first, so a `PATH` too long for cmd
+  (roughly 8,000 characters once quoted) is skipped with a message
+  instead of aborting the script or crashing cmd, and
+  `THEKNOWLEDGE_BOOTSTRAP_PYTHON` and the default locations still work
+  there. Entries containing `!` keep their spelling.
+- `scripts/install_prerequisites.py --dry-run` no longer reports
+  "Prerequisites ready." while prerequisites are missing; it says what
+  it would install. After a real install it checks again and asks for a
+  new terminal when the new tools are not visible yet.
+- `update`, `upgrade`, and `install` are intercepted behind leading
+  root options and `--` too (Claude Code dispatches them there), while
+  `plugin install <name>` and multi-word prompts still pass, including
+  in the npm-era layout, which records no subcommands.
+- On Windows, a lower-case drive letter or an 8.3 short spelling of the
+  checkout no longer forks Claude Code's path-keyed state: the launcher
+  canonicalizes the root before it exports `CLAUDE_CONFIG_DIR` and the
+  home variables. A project launched before through a lower-case drive
+  spelling (as some editor terminals provide) gets its per-project
+  Claude Code entry once more under the canonical spelling, so expect
+  one more folder-trust prompt there.
+- The Windows install gate (`install-stage-1-windows.py`) now checks
+  `HOMEDRIVE`/`HOMEPATH`, the home stage 2 falls back to, refuses an
+  empty `USERPROFILE`, and names the effective home in its elevated
+  prompt; installers also recognize another checkout's isolated home
+  and, inside a launcher session, a home that differs from the
+  account's own.
+- An uninstall stopped by a filesystem without file locks no longer
+  leaves the lock file and runtime-root scaffolding it created.
+- The tracked-state refusal ignores case on case-insensitive
+  filesystems, so a tracked `.LOCAL/Claude/...` path no longer slips
+  past it, and a caller's `GIT_LITERAL_PATHSPECS` cannot empty the
+  query.
+- A checkout whose runtime root contains the `PATH` separator is
+  refused before anything changes, and the launcher refuses to start
+  from one, instead of letting nested `claude` calls fall through to a
+  global binary. This applies on POSIX too, where the separator is `:`:
+  an existing install under such a path no longer launches and must be
+  moved.
+- The macOS prerequisites specification now matches the code (only
+  `/usr/bin/git` is gated on `xcode-select -p`), and
+  `install_prerequisites.sh` suggests `xcode-select --install` on macOS
+  when no Python 3.9+ exists.
 
 ### Security
 
@@ -334,12 +407,15 @@ where practical.
   launcher now runs a binary only while it matches the verification
   stamp written after its last full verification
   (`slots/<x>/.verified.json`: size, modification time, and on POSIX
-  inode), so a binary planted by a clone or replaced by a `git pull`
-  is refused. A copied checkout needs one `--repair-install`.
-- Install, upgrade, repair, `--update`, and `--rollback` refuse when git
-  tracks files under the runtime root, the config dir, the redirected
-  home, the npm-era layout, or the launchers (`--allow-tracked-state`
-  overrides); inspect and selftest report such files.
+  inode), so a binary planted by a git clone or replaced by a
+  `git pull` is refused. A copied checkout needs one `--repair-install`.
+  On Windows the stamp has no inode, so an archive that preserves
+  modification times could carry a matching one.
+- Install, upgrade, repair, `--update`, `--rollback`, the settings
+  toggles, and `--skip-install` refuse when git tracks files under the
+  runtime root, the config dir, the redirected home, the npm-era
+  layout, or the launchers (`--allow-tracked-state` overrides); inspect
+  and selftest report such files.
 - A slot that holds anything beyond its record, stamp, evidence, and
   binaries (for example a DLL beside `claude.exe`) fails verification,
   selftest, and repair, and loses its stamp.
@@ -350,3 +426,29 @@ where practical.
 - A non-default release host recorded in metadata is named before it is
   contacted and in the install summary.
 - On POSIX the config dir and redirected home are kept at mode 0700.
+- Nested `claude` calls on Windows no longer pass through cmd.exe,
+  which re-parsed every argument: text from a prompt, system prompt, or
+  JSON configuration could run a second command outside any permission
+  check, expand `%` variables, or be truncated. Programs that call the
+  top-level launcher should run `launch.py` with an argument list; the
+  README documents cmd's re-parsing of `bin\claude-local.cmd`.
+- A project session started from another Claude Code session no longer
+  inherits that session's identity, messaging pipe and token, or
+  secure-storage key, and the launcher names inherited credential
+  variables (never their values) once per session. The IDE port, entry
+  point, and effort variables are dropped only when `CLAUDECODE` shows
+  that another Claude Code session started the launch, because IDE
+  terminals and Agent SDK hosts set them too.
+- On Windows the config dir and redirected home get a private ACL
+  (you, SYSTEM, Administrators) when created and at every maintenance
+  operation, so other local accounts cannot read session tokens or
+  transcripts in a checkout outside the profile; install and repair
+  warn about a checkout writable by Users, Authenticated Users, or
+  Everyone.
+- Killing the launcher on Windows now ends Claude Code too (a
+  kill-on-close job), instead of leaving it running unattended.
+- `--uninstall` on Windows notes that Claude Code may keep a login in
+  Windows Credential Manager that uninstall cannot remove, and the docs
+  list the stores ring 1 shares on Windows (OpenSSH, known folders, the
+  PowerShell module path, managed settings, and environment
+  credentials).

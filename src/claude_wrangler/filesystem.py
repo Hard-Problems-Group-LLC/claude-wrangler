@@ -26,7 +26,7 @@ from pathlib import Path
 import stat
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
-from . import atomicio
+from . import atomicio, launcher_core
 from .constants import GITIGNORE_BEGIN, GITIGNORE_END, README_MARKER, SCRIPT_MARKER
 from .layout import real_path
 from .models import ClaudeWranglerError, Config
@@ -298,9 +298,11 @@ def ensure_managed_directories(config: Config) -> None:
     the redirected home also gets `AppData\\Roaming` and `AppData\\Local`,
     because the ring-1 launcher points APPDATA and LOCALAPPDATA there.
 
-    On POSIX the config dir and the redirected HOME hold transcripts,
-    history, and credentials, so they are made private to the operator
-    (mode 0700), including when they already exist with looser modes.
+    The config dir and the redirected HOME hold transcripts, history, and
+    credentials, so they are made private to the operator, including when
+    they already exist with looser permissions: mode 0700 on POSIX, and on
+    Windows a protected DACL for the operator, SYSTEM, and Administrators
+    (`_make_private_directory_windows`).
     """
 
     targets = [(config.layout.config_dir, True)]
@@ -321,6 +323,70 @@ def ensure_managed_directories(config: Config) -> None:
         target.mkdir(parents=True, exist_ok=True)
         if private and os.name != "nt":
             _make_private_directory(target)
+        elif private:
+            _make_private_directory_windows(target)
+
+
+def _make_private_directory_windows(path: Path) -> None:
+    """Give a managed Windows directory a private DACL when it has a wider one.
+
+    A checkout outside the user profile (for example under `C:\\src`)
+    inherits the drive root's grants, which on default Windows let every
+    authenticated user modify it, so other local accounts could read the
+    session's OAuth tokens and transcripts. Existing entries that already
+    name only the operator, the directory's owner, SYSTEM, and
+    Administrators are left alone. Failures (FAT or exFAT volumes, some
+    network shares) are reported and never stop the operation.
+    """
+
+    if is_link_like(path) or not path.is_dir():
+        return
+    summary = launcher_core.windows_security_summary(str(path))
+    user_sid = launcher_core.windows_current_user_sid()
+    if summary is None or user_sid is None:
+        return
+    owner_sid, entries = summary
+    principals = launcher_core.private_dacl_principals(user_sid, owner_sid)
+    if launcher_core.dacl_is_private(entries, principals):
+        return
+    eprint(
+        "[claude-wrangler] Restricting {} to you, SYSTEM, and Administrators: it "
+        "holds Claude Code session state.".format(path)
+    )
+    try:
+        launcher_core.windows_set_private_dacl(str(path))
+    except OSError as exc:
+        eprint(
+            "[claude-wrangler] Warning: could not restrict {} ({}); other local "
+            "accounts may be able to read its session state.".format(path, exc)
+        )
+
+
+def shared_checkout_warning(project_root: Path) -> Optional[str]:
+    """Return a warning when a Windows checkout is writable by broad groups.
+
+    Such a checkout is already open to every local account (its sources,
+    `.git/hooks`, and the generated launchers), so claude-wrangler cannot
+    make it safe; the warning says so instead of implying the private
+    session directories are enough. Returns None elsewhere and when the
+    ACL cannot be read.
+    """
+
+    if os.name != "nt":
+        return None
+    summary = launcher_core.windows_security_summary(str(project_root))
+    if summary is None:
+        return None
+    groups = launcher_core.broad_write_grants(summary[1])
+    if not groups:
+        return None
+    return (
+        "[claude-wrangler] WARNING: {} grants {} write access, so other local "
+        "accounts can change this checkout, including its launchers and "
+        "runtime. Such a checkout is unsafe for multi-account use: keep client "
+        "work under your own profile (or another directory only you can "
+        "write) and remove those grants.".format(project_root, " and ".join(groups))
+    )
 
 
 def _make_private_directory(path: Path) -> None:

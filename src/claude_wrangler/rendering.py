@@ -317,7 +317,10 @@ def build_posix_shim(config: Config) -> str:
     `cd` runs with `CDPATH` cleared and `--`, so an exported `CDPATH`
     cannot redirect it or make it print the directory into the captured
     root. Every managed path is embedded single-quoted, so a `$`, backtick,
-    or double quote in `--local-dir` stays literal.
+    or double quote in `--local-dir` stays literal. Each probe runs with
+    `PYTHON_MANAGER_AUTOMATIC_INSTALL=false` for that command only, so the
+    Windows Python install manager never installs a runtime during a
+    launch.
     """
 
     layout = config.layout
@@ -363,16 +366,19 @@ def build_posix_shim(config: Config) -> str:
         "    ;;",
         "esac",
         "export CLAUDE_LOCAL_REPO_ROOT",
-        'if [ -n "$claude_local_recorded" ] && "$claude_local_recorded" -I -c '
-        '"$claude_local_probe" >/dev/null 2>&1; then',
+        "# The probes never let the Windows Python install manager install a",
+        "# runtime; the launch itself keeps the caller's setting.",
+        'if [ -n "$claude_local_recorded" ] && PYTHON_MANAGER_AUTOMATIC_INSTALL=false '
+        '"$claude_local_recorded" -I -c "$claude_local_probe" >/dev/null 2>&1; then',
         '  exec "$claude_local_recorded" -I "$claude_local_core" "$@"',
         "fi",
-        'if command -v py >/dev/null 2>&1 && py -3 -I -c "$claude_local_probe" '
-        ">/dev/null 2>&1; then",
+        "if command -v py >/dev/null 2>&1 && PYTHON_MANAGER_AUTOMATIC_INSTALL=false "
+        'py -3 -I -c "$claude_local_probe" >/dev/null 2>&1; then',
         '  exec py -3 -I "$claude_local_core" "$@"',
         "fi",
         "for claude_local_python in python3 python; do",
         '  if command -v "$claude_local_python" >/dev/null 2>&1 && '
+        "PYTHON_MANAGER_AUTOMATIC_INSTALL=false "
         '"$claude_local_python" -I -c "$claude_local_probe" >/dev/null 2>&1; then',
         '    exec "$claude_local_python" -I "$claude_local_core" "$@"',
         "  fi",
@@ -387,19 +393,76 @@ def build_posix_shim(config: Config) -> str:
     return "\n".join(lines)
 
 
+CMD_SELF_LABEL = ":claude_local_self"
+
+
+def _cmd_self_label(variable: str) -> List[str]:
+    """Return the trailing subroutine that records the batch file's directory.
+
+    Outside a called label, ``%~dp0`` describes the batch file as it was
+    invoked: when cmd found the file through PATH by a quoted bare name
+    (``"claude"`` from a ``shell=True`` string, a Node ``exec`` string, or
+    an npm script), it names the caller's current directory instead, which
+    would make the shim run whatever launcher or core sits at that
+    relative location. Inside a called label ``%~dp0`` always names the
+    file's real directory. The label sits after the exit lines and is
+    reached only by ``call`` before Claude Code starts, and the files are
+    always written with CRLF and content-checked, so cmd's LF label-scan
+    hazard does not apply.
+    """
+
+    return [
+        CMD_SELF_LABEL,
+        'set "{}=%~dp0"'.format(variable),
+        "exit /b 0",
+    ]
+
+
+def _cmd_self_location(variable: str, name: str) -> List[str]:
+    """Return the lines that call the self-location label and check its result.
+
+    The variable is cleared first, and a shim whose label could not be
+    found (a file someone saved with LF endings, or edited) refuses instead
+    of resolving paths against the caller's current directory.
+    """
+
+    return [
+        'set "{}="'.format(variable),
+        "call {}".format(CMD_SELF_LABEL),
+        "if not defined {} (".format(variable),
+        "  >&2 echo {}: cannot find its own directory. Rerun {} --repair-install "
+        "to regenerate it.".format(name, SCRIPT_NAME),
+        "  exit /b 1",
+        ")",
+    ]
+
+
 def build_cmd_shim(config: Config) -> str:
     """Return `bin/claude-local.cmd`: an ASCII cmd shim (CRLF when written).
 
-    It has no labels and keeps `%*` on the launch line only. The launch
-    line ends with `& call exit /b %%ERRORLEVEL%%`, so cmd leaves the batch
-    file on that same line: cmd re-reads a batch file by byte offset after
-    each command, and an upgrade that rewrites this file while a session
-    runs would otherwise make it resume in the middle of the new content.
-    `call` re-expands ERRORLEVEL after Claude Code exits, so its exit code
-    passes through. The `CMD_EXIT` lines after it (the TheKnowledge shim
+    It keeps `%*` on the launch line only. The launch line ends with
+    `& call exit /b %%ERRORLEVEL%%`, so cmd leaves the batch file on that
+    same line: cmd re-reads a batch file by byte offset after each command,
+    and an upgrade that rewrites this file while a session runs would
+    otherwise make it resume in the middle of the new content. `call`
+    re-expands ERRORLEVEL after Claude Code exits, so its exit code passes
+    through. The `CMD_EXIT` lines after it (the TheKnowledge shim
     convention) run only if an unbalanced quote in the arguments swallowed
-    that exit. The interpreter is chosen by exit-code probe: the recorded
-    interpreter, then `py -3`, `python3`, and `python`.
+    that exit. The file's own directory comes from the one label after
+    them (`_cmd_self_label`), never from a top-level `%~dp0`.
+
+    The interpreter is chosen by exit-code probe: the recorded interpreter,
+    then `py.exe -3`, `python3.exe`, and `python.exe`. The explicit `.exe`
+    keeps cmd from running a `.bat` shim such as pyenv-win's, which would
+    take over this batch file and exit 0 without launching anything. The
+    probes run in an inner `setlocal` with
+    `PYTHON_MANAGER_AUTOMATIC_INSTALL=false`, so the Python install manager
+    never installs a runtime during an ordinary launch; `endlocal` restores
+    the caller's value, unexpanded, before Claude Code starts.
+
+    cmd re-parses the arguments on the launch line (double quotes, `%`,
+    `^`, `&`, and newlines), as it does for every batch file; programs
+    should run `launch.py` with a Python interpreter and list arguments.
     """
 
     layout = config.layout
@@ -422,17 +485,29 @@ def build_cmd_shim(config: Config) -> str:
             SCRIPT_NAME
         ),
         "rem",
-        "rem ASCII only, no labels, and the argument list appears only on the",
-        "rem launch line, so arguments such as x)y never break parsing. That",
-        "rem line also exits, so a rewrite of this file during a session is",
-        "rem never read; the exit code passes through.",
+        "rem ASCII only, and the argument list appears only on the launch line,",
+        "rem so arguments such as x)y never break parsing. That line also exits,",
+        "rem so a rewrite of this file during a session is never read; the exit",
+        "rem code passes through. The one label, after the exit lines, finds this",
+        "rem file's directory: a quoted bare name found through PATH makes the",
+        "rem top-level batch path name the caller's directory instead. cmd",
+        "rem re-parses the arguments (quotes, percent signs, carets, ampersands);",
+        "rem programs should run launch.py with a Python and list arguments.",
         "setlocal EnableExtensions DisableDelayedExpansion",
         'set "NoDefaultCurrentDirectoryInExePath=1"',
-        'for %%I in ("%~dp0{}") do set "CLAUDE_LOCAL_REPO_ROOT=%%~fI"'.format(ups),
+    ]
+    lines.extend(_cmd_self_location("CLAUDE_LOCAL_SELF", "claude-local"))
+    lines += [
+        'for %%I in ("%CLAUDE_LOCAL_SELF%{}") do set "CLAUDE_LOCAL_REPO_ROOT=%%~fI"'.format(
+            ups
+        ),
+        'set "CLAUDE_LOCAL_SELF="',
         'set "CLAUDE_LOCAL_CORE=%CLAUDE_LOCAL_REPO_ROOT%\\{}"'.format(core_relative),
         'set "CLAUDE_LOCAL_PROBE={}"'.format(PYTHON_PROBE_CMD),
         'set "CLAUDE_LOCAL_PY="',
         'set "CLAUDE_LOCAL_PYARG="',
+        "setlocal",
+        'set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"',
     ]
     if recorded is not None:
         lines.extend(
@@ -446,20 +521,24 @@ def build_cmd_shim(config: Config) -> str:
     lines.extend(
         [
             "if not defined CLAUDE_LOCAL_PY (",
-            '  py -3 -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && set "CLAUDE_LOCAL_PY=py" '
-            '&& set "CLAUDE_LOCAL_PYARG=-3"',
+            '  py.exe -3 -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+            'set "CLAUDE_LOCAL_PY=py.exe" && set "CLAUDE_LOCAL_PYARG=-3"',
             ")",
             "if not defined CLAUDE_LOCAL_PY (",
-            '  python3 -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
-            'set "CLAUDE_LOCAL_PY=python3"',
+            '  python3.exe -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+            'set "CLAUDE_LOCAL_PY=python3.exe"',
             ")",
             "if not defined CLAUDE_LOCAL_PY (",
-            '  python -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
-            'set "CLAUDE_LOCAL_PY=python"',
+            '  python.exe -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+            'set "CLAUDE_LOCAL_PY=python.exe"',
             ")",
+            # The inner scope ends here; the chosen interpreter is carried out
+            # on the same line, expanded before endlocal runs.
+            'endlocal & set "CLAUDE_LOCAL_PY=%CLAUDE_LOCAL_PY%" & '
+            'set "CLAUDE_LOCAL_PYARG=%CLAUDE_LOCAL_PYARG%"',
             "if not defined CLAUDE_LOCAL_PY (",
             "  >&2 echo claude-local: no Python 3.9+ interpreter was found. Tried the "
-            "recorded interpreter, py -3, python3, and python.",
+            "recorded interpreter, py.exe -3, python3.exe, and python.exe.",
             "  >&2 echo claude-local: Rerun {} to record one.".format(SCRIPT_NAME),
             "  exit /b 127",
             ")",
@@ -467,9 +546,10 @@ def build_cmd_shim(config: Config) -> str:
             "& call exit /b %%ERRORLEVEL%%",
             'set "CMD_EXIT=%ERRORLEVEL%"',
             "exit /b %CMD_EXIT%",
-            "",
         ]
     )
+    lines.extend(_cmd_self_label("CLAUDE_LOCAL_SELF"))
+    lines.append("")
     text = "\n".join(lines)
     return _require_ascii(text, "cmd launcher content")
 
@@ -508,28 +588,38 @@ def build_path_shim_sh(config: Config) -> str:
 def build_path_shim_cmd(config: Config) -> str:
     """Return `<runtime root>/shim/claude.cmd`, re-entering the cmd launcher.
 
-    The final line hands control to the launcher shim without `call`, so
-    the arguments are not re-parsed and the launcher's own CMD_EXIT sets
-    the exit code.
+    The launch line hands control to the launcher shim without `call`, so
+    the arguments are not re-parsed a second time and the launcher's own
+    CMD_EXIT sets the exit code. The shim's directory comes from a called
+    label (`_cmd_self_label`), because a top-level `%~dp0` names the
+    caller's current directory when cmd found this file through PATH by a
+    quoted bare name. On native Windows the launcher puts the selected
+    slot's `claude.exe` ahead of this directory on PATH, so this file
+    serves `claude.cmd` callers and the fallback when the slot directory
+    is not used.
     """
 
     relative = _cmd_path_literal(
         path_shim_relative_target(config.layout, cmd=True).replace("/", "\\"),
         "Launcher path",
     )
-    text = "\n".join(
-        [
-            "@echo off",
-            "rem {}".format(SCRIPT_MARKER),
-            "rem Nested {} calls re-enter this project's launcher; generated by".format(
-                PATH_SHIM_NAME
-            ),
-            "rem {}. Do not edit.".format(SCRIPT_NAME),
-            '"%~dp0{}" %*'.format(relative),
-            "",
-        ]
-    )
-    return _require_ascii(text, "cmd PATH shim content")
+    lines = [
+        "@echo off",
+        "rem {}".format(SCRIPT_MARKER),
+        "rem Nested {} calls re-enter this project's launcher; generated by".format(
+            PATH_SHIM_NAME
+        ),
+        "rem {}. Do not edit.".format(SCRIPT_NAME),
+        "setlocal EnableExtensions DisableDelayedExpansion",
+    ]
+    lines.extend(_cmd_self_location("CLAUDE_LOCAL_SHIM_SELF", PATH_SHIM_NAME))
+    lines += [
+        '"%CLAUDE_LOCAL_SHIM_SELF%{}" %*'.format(relative),
+        "exit /b",
+    ]
+    lines.extend(_cmd_self_label("CLAUDE_LOCAL_SHIM_SELF"))
+    lines.append("")
+    return _require_ascii("\n".join(lines), "cmd PATH shim content")
 
 
 def _ring_lines(config: Config) -> List[str]:
@@ -573,6 +663,14 @@ def _ring_lines(config: Config) -> List[str]:
         "Change it with `{} --set-windows-sandbox-warning on|off .`.".format(
             SCRIPT_NAME
         ),
+        "",
+        "Shared at ring 1 on every OS, as on Linux: OpenSSH keys, config, and",
+        "agent (Windows OpenSSH finds `~\\.ssh` from the account profile, not",
+        "`USERPROFILE`), programs that ask Windows for known folders, the",
+        "PowerShell module path, machine-wide managed settings, and",
+        "credentials passed in environment variables. The launcher names any",
+        "`ANTHROPIC_API_KEY`-style credential variables it inherits, because",
+        "Claude Code prefers them to this project's own login.",
         "",
     ]
 
@@ -629,6 +727,16 @@ def build_local_readme_content(config: Config, *, legacy_pending: bool = False) 
                 SCRIPT_NAME
             ),
             "fallbacks). They never fall back to a global `claude`.",
+            "",
+            "cmd.exe re-parses the arguments of every `.cmd` file, so a prompt",
+            'passed to `{}` that contains `"`, `%`, `^`, or `&`'.format(cmd_launcher),
+            "can change. Programs that start Claude Code with arbitrary",
+            "arguments should run `{}` with a Python 3.9+".format(
+                posixpath.join(config.layout.local_dir_relative, LAUNCH_CORE_FILENAME)
+            ),
+            "interpreter (`python -I <path> <args...>`) and an argument list.",
+            "Inside a session on Windows, a nested `claude` runs this project's",
+            "`claude.exe` directly.",
             "",
             "## Managed Paths",
             "",

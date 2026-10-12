@@ -1046,6 +1046,8 @@ def test_selftest_fails_on_damage(installed, capsys, damage):
 
 def test_cli_install_reports_errors_without_traceback(project, capsys, monkeypatch):
     def boom(config, services=None):
+        """Fail like an operation that refuses."""
+
         raise ClaudeWranglerError("simulated failure")
 
     monkeypatch.setattr("claude_wrangler.cli.install_like_operation", boom)
@@ -1987,3 +1989,180 @@ def test_a_slot_lacking_this_hosts_platform_keeps_its_stamp(installed):
     assert not result.ok
     assert "no {} binary".format(foreign) in result.problem
     assert store(installed).stamp_problem("a", KEY) is None
+
+
+# Case-variant tracked state, lock-less filesystems, PATH separators, ACLs ------
+
+
+def case_insensitive_filesystem(root: Path) -> bool:
+    """Return True when ``root`` treats names that differ in case as one."""
+
+    probe = root / "Case-Probe"
+    probe.mkdir()
+    try:
+        return (root / "case-probe").exists()
+    finally:
+        probe.rmdir()
+
+
+def test_install_refuses_a_case_variant_tracked_runtime_path(git_project):
+    # On a case-insensitive filesystem a tracked `.LOCAL/Claude/...` is the
+    # managed `.local/claude/...`, while git compares pathspecs by case. A
+    # pull writes such an entry into the existing `.local/claude` directory,
+    # so the index and the directory on disk disagree in case.
+    from claude_wrangler.services import list_tracked_files
+
+    if not case_insensitive_filesystem(git_project):
+        pytest.skip("the filesystem distinguishes names that differ in case")
+    on_disk = git_project / ".local" / "claude" / "settings.json"
+    on_disk.parent.mkdir(parents=True)
+    on_disk.write_text("{}", encoding="utf-8")
+    blob = git(git_project, "hash-object", "-w", str(on_disk)).strip()
+    git(
+        git_project,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "100644,{},.LOCAL/Claude/settings.json".format(blob),
+    )
+    source = standard_source()
+    services = make_services(source, tracked_files=list_tracked_files)
+
+    with pytest.raises(ClaudeWranglerError, match="git tracks") as raised:
+        install_like_operation(make_config(git_project), services)
+
+    assert ".LOCAL/Claude/settings.json" in str(raised.value)
+    assert source.downloads == [] and source.pointer_requests == []
+
+
+def test_uninstall_leaves_nothing_behind_on_a_filesystem_without_locks(
+    project, monkeypatch
+):
+    # Nobody can hold a lock on such a filesystem, so the lock file and the
+    # runtime-root scaffolding this run created go again.
+    from claude_wrangler import slots as slots_module
+    from claude_wrangler.slots import MaintenanceLockError
+
+    legacy = project / ".local" / "claude" / "npm"
+    legacy.mkdir(parents=True)
+    (legacy / "package.json").write_text(
+        json.dumps({"name": "claude-local-managed-install"}), encoding="utf-8"
+    )
+
+    def unsupported(descriptor):
+        """Fail like flock on a filesystem without lock support."""
+
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(slots_module, "_lock_descriptor", unsupported)
+
+    with pytest.raises(MaintenanceLockError, match="does not support"):
+        uninstall_operation(
+            make_config(project, "--uninstall", "--force"),
+            make_services(standard_source()),
+        )
+
+    assert not runtime(project).exists()
+    assert legacy.is_dir()
+
+
+def test_uninstall_keeps_a_lock_file_it_did_not_create(installed, monkeypatch):
+    from claude_wrangler import slots as slots_module
+    from claude_wrangler.slots import MaintenanceLockError
+
+    lock_file = runtime(installed) / ".lock"
+    assert lock_file.is_file()
+
+    def unsupported(descriptor):
+        """Fail like flock on a filesystem without lock support."""
+
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(slots_module, "_lock_descriptor", unsupported)
+
+    with pytest.raises(MaintenanceLockError):
+        uninstall_operation(
+            make_config(installed, "--uninstall"), make_services(standard_source())
+        )
+
+    assert lock_file.is_file()
+
+
+def test_install_refuses_a_runtime_root_with_the_path_separator(tmp_path):
+    root = tmp_path / "pro{}ject".format(os.pathsep)
+    (root / ".git").mkdir(parents=True)
+    source = standard_source()
+
+    with pytest.raises(ClaudeWranglerError, match="PATH separator"):
+        install(root, source)
+
+    assert source.downloads == []
+    assert not (root / "bin").exists()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_uninstall_on_windows_mentions_credential_manager(installed, capsys, dry_run):
+    args = ["--uninstall"] + (["--dry-run"] if dry_run else [])
+    services = make_services(standard_source(), key="win32-x64")
+
+    assert uninstall_operation(make_config(installed, *args), services) == 0
+
+    assert "Windows Credential Manager" in capsys.readouterr().out
+
+
+def test_uninstall_elsewhere_does_not_mention_credential_manager(installed, capsys):
+    services = make_services(standard_source(), key="linux-x64")
+
+    assert uninstall_operation(make_config(installed, "--uninstall"), services) == 0
+
+    assert "Credential Manager" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_install_makes_the_session_directories_private_on_windows(project, capsys):
+    from claude_wrangler import launcher_core as core
+
+    config_dir = project / ".local" / "claude"
+    (config_dir / "HOME").mkdir(parents=True)
+    # Give the config dir a grant other local accounts would inherit.
+    grant_users_modify(config_dir)
+
+    assert install(project, standard_source()) == 0
+
+    assert "Restricting" in capsys.readouterr().err
+    user = core.windows_current_user_sid()
+    for path in (config_dir, config_dir / "HOME", runtime(project)):
+        summary = core.windows_security_summary(str(path))
+        assert summary is not None
+        principals = core.private_dacl_principals(user, summary[0])
+        assert core.dacl_is_private(summary[1], principals), path
+
+
+def grant_users_modify(path: Path) -> None:
+    """Add an inheritable Modify grant for BUILTIN\\Users with icacls."""
+
+    completed = subprocess.run(
+        ["icacls", str(path), "/grant", "*S-1-5-32-545:(OI)(CI)M"],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_install_warns_about_a_checkout_other_accounts_can_change(project, capsys):
+    grant_users_modify(project)
+
+    assert install(project, standard_source()) == 0
+
+    error = capsys.readouterr().err
+    assert "grants Users write access" in error
+    assert "unsafe for multi-account use" in error
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_a_private_checkout_gets_no_shared_checkout_warning(project, capsys):
+    assert install(project, standard_source()) == 0
+
+    assert "unsafe for multi-account use" not in capsys.readouterr().err

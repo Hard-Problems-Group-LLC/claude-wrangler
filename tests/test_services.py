@@ -294,3 +294,73 @@ def test_settings_probe_budget_rejects_without_running(tmp_path, monkeypatch):
     assert probe_settings_rejections(
         Path("claude"), {}, tmp_path, ["mcp", "doctor"], budget_seconds=0
     ) == ["mcp", "doctor"]
+
+
+# git tracked-file query ------------------------------------------------------
+
+
+def tracked_repository(tmp_path: Path) -> Path:
+    """Return a git work tree that tracks `.LOCAL/claude/settings.json`."""
+
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    root = tmp_path / "repo"
+    tracked = root / ".LOCAL" / "claude" / "settings.json"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("{}", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "-f", ".LOCAL/claude/settings.json"]):
+        subprocess.run(
+            ["git", "-c", "core.longpaths=true", "-C", str(root)] + args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+    return root
+
+
+def test_tracked_file_query_matches_case_variants_when_names_ignore_case(
+    tmp_path, monkeypatch
+):
+    from claude_wrangler.services import list_tracked_files
+
+    root = tracked_repository(tmp_path)
+    managed = [root / ".local" / "claude"]
+
+    assert list_tracked_files(root, managed, ignore_case=True) == [
+        ".LOCAL/claude/settings.json"
+    ]
+    assert list_tracked_files(root, managed, ignore_case=False) == []
+    # A caller's pathspec switches never turn the magic into a literal path.
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
+    assert list_tracked_files(root, managed, ignore_case=True) == [
+        ".LOCAL/claude/settings.json"
+    ]
+    monkeypatch.delenv("GIT_LITERAL_PATHSPECS")
+    monkeypatch.setenv("GIT_GLOB_PATHSPECS", "1")
+    assert list_tracked_files(root, managed, ignore_case=True) == [
+        ".LOCAL/claude/settings.json"
+    ]
+
+
+def test_tracked_file_query_keeps_wildcards_literal(tmp_path):
+    from claude_wrangler.services import list_tracked_files
+
+    root = tracked_repository(tmp_path)
+
+    assert list_tracked_files(root, [root / ".LOCAL" / "c*"], ignore_case=True) == []
+    assert list_tracked_files(root, [root / ".LOCAL" / "claude"]) == [
+        ".LOCAL/claude/settings.json"
+    ]
+
+
+@pytest.mark.skipif(
+    os.name != "nt" and sys.platform != "darwin", reason="default case folding"
+)
+def test_windows_and_macos_filesystems_ignore_case(tmp_path):
+    from claude_wrangler.services import filesystem_ignores_case
+
+    assert filesystem_ignores_case(tmp_path) is True

@@ -4,6 +4,43 @@ Record completed tasks with newest entries at the top. Use asterisk-plus-blank
 line formatting. Include concise outcomes, owners, blocker resolution notes,
 and ISO 8601 timestamps.
 
+* Windows entry-point, launcher, and isolation review with fixes
+  (`feature/windows-platform-support`). A four-stage review (reviewer,
+  skeptic, fixer, re-checker) confirmed 16 Windows findings and refuted
+  none; all were fixed, plus five leftovers from the earlier recheck.
+  Highlights: nested `claude` calls on Windows now reach the active
+  slot's claude.exe directly (no cmd.exe argument re-parsing, no global
+  binary), the cmd shims locate themselves through a called label,
+  another Claude Code session's identity and IPC variables are dropped,
+  a job object ends Claude Code with its launcher, session directories
+  get a private DACL, update/upgrade/install are intercepted behind
+  leading options, the tracked-state refusal ignores case, and
+  install.cmd and install_prerequisites.cmd survive quoted, long, and
+  metacharacter-laden PATH values (cmd.exe crashed on delayed
+  replacements past 8191 characters; the scan now measures first).
+  The re-checker's five follow-ups (long-PATH regression, stale venv
+  re-check, over-broad session-variable list, legacy-mode interception,
+  silent shim fallback) were fixed by the main session. Verified: full
+  suite 1756 passed / 25 skipped on CPython 3.12.10 and 3.9.13; black,
+  ruff, and git diff --check clean; operator profile untouched. Drafted
+  ECRs/TheKnowledge/open/install-sh-bash32-empty-array-and-cdpath.md and
+  corrected the cross-platform CI proposal. Requestor: Matt Heck. Owner:
+  AI (Claude). Started: 2026-10-12T06:15:00-07:00. Completed:
+  2026-10-12T08:47:00-07:00. Blockers: none.
+
+* Native Claude Code runtime for claude-wrangler, with Windows support
+  foundations (`feature/windows-platform-support`, commits ea55dab,
+  2037f53, 310c991, 4d5e4e4, 25e0afe). Replaced the npm-managed install
+  with signature-verified native binaries in A/B runtime slots, a Python
+  launcher core with thin sh and cmd shims, self-update suppression in
+  three layers, legacy npm-layout migration, the install_prerequisites
+  family plus install.cmd, and an adversarial review whose 29 findings
+  were fixed (slot verification stamps, exact slot file sets,
+  tracked-state refusal, uninstall ordering, POSIX path handling, Python
+  3.9 compatibility). Requestor: Matt Heck. Owner: AI (Claude) with
+  operator decisions. Started: 2026-10-11T21:56:00-07:00. Completed:
+  2026-10-12T06:03:04-07:00. Blockers: none.
+
 * Port codex-wrangler to claude-wrangler (spirit-of-the-law). Shipped the
   full utility (17 modules), ring-aware bin/claude-local launcher with
   pinned CLAUDE_CONFIG_DIR=.local/claude and per-invocation ring-0 escape,

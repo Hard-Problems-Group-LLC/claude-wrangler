@@ -56,6 +56,7 @@ from .filesystem import (
     remove_gitignore_block,
     remove_tree,
     remove_tree_except,
+    shared_checkout_warning,
     upsert_gitignore_block,
     write_metadata,
 )
@@ -110,6 +111,7 @@ from .slots import (
     SLOTS_DIR_NAME,
     STAGING_DIR_NAME,
     MaintenanceLockError,
+    MaintenanceLockUnsupportedError,
     PointerError,
     RuntimeStore,
     check_runtime_root_placement,
@@ -146,6 +148,18 @@ __all__ = [
 
 # How many tracked paths a refusal names before summarizing the rest.
 TRACKED_PATHS_SHOWN = 10
+
+# Claude Code on Windows can also keep a login in Windows Credential Manager
+# under a name derived from the exact CLAUDE_CONFIG_DIR string. Uninstall
+# cannot see or remove such an entry, and a later checkout at the same path
+# would find it, so the operator is told where to look.
+WINDOWS_CREDENTIAL_NOTE = (
+    "Note: Claude Code may also keep this project's login in Windows "
+    "Credential Manager, under a generic credential whose name is derived "
+    "from the config dir path; uninstall does not remove it. Run /logout in a "
+    "project session before uninstalling, or remove that entry in Credential "
+    "Manager, so a later checkout at this path does not find it."
+)
 
 
 def require_unchanged_state(config: Config) -> None:
@@ -334,10 +348,24 @@ def check_renderable(config: Config) -> None:
     """Refuse a layout whose generated files cannot be written, before any change.
 
     The cmd launcher is ASCII-only, so a non-ASCII `--local-dir` (or other
-    managed path) would otherwise fail after download and promotion.
+    managed path) would otherwise fail after download and promotion. The
+    runtime root also may not contain the PATH separator (`;` on Windows,
+    `:` elsewhere): the launcher puts the shim directory, and on Windows a
+    slot directory, under it on PATH, and a split entry would let nested
+    `claude` calls fall through to a global binary.
     """
 
     planned_files(config)
+    shim_dir = str(config.layout.shim_dir)
+    if os.pathsep in shim_dir:
+        raise ClaudeWranglerError(
+            "The runtime root {} contains the PATH separator {!r}, so the "
+            "launcher's nested-`claude` PATH entry would split and nested calls "
+            "could reach a global claude. Move the checkout (or choose a "
+            "--local-dir) without {!r}.".format(
+                config.layout.local_dir, os.pathsep, os.pathsep
+            )
+        )
 
 
 def _managed_launcher_exists(config: Config) -> bool:
@@ -1313,6 +1341,9 @@ def install_like_operation(config: Config, services: Optional[Services] = None) 
     if config.platform_override is not None:
         # Refuse another operating system's build before creating anything.
         select_platform_key(services, config.platform_override)
+    shared = shared_checkout_warning(config.project_root)
+    if shared is not None:
+        eprint(shared)
     store = runtime_store(config)
     with store.lock():
         require_unchanged_state(config)
@@ -1860,12 +1891,25 @@ def uninstall_operation(config: Config, services: Optional[Services] = None) -> 
         )
         remove_gitignore_block(layout.gitignore_path, dry_run=True)
         print("Uninstall complete for {} (dry-run).".format(config.project_root))
+        if services.host_os == "win32":
+            print(WINDOWS_CREDENTIAL_NOTE)
         return 0
 
     created = _outermost_missing_dir(store.root, config.project_root)
     lock = store.lock()
     try:
         lock.acquire()
+    except MaintenanceLockUnsupportedError as exc:
+        # The filesystem cannot lock at all, so nobody holds this lock file.
+        # When this run created the runtime root, the file it just created
+        # goes too, and the scaffolding with it.
+        if created is not None and exc.created_lock_file:
+            try:
+                os.unlink(str(lock.path))
+            except OSError:
+                pass
+        _discard_lock_scaffolding(store, created)
+        raise
     except BaseException:
         # The lock may be another maintainer's: only empty directories this
         # run created are removed, never the lock file.
@@ -1885,7 +1929,10 @@ def uninstall_operation(config: Config, services: Optional[Services] = None) -> 
         _discard_lock_scaffolding(store, created)
         return code
     lock.release(delete=True)
-    return _uninstall_finish(config, store)
+    code = _uninstall_finish(config, store)
+    if code == 0 and services.host_os == "win32":
+        print(WINDOWS_CREDENTIAL_NOTE)
+    return code
 
 
 def describe_in_use(config: Config, services: Services) -> Dict[str, object]:

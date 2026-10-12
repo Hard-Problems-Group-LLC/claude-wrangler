@@ -131,13 +131,33 @@ children, so the runtime root must never be placed there.
    "inherited from the caller" at ring 0), and the per-session escape
    hatches.
 
-Privacy of the session directories (POSIX): the pinned config dir and
-the redirected HOME hold transcripts, history, and credentials. The
-launcher creates either one that is missing with mode 0700, and every
-maintenance operation that publishes managed files tightens both to
-0700 when they are group- or world-accessible, saying so. A checkout in
-a shared location (for example `/srv`) therefore never exposes session
-state to other local users. On Windows the inherited ACLs apply.
+Privacy of the session directories: the pinned config dir and the
+redirected HOME hold transcripts, history, and credentials (on Windows,
+Claude Code keeps its login in `<config dir>\.credentials.json`).
+
+- POSIX: the launcher creates either one that is missing with mode
+  0700, and every maintenance operation that publishes managed files
+  tightens both to 0700 when they are group- or world-accessible,
+  saying so. A checkout in a shared location (for example `/srv`)
+  therefore never exposes session state to other local users.
+- Windows: a checkout outside the user profile (for example under
+  `C:\src`) inherits the drive root's grants, which on default Windows
+  give every authenticated user Modify. The launcher gives either
+  directory it creates a protected DACL granting full control only to
+  the operator, the directory's owner when that is an account, SYSTEM,
+  and Administrators, and every maintenance operation that publishes
+  managed files does the same to an existing one whose DACL allows
+  anyone else, saying so. CREATOR OWNER and OWNER RIGHTS entries count
+  as private. The ACL is set through `SetNamedSecurityInfoW`, so it
+  does not depend on Python 3.13's mode-to-ACL behavior, and Windows
+  propagates it to existing children. Failures (FAT, exFAT, some network
+  shares) are reported and never stop an operation.
+- Windows: install, upgrade, repair, and the toggles also warn when the
+  checkout root grants write access to Users, Authenticated Users, or
+  Everyone. Such a checkout is already open to every local account (its
+  sources, `.git\hooks`, and the generated launchers), so private
+  session directories protect only the session state's confidentiality;
+  the warning calls the checkout unsafe for multi-account use.
 
 ## Validation
 

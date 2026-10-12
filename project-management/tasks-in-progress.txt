@@ -9,8 +9,14 @@ status notes, blockers, and ISO 8601 timestamps.
 Windows support and native Claude Code runtime
 (`feature/windows-platform-support`). Started 2026-10-11T21:56:00-07:00.
 Done: research, design, operator decisions, self-update hotfix (ea55dab),
-specifications. Next: implementation (signing/download/platform modules,
-A/B slots, operations rewrite and migration, Python launcher core and
-shims, prerequisites family and install.cmd, Windows-safe tests), then
-Windows Sandbox verification. Blocker ahead: operator must enable Windows
-Sandbox (see ai-human-requests.txt). Owner: AI (Claude) with operator.
+specifications (2037f53), native foundations and Windows entry points
+(310c991), the native runtime with A/B slots and the Python launcher
+(4d5e4e4), adversarial-review hardening (25e0afe), and the Windows
+entry-point, launcher, and isolation review with its fixes (local commit
+after 2026-10-12T08:47:00-07:00). Next: the live end-to-end download
+test against downloads.claude.ai (awaiting operator approval; a
+local-mirror fallback is available), then Windows Sandbox verification
+of Claude Code's own update, housekeeping, and settings-precedence
+behavior. Blocker ahead: operator must enable Windows Sandbox (see
+ai-human-requests.txt). Merge and push need operator approval. Owner:
+AI (Claude) with operator.

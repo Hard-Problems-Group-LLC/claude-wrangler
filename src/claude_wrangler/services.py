@@ -378,17 +378,52 @@ def probe_settings_rejections(
 
 
 GIT_LS_FILES_TIMEOUT_SECONDS = 30.0
+# Environment switches that change how git reads every pathspec.
+GIT_PATHSPEC_VARIABLES = (
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
 
 
-def list_tracked_files(project_root: Path, paths: Sequence[Path]) -> List[str]:
+def filesystem_ignores_case(project_root: Path) -> bool:
+    """Return True when the project's filesystem treats names case-insensitively.
+
+    Windows and macOS default to case-insensitive volumes. Elsewhere the
+    project root's `.git` entry is looked up under a case-swapped spelling;
+    finding the same entry means names differing only in case collide.
+    """
+
+    if os.name == "nt" or sys.platform == "darwin":
+        return True
+    marker = Path(project_root) / ".git"
+    swapped = Path(project_root) / ".GIT"
+    try:
+        return os.path.samefile(str(marker), str(swapped))
+    except OSError:
+        return False
+
+
+def list_tracked_files(
+    project_root: Path,
+    paths: Sequence[Path],
+    *,
+    ignore_case: Optional[bool] = None,
+) -> List[str]:
     """Return the files git tracks under ``paths`` (relative to the project).
 
-    Runs `git --literal-pathspecs -C <project root> ls-files -z -- <paths>`
-    with `core.fsmonitor` switched off, so a `.git/config` that came with an
-    untrusted checkout cannot make the query run a command. When git is
-    missing, the project is not inside a work tree, or git fails, nothing
-    can be tracked there and the result is empty; a timeout is reported and
-    treated the same way.
+    Runs `git -C <project root> ls-files -z -- <pathspecs>` with
+    `core.fsmonitor` switched off, so a `.git/config` that came with an
+    untrusted checkout cannot make the query run a command. Each pathspec
+    carries `literal` magic, so wildcards in managed paths match only
+    themselves. On a case-insensitive filesystem (``ignore_case``, detected
+    by `filesystem_ignores_case` when None) the pathspecs also carry
+    `icase`: there a tracked `.LOCAL/claude/...` is the same file as the
+    managed `.local/claude/...`, while git compares pathspecs case-sensitively
+    even with `core.ignorecase`. When git is missing, the project is not
+    inside a work tree, or git fails, nothing can be tracked there and the
+    result is empty; a timeout is reported and treated the same way.
     """
 
     relative: List[str] = []
@@ -402,14 +437,28 @@ def list_tracked_files(project_root: Path, paths: Sequence[Path]) -> List[str]:
         relative.append(spelled.replace(os.sep, "/"))
     if not relative:
         return []
-    command = ["git", "-c", "core.fsmonitor=false", "--literal-pathspecs"]
-    command += ["-C", str(project_root), "ls-files", "-z", "--"] + relative
+    if ignore_case is None:
+        ignore_case = filesystem_ignores_case(project_root)
+    magic = ":(literal,icase)" if ignore_case else ":(literal)"
+    # Per-pathspec magic instead of --literal-pathspecs, which would read the
+    # magic prefix itself as part of a literal path. The global pathspec
+    # variables are dropped for the same reason: GIT_LITERAL_PATHSPECS would
+    # make every pathspec match nothing and silently pass the refusal.
+    command = ["git", "-c", "core.fsmonitor=false"]
+    command += ["-C", str(project_root), "ls-files", "-z", "--"]
+    command += [magic + item for item in relative]
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in GIT_PATHSPEC_VARIABLES
+    }
     try:
         completed = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             timeout=GIT_LS_FILES_TIMEOUT_SECONDS,
             check=False,
         )

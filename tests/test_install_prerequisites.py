@@ -67,6 +67,8 @@ def fake_which(available: Dict[str, str]):
     """Return a `which` that only knows the given program paths."""
 
     def which(name: str) -> Optional[str]:
+        """Return the configured path for ``name``, or None."""
+
         return available.get(name)
 
     return which
@@ -346,6 +348,8 @@ def test_macos_command_line_tools_stub_is_not_git(prereq, capsys):
     probes: List[List[str]] = []
 
     def succeeds(command):
+        """Record the probe and fail it, as xcode-select -p does without the tools."""
+
         probes.append(list(command))
         return False
 
@@ -559,6 +563,8 @@ def test_consent_interactive_asks_once(prereq, answer, expected):
     prompts: List[str] = []
 
     def ask(prompt: str) -> str:
+        """Record the prompt and give the parametrized answer."""
+
         prompts.append(prompt)
         return answer
 
@@ -573,6 +579,8 @@ def test_consent_interactive_asks_once(prereq, answer, expected):
 
 def test_consent_end_of_input_refuses(prereq):
     def end_of_input(prompt: str) -> str:
+        """Behave like input() at the end of standard input."""
+
         raise EOFError
 
     assert not prereq.confirm_installation(
@@ -659,6 +667,8 @@ def test_main_windows_interactive_consent_runs_without_silent(prereq):
     prompts: List[str] = []
 
     def ask(prompt: str) -> str:
+        """Record the prompt and consent."""
+
         prompts.append(prompt)
         return "y"
 
@@ -678,6 +688,8 @@ def test_main_no_git_bash_skips_the_bash_requirement(prereq):
 
 def test_main_dry_run_prints_without_prompting_or_running(prereq, capsys, monkeypatch):
     def no_subprocess(*args, **kwargs):
+        """Fail the test if the dry run starts any command."""
+
         raise AssertionError("dry run must not run commands")
 
     monkeypatch.setattr(prereq.subprocess, "run", no_subprocess)
@@ -690,6 +702,99 @@ def test_main_dry_run_prints_without_prompting_or_running(prereq, capsys, monkey
     assert "-> " in output
     assert "Git.Git" in output
     assert "--silent" not in output
+
+
+@pytest.mark.parametrize(
+    "argv", [["--dry-run"], ["--dry-run", "--yes"], ["--dry-run", "--no-git-bash"]]
+)
+def test_main_dry_run_never_reports_a_missing_prerequisite_as_ready(
+    prereq, capsys, argv
+):
+    facts = windows_facts(prereq, git=False, bash=False)
+
+    assert prereq.main(argv, facts=facts, ask=refuse_ask) == 0
+
+    output = capsys.readouterr().out
+    assert "Prerequisites ready." not in output
+    assert "would be installed" in output
+    assert "nothing was changed" in output
+    assert "Git" in output.split("would be installed")[1]
+
+
+def test_main_after_install_says_when_new_tools_are_not_visible_yet(prereq, capsys):
+    # winget changes only the registry PATH, so this process still cannot
+    # find the new git.
+    runner = RecordingRunner()
+    facts = windows_facts(prereq, git=False, bash=False)
+
+    assert prereq.main(["--yes"], facts=facts, runner=runner, ask=refuse_ask) == 0
+
+    output = capsys.readouterr().out
+    assert len(runner.commands) == 1
+    assert "Prerequisites ready." not in output
+    assert "Open a new terminal" in output
+
+
+def test_main_after_install_reports_ready_once_the_tools_are_found(prereq, capsys):
+    runner = RecordingRunner()
+    facts = make_facts(
+        prereq,
+        programs={"apt-get": "/usr/bin/apt-get", "sudo": "/usr/bin/sudo"},
+    )
+    found: Dict[str, str] = {"apt-get": "/usr/bin/apt-get", "sudo": "/usr/bin/sudo"}
+
+    def which(name: str) -> Optional[str]:
+        """Find git once the package manager has run."""
+
+        if runner.commands:
+            found["git"] = "/usr/bin/git"
+        return found.get(name)
+
+    facts.which = which
+
+    result = prereq.main(
+        ["--system-packages", "--yes"], facts=facts, runner=runner, ask=refuse_ask
+    )
+
+    assert result == 0
+    assert "Prerequisites ready." in capsys.readouterr().out
+
+
+def test_main_after_installing_venv_support_reports_ready(prereq, monkeypatch, capsys):
+    # The facts' venv flag is a startup snapshot; once python3-venv is
+    # installed and --dev's environment setup succeeds, the host is ready.
+    dev_setups: List[object] = []
+
+    def dev_setup(args, runner):
+        """Record the --dev environment setup instead of creating a venv."""
+
+        dev_setups.append(args)
+
+    monkeypatch.setattr(prereq, "run_dev_setup", dev_setup)
+    runner = RecordingRunner()
+    facts = make_facts(
+        prereq,
+        venv_available=False,
+        programs={
+            "apt-get": "/usr/bin/apt-get",
+            "sudo": "/usr/bin/sudo",
+            "git": "/usr/bin/git",
+        },
+    )
+
+    result = prereq.main(
+        ["--dev", "--system-packages", "--yes"],
+        facts=facts,
+        runner=runner,
+        ask=refuse_ask,
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert any("python3-venv" in command for command in runner.commands)
+    assert len(dev_setups) == 1
+    assert "Prerequisites ready." in output
+    assert "cannot see" not in output
 
 
 def test_main_reports_failed_install(prereq, capsys):
@@ -779,6 +884,8 @@ def test_main_dev_runs_git_hook_installer_when_present(prereq, tmp_path, monkeyp
 
 def test_main_dev_waits_for_a_supported_python(prereq, monkeypatch, capsys):
     def no_dev_setup(*args, **kwargs):
+        """Fail the test if --dev starts before Python 3.9+ exists."""
+
         raise AssertionError("--dev must wait for Python 3.9+")
 
     monkeypatch.setattr(prereq, "run_dev_setup", no_dev_setup)
@@ -792,6 +899,8 @@ def test_main_dev_waits_for_a_supported_python(prereq, monkeypatch, capsys):
 
 def test_select_tool_python_falls_back_to_running_interpreter(prereq, monkeypatch):
     def no_runtime(*args, **kwargs):
+        """Fail like the profile helper when no runtime matches the policy."""
+
         raise RuntimeError("No Python runtime matched policy")
 
     monkeypatch.setattr(prereq, "resolve_runtime_policy_executable", no_runtime)
@@ -819,6 +928,8 @@ def test_select_tool_python_refuses_a_running_interpreter_below_the_dev_floor(
     # The [dev] extras pin pytest 9 and black 26, which need Python 3.12; a
     # 3.9 fallback would only fail later inside pip's resolver.
     def no_runtime(*args, **kwargs):
+        """Fail like the profile helper when no runtime matches the policy."""
+
         raise RuntimeError("No Python runtime matched policy")
 
     monkeypatch.setattr(
@@ -857,6 +968,8 @@ def test_main_dev_refuses_before_creating_a_venv_on_a_too_old_interpreter(
 
 def test_command_runner_dry_run_only_prints(prereq, capsys, monkeypatch):
     def no_subprocess(*args, **kwargs):
+        """Fail the test if the dry run starts any command."""
+
         raise AssertionError("dry run must not run commands")
 
     monkeypatch.setattr(prereq.subprocess, "run", no_subprocess)

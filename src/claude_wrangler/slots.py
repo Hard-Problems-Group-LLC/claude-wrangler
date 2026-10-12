@@ -27,9 +27,11 @@ It is replaced only through a same-directory temporary file and
 
 The verification stamp records each binary's size, modification time, and
 (on POSIX) inode at the moment maintenance last verified the slot in full.
-A repository cannot supply a matching stamp: a clone or pull writes new
-files with a fresh modification time and inode, so the launcher's cheap
-check refuses a binary that changed after verification.
+A git clone or pull cannot carry a matching stamp: it writes new files with
+a fresh modification time and inode, so the launcher's cheap check refuses
+a binary it planted or replaced after verification. The Windows stamp has
+no inode, so an archive or copy tool that preserves modification times
+could restore a same-size binary together with a matching stamp.
 
 This module is standard-library-only and Python 3.9 compatible.
 """
@@ -194,6 +196,22 @@ class SlotInUseError(SlotError):
 
 class MaintenanceLockError(ClaudeWranglerError):
     """Raised when the maintenance lock is held elsewhere or unsafe."""
+
+
+class MaintenanceLockUnsupportedError(MaintenanceLockError):
+    """Raised when the filesystem cannot take file locks at all.
+
+    No other maintainer can hold such a lock either. ``created_lock_file``
+    says whether this attempt created the lock file (it did not exist when
+    the attempt started), so a caller that also created the runtime root
+    can remove what it left behind.
+    """
+
+    def __init__(self, message: str, *, created_lock_file: bool) -> None:
+        """Keep the message and whether this attempt created the lock file."""
+
+        super().__init__(message)
+        self.created_lock_file = created_lock_file
 
 
 class ProcessQueryError(ClaudeWranglerError):
@@ -734,8 +752,10 @@ def binary_identity(status: os.stat_result) -> Dict[str, int]:
 
     Size and modification time in nanoseconds everywhere, plus the inode on
     POSIX. Windows inode values differ between Python versions on ReFS, so
-    they are left out there; a checkout or pull still writes a new
-    modification time. Mirrored by ``launcher_core._binary_identity``.
+    they are left out there; a git checkout or pull still writes a new
+    modification time, but an archive that preserves modification times
+    could reproduce a Windows identity. Mirrored by
+    ``launcher_core._binary_identity``.
     """
 
     identity = {"size": int(status.st_size), "mtime_ns": int(status.st_mtime_ns)}
@@ -1629,7 +1649,7 @@ class MaintenanceLock:
             if exc.errno not in _LOCK_CONTENTION_ERRNOS:
                 # ENOLCK, EINVAL, ENOTSUP and similar mean the filesystem
                 # cannot lock at all; waiting would never help.
-                raise MaintenanceLockError(
+                raise MaintenanceLockUnsupportedError(
                     "Cannot lock {} ({}): this filesystem does not support the "
                     "file locks claude-wrangler needs. Keep the checkout on a "
                     "local filesystem or a lock-capable mount.".format(
@@ -1638,7 +1658,8 @@ class MaintenanceLock:
                             exc.errno,
                             exc.strerror or errno.errorcode.get(exc.errno, ""),
                         ).strip(),
-                    )
+                    ),
+                    created_lock_file=status is None,
                 ) from exc
             raise MaintenanceLockError(
                 "Another claude-wrangler maintenance operation is already running "

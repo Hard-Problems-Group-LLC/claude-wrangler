@@ -467,7 +467,12 @@ def compile_fake_claude(destination: Path, pad_to: int = 0) -> Path:
 
 
 def posix_fake_claude() -> bytes:
-    """Return a POSIX shell fake Claude binary using this interpreter."""
+    """Return a POSIX shell fake Claude binary using this interpreter.
+
+    It mirrors FakeClaude.cs: `--version`, `--help`, the `--settings` probe,
+    and otherwise an optional start marker and sleep, then a JSON report of
+    its arguments, environment, and own path ("image").
+    """
 
     script = """#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -486,12 +491,17 @@ if [ "$1" = "--settings" ] && [ "$#" -ge 4 ] && [ "$claude_last" = "--help" ]; t
   echo "Usage: claude $3 [options]"
   exit 0
 fi
-"%s" -c 'import json, os, sys
-report = json.dumps({"argv": sys.argv[1:], "env": dict(os.environ)})
+if [ -n "${FAKE_CLAUDE_STARTED:-}" ]; then
+  : > "$FAKE_CLAUDE_STARTED"
+fi
+FAKE_CLAUDE_SELF=$0 "%s" -c 'import json, os, sys, time
+image = os.environ.pop("FAKE_CLAUDE_SELF")
+time.sleep(int(os.environ.get("FAKE_CLAUDE_SLEEP_MS") or 0) / 1000.0)
+data = {"argv": sys.argv[1:], "env": dict(os.environ), "image": image}
 path = os.environ.get("FAKE_CLAUDE_REPORT")
 if path:
-    open(path, "w", encoding="utf-8").write(report)
-print(json.dumps({"argv": sys.argv[1:], "env": dict(os.environ)}, ensure_ascii=True))' "$@"
+    open(path, "w", encoding="utf-8").write(json.dumps(data))
+print(json.dumps(data, ensure_ascii=True))' "$@"
 exit "${FAKE_CLAUDE_EXIT:-0}"
 """ % sys.executable
     return script.encode("utf-8")

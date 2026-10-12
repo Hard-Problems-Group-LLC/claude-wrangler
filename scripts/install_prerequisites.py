@@ -12,9 +12,10 @@ name. It keeps that file's structure and function names (`detect_os_info`,
   missing ones are installed. Node.js is not a prerequisite.
 - Package managers: apt-get, dnf/yum, brew, and on Windows winget, with
   `--scope user` for packages that support a per-user install.
-- Consent: `--dry-run` only prints commands; `--yes` runs them without
-  prompting; otherwise an interactive run asks once and a non-interactive
-  run refuses.
+- Consent: `--dry-run` only prints commands (and never reports the host
+  ready while something is missing); `--yes` runs them without prompting;
+  otherwise an interactive run asks once and a non-interactive run
+  refuses.
 - Privilege: sudo is used only by an operator who passed
   `--system-packages` (root needs no sudo). Windows is never elevated; a
   command that needs elevation is printed for the operator to run.
@@ -66,7 +67,9 @@ MINIMUM_PYTHON = (3, 9)
 # The development extras (pytest 9, black 26) need the steady-state floor.
 DEV_MINIMUM_PYTHON = (3, 12)
 # macOS ships these as xcode-select stubs that exist but only open the
-# Command Line Tools installer until the tools are installed.
+# Command Line Tools installer until the tools are installed. Only git is
+# looked up through `which`, so only it is gated on `xcode-select -p`;
+# Python is judged by running it (the wrappers' probe rejects the stub).
 MACOS_CLT_STUBS = frozenset({"/usr/bin/git", "/usr/bin/python3"})
 MACOS_CLT_INSTALL_HINT = (
     "run `xcode-select --install` to install the Command Line Tools"
@@ -942,7 +945,14 @@ def main(
     runner: Optional[CommandRunner] = None,
     ask: Callable[[str], str] = input,
 ) -> int:
-    """Install whatever is missing; return 0 when nothing remains missing."""
+    """Install whatever is missing; return 0 when nothing remains missing.
+
+    "Prerequisites ready." is printed only when nothing is missing. A dry
+    run that would install something says so, changes nothing, and returns
+    0 for the dry run itself. After a real install the prerequisites are
+    detected again: winget changes only the registry PATH, so a tool this
+    process still cannot see gets an "open a new terminal" note instead.
+    """
 
     args = parse_args(argv)
     if runner is None or (args.dry_run and not getattr(runner, "dry_run", False)):
@@ -966,6 +976,8 @@ def main(
         print(line)
 
     still_missing: List[str] = []
+    # Prerequisites this run installed (or, in a dry run, would install).
+    planned: List[str] = []
     if missing:
         try:
             validate_platform(os_info)
@@ -1015,13 +1027,13 @@ def main(
             except (subprocess.CalledProcessError, OSError) as error:
                 print(f"install_prerequisites: FAIL: {error}", file=sys.stderr)
                 return 1
-            if is_windows(os_info) and not dry_run:
-                print("Open a new terminal so PATH picks up the newly installed tools.")
         if plan.operator_commands:
             print(plan.operator_reason)
             for command in plan.operator_commands:
                 print("  {}".format(format_command(command)))
         still_missing = plan.operator_prerequisites + plan.unresolved
+        if plan.commands:
+            planned = [key for key in missing if key not in still_missing]
         report_unresolved(plan.unresolved, os_info)
 
     if args.dev:
@@ -1040,6 +1052,39 @@ def main(
 
     if still_missing:
         return 1
+    if planned and dry_run:
+        # Nothing ran, so the host is not ready; exit 0 only means the dry
+        # run itself succeeded.
+        print(
+            "Dry run: {} prerequisite(s) would be installed ({}); nothing was "
+            "changed.".format(
+                len(planned), ", ".join(PREREQUISITE_LABELS[key] for key in planned)
+            )
+        )
+        return 0
+    if planned:
+        # The package manager succeeded, but this process keeps the PATH it
+        # started with (winget updates the registry PATH only), so check
+        # again before calling the host ready. venv support is skipped: the
+        # facts hold a startup snapshot of it, and --dev's environment
+        # setup, which needs it and has just succeeded, already proved it.
+        remaining = [
+            key
+            for key in detect_missing_prerequisites(
+                facts, include_git_bash=include_git_bash, dev=args.dev
+            )
+            if key != PYTHON_VENV
+        ]
+        if remaining:
+            print(
+                "Installed {}, but this process cannot see {} yet. Open a new "
+                "terminal so PATH picks up the new tools, then rerun to "
+                "confirm.".format(
+                    ", ".join(PREREQUISITE_LABELS[key] for key in planned),
+                    ", ".join(PREREQUISITE_LABELS[key] for key in remaining),
+                )
+            )
+            return 0
     print("Prerequisites ready.")
     return 0
 

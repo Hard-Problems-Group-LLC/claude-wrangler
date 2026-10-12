@@ -8,14 +8,18 @@
 //              prints "Usage: claude <sub> [options]", or fails with an
 //              option error when <sub> is listed in the comma-separated
 //              FAKE_CLAUDE_REJECT_SETTINGS
-//   otherwise  prints one ASCII-only JSON object {"argv": [...], "env": {...}}
-//              (and writes the same UTF-8 JSON to FAKE_CLAUDE_REPORT when set),
-//              then exits with FAKE_CLAUDE_EXIT (default 0).
+//   otherwise  writes an empty FAKE_CLAUDE_STARTED file when that is set,
+//              sleeps FAKE_CLAUDE_SLEEP_MS milliseconds when set, prints one
+//              ASCII-only JSON object {"argv": [...], "env": {...},
+//              "image": "<this executable's path>"} (and writes the same
+//              UTF-8 JSON to FAKE_CLAUDE_REPORT when set), then exits with
+//              FAKE_CLAUDE_EXIT (default 0).
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 internal static class FakeClaude
 {
@@ -54,7 +58,9 @@ internal static class FakeClaude
             builder.Append(Escape(names[i], asciiOnly)).Append(": ");
             builder.Append(Escape((string)environment[names[i]] ?? "", asciiOnly));
         }
-        return builder.Append("}}").ToString();
+        builder.Append("}, \"image\": ");
+        builder.Append(Escape(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName, asciiOnly));
+        return builder.Append("}").ToString();
     }
 
     private static int Main(string[] args)
@@ -89,6 +95,17 @@ internal static class FakeClaude
             }
             Console.Out.Write("Usage: claude " + args[2] + " [options]\n");
             return 0;
+        }
+        string startedPath = Environment.GetEnvironmentVariable("FAKE_CLAUDE_STARTED");
+        if (!string.IsNullOrEmpty(startedPath))
+        {
+            File.WriteAllText(startedPath, "", new UTF8Encoding(false));
+        }
+        string sleepText = Environment.GetEnvironmentVariable("FAKE_CLAUDE_SLEEP_MS");
+        int sleepMs;
+        if (int.TryParse(sleepText, out sleepMs) && sleepMs > 0)
+        {
+            Thread.Sleep(sleepMs);
         }
         string reportPath = Environment.GetEnvironmentVariable("FAKE_CLAUDE_REPORT");
         if (!string.IsNullOrEmpty(reportPath))

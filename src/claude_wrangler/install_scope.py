@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 from .constants import DEFAULT_HOME_DIR
 
@@ -31,6 +31,11 @@ ISOLATED_HOME_RELATIVES = (
     CODEX_HOME_DIRNAME,
     LEGACY_CODEX_HOME_DIRNAME,
 )
+# Set by the generated claude-local and codex-local launchers in the
+# sessions they start (the same markers the Windows stage-1 gate reads).
+MANAGED_BY_VARIABLES = ("CLAUDE_LOCAL_MANAGED_BY", "CODEX_LOCAL_MANAGED_BY")
+# Marks "probe the account's own home" for the injectable account_home.
+_PROBE_ACCOUNT_HOME = object()
 
 
 def _environment(environ: Optional[Mapping[str, str]]) -> Mapping[str, str]:
@@ -188,18 +193,128 @@ def is_repo_local_isolated_home(user_home: Path, repo_root: Path) -> bool:
     )
 
 
+def has_isolated_home_tail(path: Path, os_name: Optional[str] = None) -> bool:
+    """Return True when a path ends like any repository's isolated home.
+
+    Inside project A's session, an installer started from checkout B sees
+    A's redirected home, which B's own layout check cannot recognize. The
+    path tails `.local/claude/HOME`, `.local/codex-home`, and `.codex-home`
+    are compared case-insensitively on Windows.
+    """
+
+    windows = _is_windows(os_name)
+    parts = tuple(part.lower() if windows else part for part in Path(path).parts)
+    for relative in ISOLATED_HOME_RELATIVES:
+        tail = tuple(part.lower() if windows else part for part in relative.split("/"))
+        if len(parts) > len(tail) and parts[-len(tail) :] == tail:
+            return True
+    return False
+
+
+def account_home_directory(os_name: Optional[str] = None) -> Optional[Path]:
+    """Return the home recorded for this account, ignoring the environment.
+
+    On Windows that is the logon token's profile (`GetUserProfileDirectoryW`,
+    which still names the real profile when a launcher redirected
+    `USERPROFILE`); on POSIX the password database entry. None when it
+    cannot be read.
+    """
+
+    if _is_windows(os_name):
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            userenv = ctypes.WinDLL("userenv", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            advapi32.OpenProcessToken.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.HANDLE),
+            ]
+            userenv.GetUserProfileDirectoryW.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+            ):
+                return None
+            try:
+                size = wintypes.DWORD(0)
+                # The first call only reports the buffer size it needs.
+                userenv.GetUserProfileDirectoryW(token, None, ctypes.byref(size))
+                if size.value == 0:
+                    return None
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if not userenv.GetUserProfileDirectoryW(
+                    token, buffer, ctypes.byref(size)
+                ):
+                    return None
+                return Path(buffer.value)
+            finally:
+                kernel32.CloseHandle(token)
+        except (AttributeError, OSError, ValueError):
+            return None
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, AttributeError, OSError):
+        return None
+
+
 def isolated_home_sources(
     repo_root: Path,
     environ: Optional[Mapping[str, str]] = None,
     os_name: Optional[str] = None,
+    *,
+    account_home: Any = _PROBE_ACCOUNT_HOME,
 ) -> List[Tuple[str, Path]]:
-    """Return each advertised home that is a repo-local isolated home."""
+    """Return each advertised home that is an isolated or launcher home.
 
-    return [
-        (source, path)
-        for source, path in home_candidates(environ, os_name)
-        if is_repo_local_isolated_home(path, repo_root)
-    ]
+    A home counts when it is one of this repository's isolated homes, when
+    its path ends like any repository's isolated home, or, inside a
+    claude-local or codex-local session (`MANAGED_BY_VARIABLES`), when it
+    differs from the account's own home (a custom launcher layout). Ring-0
+    sessions keep the real home and pass. On Windows `HOMEDRIVE/HOMEPATH`
+    takes part in that last check only when it is the effective home,
+    because domain accounts often point it at a network drive.
+    `account_home` defaults to `account_home_directory`; tests pass a path
+    or None.
+    """
+
+    env = _environment(environ)
+    marker = any(env.get(name) for name in MANAGED_BY_VARIABLES)
+    expected: Optional[Path] = None
+    if marker:
+        raw = (
+            account_home_directory(os_name)
+            if account_home is _PROBE_ACCOUNT_HOME
+            else account_home
+        )
+        expected = _resolve_lenient(Path(raw)) if raw is not None else None
+    hits: List[Tuple[str, Path]] = []
+    for index, (source, path) in enumerate(home_candidates(environ, os_name)):
+        if is_repo_local_isolated_home(path, repo_root) or has_isolated_home_tail(
+            path, os_name
+        ):
+            hits.append((source, path))
+            continue
+        if expected is None:
+            continue
+        if source == "HOMEDRIVE/HOMEPATH" and index != 0:
+            continue
+        if not _same_location(path, expected):
+            hits.append((source, path))
+    return hits
 
 
 def describe_user_home_source(
@@ -211,7 +326,9 @@ def describe_user_home_source(
 
     if explicit_home is not None:
         return "explicit --user-home target"
-    if is_repo_local_isolated_home(user_home, repo_root):
+    if is_repo_local_isolated_home(user_home, repo_root) or has_isolated_home_tail(
+        user_home
+    ):
         return "current repo-local isolated home"
     return "current process HOME"
 
@@ -223,27 +340,29 @@ def resolve_user_home(
     allow_isolated_home: bool = False,
     environ: Optional[Mapping[str, str]] = None,
     os_name: Optional[str] = None,
+    account_home: Any = _PROBE_ACCOUNT_HOME,
 ) -> Path:
     """Return the intended home for user-scoped installer side effects.
 
-    `environ` and `os_name` default to the live process and exist so the
-    Windows and POSIX rules can be tested on any host.
+    `environ`, `os_name`, and `account_home` default to the live process
+    and exist so the Windows and POSIX rules can be tested on any host.
     """
 
     if explicit_home is not None:
         return _resolve_lenient(explicit_home)
 
-    isolated = isolated_home_sources(repo_root, environ, os_name)
+    isolated = isolated_home_sources(
+        repo_root, environ, os_name, account_home=account_home
+    )
     if isolated:
         source, isolated_home = isolated[0]
         if not allow_isolated_home:
             raise RuntimeError(
-                "Current {} resolves to a repo-local isolated home ({}). Rerun "
-                "from a normal terminal, pass --user-home PATH to target a "
-                "different user scope explicitly, or pass --allow-isolated-home "
-                "to install into the isolated AI home on purpose.".format(
-                    source, isolated_home
-                )
+                "Current {} resolves to a repo-local isolated home or a "
+                "launcher-redirected home ({}). Rerun from a normal terminal, "
+                "pass --user-home PATH to target a different user scope "
+                "explicitly, or pass --allow-isolated-home to install into the "
+                "isolated AI home on purpose.".format(source, isolated_home)
             )
         # The operator opted into the isolated home. When only some home
         # variables were redirected, never fall through to the real profile
@@ -257,12 +376,15 @@ __all__ = [
     "CODEX_HOME_DIRNAME",
     "ISOLATED_HOME_RELATIVES",
     "LEGACY_CODEX_HOME_DIRNAME",
+    "MANAGED_BY_VARIABLES",
+    "account_home_directory",
     "current_home",
     "default_pyenv_root",
     "default_tool_venv",
     "default_user_bin_dir",
     "default_user_share_dir",
     "describe_user_home_source",
+    "has_isolated_home_tail",
     "home_candidates",
     "is_repo_local_isolated_home",
     "isolated_home_sources",

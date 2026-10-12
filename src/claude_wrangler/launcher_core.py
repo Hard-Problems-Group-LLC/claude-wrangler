@@ -18,7 +18,11 @@ fallback (``ab_runtime_slots.md`` requirements 8 and 15), notify-only
 update checks
 (``native_runtime_distribution_and_verification.md`` requirement 12), the
 reasonable-permissions default, the warn-only Node.js parity check, the
-native-Windows sandbox warning, and process semantics.
+native-Windows sandbox warning, the nested-``claude`` PATH order, the
+handling of another Claude Code session's variables and of inherited
+credentials, private session directories (mode 0700, or a private DACL on
+Windows), and process semantics (including the Windows kill-on-close
+job).
 
 Several constants and the host platform detector intentionally duplicate
 package code (``slots.py``, ``platforms.py``, ``distribution.py``). Keep
@@ -92,6 +96,10 @@ REQUIRED_SUPPRESSION_ENV = (
 )
 NONESSENTIAL_TRAFFIC_VAR = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 INTERCEPTED_SUBCOMMANDS = ("update", "upgrade", "install")
+# Subcommands whose operands can be one of those words (`plugin install
+# <name>`). They end the interception scan when the completion record lists
+# no subcommands: the npm-era layout, or a record without the probe.
+FALLBACK_SCAN_STOPS = ("mcp", "plugin", "plugins", "config")
 PROJECT_SETTINGS_FILES = ("settings.json", "settings.local.json")
 
 # How CLAUDE_CONFIG_DIR is spelled. "forward-slash" reproduces, on Windows,
@@ -119,6 +127,54 @@ NOTICES_SHOWN_VAR = "CLAUDE_LOCAL_NOTICES_SHOWN"
 # environment so commands Claude Code runs keep the normal MSYS behavior.
 MSYS_ARGS_VAR = "CLAUDE_LOCAL_MSYS_ARGS"
 MSYS_ARG_CONVERSION_VARS = ("MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL")
+# Helper variables the generated cmd shims set for themselves inside their
+# setlocal scope; Claude Code's environment never needs them.
+SHIM_INTERNAL_VARS = (
+    "CLAUDE_LOCAL_CORE",
+    "CLAUDE_LOCAL_PY",
+    "CLAUDE_LOCAL_PYARG",
+    "CLAUDE_LOCAL_PROBE",
+    "CLAUDE_LOCAL_SELF",
+    "CLAUDE_LOCAL_SHIM_SELF",
+)
+# What a running Claude Code session exports to the processes it starts:
+# its identity, its IPC endpoint and token, and its secure-storage key. A
+# project session started from another Claude Code session (another
+# project's, or the operator's global one) must not inherit them, or it
+# behaves as that session's child; a nested launch of the same project
+# keeps them, as Claude Code intends for its own children.
+PARENT_SESSION_VARS = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_PID",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+)
+PARENT_SESSION_PREFIXES = ("CLAUDE_CODE_MESSAGING_",)
+# Set by IDE terminals for Claude Code's IDE integration (the SSE port), or
+# by Agent SDK and IDE hosts for the CLI they start as well as by a Claude
+# Code session for its children (the entry point and effort). They are kept
+# unless CLAUDECODE shows the launch came from another Claude Code session,
+# whose IDE connection and settings are not this project's.
+PARENT_SESSION_GATED_VARS = (
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_EFFORT",
+)
+# Credentials and provider selection that Claude Code reads from the
+# environment ahead of the project's own login in the pinned config dir.
+# The launcher names them (never their values) once per session.
+CREDENTIAL_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
 
 SHARED_HOME_FLAG = "--shared-home"
 ISOLATED_HOME_FLAG = "--isolated-home"
@@ -144,9 +200,74 @@ WINDOWS_SANDBOX_WARNING = (
     "note: Claude Code has no sandbox on native Windows, so the commands it "
     "runs are unsandboxed; this project's isolation covers Claude's state "
     "and redirected-home tools, not per-user Windows stores (Credential "
-    "Manager, the registry, HKCU\\SOFTWARE\\Policies). Use WSL2 or a "
-    "separate Windows account for work that needs ring 3."
+    "Manager, the registry, HKCU\\SOFTWARE\\Policies, OpenSSH keys and "
+    "agent). Use WSL2 or a separate Windows account for work that needs "
+    "ring 3."
 )
+# Shown on native Windows when nested `claude` calls cannot reach the slot's
+# claude.exe directly (see nested_claude_slot_dir) and fall back to the cmd
+# PATH shim.
+NESTED_SHIM_FALLBACK_WARNING = (
+    "warning: nested `claude` calls in this session go through "
+    "shim\\claude.cmd because {reason}. cmd.exe re-parses their arguments, "
+    "and callers that look only for .exe files can reach another claude.exe "
+    "on PATH."
+)
+NESTED_SHIM_REASON_LEGACY = "the npm-era layout is still in place"
+NESTED_SHIM_REASON_SLOT = (
+    "the active slot's directory holds more than claude.exe; run "
+    "`{cmd} --repair-install .`"
+)
+CREDENTIAL_ENV_NOTE = (
+    "note: {names} {verb} set in the environment that started this launcher. "
+    "Claude Code uses {pronoun} ahead of this project's own login in {config}, "
+    "so every project started from this environment shares that account or "
+    "endpoint. Unset {pronoun} unless {subject} {belong} to this project."
+)
+
+# Windows security identifiers and flags for the private session-directory
+# DACL (owner, SYSTEM, Administrators) and the shared-checkout check.
+LOCAL_SYSTEM_SID = "S-1-5-18"
+ADMINISTRATORS_SID = "S-1-5-32-544"
+# CREATOR OWNER and OWNER RIGHTS: entries that grant only the owner.
+OWNER_PRINCIPAL_SIDS = ("S-1-3-0", "S-1-3-4")
+BROAD_GROUP_SIDS = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-32-545": "Users",
+}
+ACCESS_ALLOWED_ACE_TYPE = 0
+ACCESS_DENIED_ACE_TYPE = 1
+# Rights that let a principal change a directory's contents or its ACL:
+# add file or subdirectory, delete child, delete, write DAC, write owner,
+# generic all, and generic write.
+WINDOWS_WRITE_RIGHTS = (
+    0x00000002  # FILE_ADD_FILE / FILE_WRITE_DATA
+    | 0x00000004  # FILE_ADD_SUBDIRECTORY / FILE_APPEND_DATA
+    | 0x00000040  # FILE_DELETE_CHILD
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+)
+_SE_FILE_OBJECT = 1
+_OWNER_SECURITY_INFORMATION = 0x00000001
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SDDL_REVISION_1 = 1
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER_CLASS = 1
+_ACL_SIZE_INFORMATION_CLASS = 2
+
+# Windows job object settings for spawn_and_wait: the child dies when the
+# launcher's job handle closes (for example when the launcher is killed),
+# while processes the child starts itself are never placed in the job.
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CHANNEL_POINTER_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -814,6 +935,46 @@ def forward_slash_spelling(value: str) -> str:
     return text
 
 
+def canonical_windows_root(value: str) -> str:
+    """Return a Windows root spelling with 8.3 names expanded and drive upper.
+
+    Claude Code keys its per-project directory, its ``.claude.json`` project
+    entries, and its secure-storage name on exact path strings, so the same
+    checkout reached as ``c:\\...`` or through an 8.3 short name would fork
+    that state. Only the drive letter's case and short components change:
+    subst drives, mapped drives, and UNC paths keep the caller's spelling,
+    and nothing resolves links.
+    """
+
+    text = long_path_spelling(value)
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        text = text[0].upper() + text[1:]
+    return text
+
+
+def path_entry_problem(entry: str, os_name: str) -> Optional[str]:
+    """Return why ``entry`` cannot be one PATH entry, or None when it can.
+
+    A directory whose name contains the PATH separator (``;`` on Windows,
+    ``:`` elsewhere) splits into two entries, so a nested ``claude`` would
+    fall through to whatever ``claude`` comes later on PATH.
+    """
+
+    separator = ";" if os_name == "nt" else ":"
+    checked = entry
+    if os_name != "nt" and not entry.startswith("/"):
+        # Only tests that drive POSIX behavior on a Windows host see a
+        # drive-letter root here; its drive colon is not a separator.
+        checked = ntpath.splitdrive(entry)[1]
+    if separator in checked:
+        return (
+            "{} contains the PATH separator {!r}, so nested `claude` calls could "
+            "fall through to a global claude. Move the checkout to a path "
+            "without {!r}.".format(entry, separator, separator)
+        )
+    return None
+
+
 def build_repo_paths(repo_root: str, config: LaunchConfig, os_name: str) -> RepoPaths:
     """Compute every managed path for one launch from the chosen root."""
 
@@ -929,6 +1090,66 @@ def prepend_path_entry(env: Dict[str, str], entry: str, os_name: str) -> None:
     env_set(env, "PATH", separator.join([entry] + kept), os_name)
 
 
+def is_nested_launch(
+    environ: Mapping[str, str], paths: RepoPaths, os_name: str
+) -> bool:
+    """Return True when a launcher session of this same project started us.
+
+    The launcher exports ``CLAUDE_LOCAL_NOTICES_SHOWN`` as the pinned config
+    dir; another project's launcher, or a shell outside any session, has a
+    different value or none.
+    """
+
+    return env_lookup(environ, NOTICES_SHOWN_VAR, os_name) == paths.config_dir
+
+
+def parent_session_variables(environ: Mapping[str, str], os_name: str) -> List[str]:
+    """Return the inherited names that belong to another Claude Code session.
+
+    These are the identity, IPC, and secure-storage variables of
+    ``PARENT_SESSION_VARS`` and ``PARENT_SESSION_PREFIXES``, plus
+    ``PARENT_SESSION_GATED_VARS`` when ``CLAUDECODE`` shows the caller is
+    itself a Claude Code session (an IDE terminal or an SDK host sets those
+    for the CLI too). Callers drop them only for a launch that is not a
+    nested launch of the same project.
+    """
+
+    # Every listed name is upper case, so on Windows (where names are case
+    # insensitive) comparing the upper-cased key is enough.
+    exact = set(PARENT_SESSION_VARS)
+    if env_lookup(environ, "CLAUDECODE", os_name):
+        exact.update(PARENT_SESSION_GATED_VARS)
+    names: List[str] = []
+    for key in environ:
+        comparable = key.upper() if os_name == "nt" else key
+        if comparable in exact or comparable.startswith(PARENT_SESSION_PREFIXES):
+            names.append(key)
+    return names
+
+
+def credential_variables(environ: Mapping[str, str], os_name: str) -> List[str]:
+    """Return the credential or provider variables set (non-empty) in environ."""
+
+    return [name for name in CREDENTIAL_ENV_VARS if env_lookup(environ, name, os_name)]
+
+
+def credential_note(names: Sequence[str], config_dir: str) -> str:
+    """Render the once-per-session note naming inherited credential variables.
+
+    Only the variable names appear, never their values.
+    """
+
+    single = len(names) == 1
+    return CREDENTIAL_ENV_NOTE.format(
+        names=", ".join(names),
+        verb="is" if single else "are",
+        pronoun="it" if single else "them",
+        subject="it" if single else "they",
+        belong="belongs" if single else "belong",
+        config=config_dir,
+    )
+
+
 def build_session_environment(
     base: Mapping[str, str],
     *,
@@ -936,12 +1157,23 @@ def build_session_environment(
     config: LaunchConfig,
     shared_home: bool,
     os_name: str,
+    slot_dir: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build the child environment for the selected ring.
 
     At ring 0 the operator's home variables are left exactly as inherited.
     The config-dir pin, the managed-by marker, and the self-update
-    suppression variables are set at every ring.
+    suppression variables are set at every ring. Unless this is a nested
+    launch of the same project, the variables of another Claude Code
+    session (``parent_session_variables``) are dropped, and the cmd shims'
+    own helper variables never reach Claude Code.
+
+    ``PATH`` gets the nested-``claude`` shim directory first. With
+    ``slot_dir`` (Windows, see ``nested_claude_slot_dir``) the selected
+    slot's platform directory goes in front of it, so a nested ``claude``
+    reaches the slot's ``claude.exe`` directly: CreateProcess and libuv
+    search only ``.exe`` files, and a ``.cmd`` shim would make cmd.exe
+    re-parse every argument.
     """
 
     env = dict(base)
@@ -950,6 +1182,11 @@ def build_session_environment(
             env_pop(env, name, os_name)
     else:
         env_pop(env, MSYS_ARGS_VAR, os_name)
+    for name in SHIM_INTERNAL_VARS:
+        env_pop(env, name, os_name)
+    if not is_nested_launch(base, paths, os_name):
+        for name in parent_session_variables(env, os_name):
+            env.pop(name, None)
     if not shared_home:
         for name, value in redirected_home_environment(paths.home_dir, os_name).items():
             env_set(env, name, value, os_name)
@@ -964,7 +1201,39 @@ def build_session_environment(
         env_set(env, name, value, os_name)
     env_set(env, NOTICES_SHOWN_VAR, paths.config_dir, os_name)
     prepend_path_entry(env, paths.shim_dir, os_name)
+    if slot_dir:
+        prepend_path_entry(env, slot_dir, os_name)
     return env
+
+
+def nested_claude_slot_dir(
+    selection: SlotSelection, config: LaunchConfig, os_name: str
+) -> Optional[str]:
+    """Return the slot directory to put first on PATH on Windows, or None.
+
+    On native Windows a nested ``claude`` must reach the slot's
+    ``claude.exe`` itself: CreateProcess and libuv-based spawns (Python
+    list calls, Node, Bun) look only for ``.exe`` files and would skip the
+    ``.cmd`` shim for the next ``claude.exe`` on PATH, and any caller that
+    does reach ``claude.cmd`` has cmd.exe re-parse its arguments. The
+    directory qualifies only in slot mode (the npm-era layout's directory
+    holds other files) and only while it holds nothing but the binary, so a
+    future release's extra executables never shadow tools session-wide.
+    ``selection.binary`` is already spelled with long names, so
+    maintenance's in-use check matches the image path.
+    """
+
+    if os_name != "nt" or config.legacy_binary is not None or not selection.binary:
+        return None
+    directory = os.path.dirname(selection.binary)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    binary_name = os.path.normcase(os.path.basename(selection.binary))
+    if [os.path.normcase(entry) for entry in entries] != [binary_name]:
+        return None
+    return directory
 
 
 def ensure_session_directories(
@@ -975,9 +1244,11 @@ def ensure_session_directories(
     On Windows ring 1 also creates ``HOME\\AppData\\Roaming`` and
     ``HOME\\AppData\\Local``, because APPDATA and LOCALAPPDATA point
     there and native programs expect both to exist. A config dir or home
-    created here is private to the operator (mode 0700 on POSIX), because
-    it holds transcripts and credentials; existing directories are left as
-    they are (maintenance tightens them).
+    created here is private to the operator, because it holds transcripts
+    and credentials: mode 0700 on POSIX, and on Windows a protected DACL
+    granting only the operator, SYSTEM, and Administrators (best effort; a
+    filesystem without ACLs keeps its defaults). Existing directories are
+    left as they are (maintenance tightens them).
     """
 
     # The config dir comes first so a home inside it never creates it with
@@ -992,9 +1263,10 @@ def ensure_session_directories(
             targets.append((os.path.join(paths.home_dir_fs, "AppData", "Local"), False))
     for target, private in targets:
         try:
-            # Windows is left to its inherited ACLs: Python 3.13+ turns mode
-            # 0700 into a restrictive ACL there, which earlier versions do not.
-            if private and os.name != "nt" and not os.path.isdir(target):
+            created = not os.path.isdir(target)
+            # Python 3.13+ turns mode 0700 into a restrictive ACL on Windows
+            # and earlier versions do not, so Windows sets its DACL itself.
+            if private and os.name != "nt" and created:
                 os.makedirs(target, mode=0o700, exist_ok=True)
             else:
                 os.makedirs(target, exist_ok=True)
@@ -1002,6 +1274,350 @@ def ensure_session_directories(
             raise LauncherError(
                 "cannot create managed directory {}: {}".format(target, exc)
             ) from exc
+        if private and created and os.name == "nt":
+            try:
+                windows_set_private_dacl(target)
+            except OSError:
+                # FAT, exFAT, and some network shares have no ACLs to set.
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Windows ACLs (private session directories, shared-checkout detection)
+# ---------------------------------------------------------------------------
+
+
+def _windows_security_api() -> Tuple[Any, Any]:
+    """Return prototyped private ``advapi32`` and ``kernel32`` instances.
+
+    Private ``WinDLL`` instances keep these prototypes from leaking into
+    other ``ctypes.windll`` users in the same process.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [pointer]
+    kernel32.LocalFree.restype = pointer
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        pointer,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        pointer,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(pointer),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pointer,
+        pointer,
+        pointer,
+        pointer,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        pointer,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        pointer,
+        pointer,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [pointer, wintypes.DWORD, ctypes.POINTER(pointer)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    function = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    function.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(pointer),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    function.restype = wintypes.BOOL
+    return advapi32, kernel32
+
+
+def _sid_string(advapi32: Any, kernel32: Any, sid: Any) -> Optional[str]:
+    """Return the ``S-1-...`` form of a SID pointer, or None."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    if not sid:
+        return None
+    text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        return None
+    try:
+        return text.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def windows_current_user_sid() -> Optional[str]:
+    """Return the SID of this process's user as ``S-1-...``, or None."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32, kernel32 = _windows_security_api()
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+        ):
+            return None
+        try:
+            size = wintypes.DWORD(0)
+            # The first call only reports the buffer size it needs.
+            advapi32.GetTokenInformation(
+                token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(size)
+            )
+            if not size.value:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if not advapi32.GetTokenInformation(
+                token, _TOKEN_USER_CLASS, buffer, size, ctypes.byref(size)
+            ):
+                return None
+            # TOKEN_USER starts with SID_AND_ATTRIBUTES, whose first member
+            # is the SID pointer.
+            sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+            return _sid_string(advapi32, kernel32, sid)
+        finally:
+            kernel32.CloseHandle(token)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def windows_security_summary(
+    path: str,
+) -> Optional[Tuple[Optional[str], List[Tuple[int, int, int, Optional[str]]]]]:
+    """Return ``(owner SID, DACL entries)`` for a path, or None when unreadable.
+
+    Each entry is ``(ACE type, ACE flags, access mask, SID)``. A NULL DACL,
+    which grants everyone everything, is reported as one allow entry for
+    Everyone with every right.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32, kernel32 = _windows_security_api()
+        owner = ctypes.c_void_p()
+        dacl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        status = advapi32.GetNamedSecurityInfoW(
+            path,
+            _SE_FILE_OBJECT,
+            _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner),
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if status != 0:
+            return None
+        try:
+            owner_sid = _sid_string(advapi32, kernel32, owner.value)
+            if not dacl.value:
+                return owner_sid, [(ACCESS_ALLOWED_ACE_TYPE, 0, 0xFFFFFFFF, "S-1-1-0")]
+
+            class AclSizeInformation(ctypes.Structure):
+                """ACL_SIZE_INFORMATION: the ACE count and byte usage."""
+
+                _fields_ = [
+                    ("AceCount", wintypes.DWORD),
+                    ("AclBytesInUse", wintypes.DWORD),
+                    ("AclBytesFree", wintypes.DWORD),
+                ]
+
+            info = AclSizeInformation()
+            if not advapi32.GetAclInformation(
+                dacl.value,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                _ACL_SIZE_INFORMATION_CLASS,
+            ):
+                return None
+            entries: List[Tuple[int, int, int, Optional[str]]] = []
+            for index in range(info.AceCount):
+                ace = ctypes.c_void_p()
+                if not advapi32.GetAce(dacl.value, index, ctypes.byref(ace)):
+                    return None
+                raw = ctypes.cast(ace, ctypes.POINTER(ctypes.c_ubyte))
+                ace_type, ace_flags = raw[0], raw[1]
+                mask = ctypes.cast(
+                    ace.value + 4, ctypes.POINTER(ctypes.c_uint32)
+                ).contents.value
+                sid: Optional[str] = None
+                # Only the basic allow and deny ACEs keep the SID at offset 8;
+                # other ACE types are reported without one.
+                if ace_type in (ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE):
+                    sid = _sid_string(advapi32, kernel32, ace.value + 8)
+                entries.append((ace_type, ace_flags, mask, sid))
+            return owner_sid, entries
+        finally:
+            kernel32.LocalFree(descriptor)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def private_dacl_principals(
+    user_sid: Optional[str], owner_sid: Optional[str]
+) -> List[str]:
+    """Return the SIDs a private session directory grants full control.
+
+    The operator, the directory's owner when that is an account (so another
+    administrator running maintenance never locks the owner out; an owner
+    can always rewrite its DACL anyway), SYSTEM, and Administrators.
+    """
+
+    principals: List[str] = []
+    # An owner counts only when it is an account SID (S-1-5-21-...): a
+    # directory created elevated is owned by Administrators, which is
+    # listed anyway, and a broad group must never be granted.
+    owner_account = (
+        owner_sid if owner_sid and owner_sid.startswith("S-1-5-21-") else None
+    )
+    for sid in (user_sid, owner_account, LOCAL_SYSTEM_SID, ADMINISTRATORS_SID):
+        if sid and sid not in principals:
+            principals.append(sid)
+    return principals
+
+
+def dacl_is_private(
+    entries: Sequence[Tuple[int, int, int, Optional[str]]], principals: Sequence[str]
+) -> bool:
+    """Return True when every allow entry names one of ``principals``.
+
+    CREATOR OWNER and OWNER RIGHTS count as private too: they grant only the
+    owner, who can rewrite the DACL anyway (Python 3.13 and pytest create
+    private directories that way). Deny entries never widen access. An
+    allow entry of another type (object or callback ACEs) cannot be judged
+    here and counts as not private.
+    """
+
+    accepted = set(principals) | set(OWNER_PRINCIPAL_SIDS)
+    for ace_type, _flags, _mask, sid in entries:
+        if ace_type == ACCESS_DENIED_ACE_TYPE:
+            continue
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE or sid not in accepted:
+            return False
+    return True
+
+
+def broad_write_grants(
+    entries: Sequence[Tuple[int, int, int, Optional[str]]],
+) -> List[str]:
+    """Return the names of broad groups an ACL lets change content or the ACL.
+
+    Inherit-only entries count too: they grant the same rights on every
+    file and directory below.
+    """
+
+    names: List[str] = []
+    for ace_type, _flags, mask, sid in entries:
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE or sid not in BROAD_GROUP_SIDS:
+            continue
+        if mask & WINDOWS_WRITE_RIGHTS and BROAD_GROUP_SIDS[sid] not in names:
+            names.append(BROAD_GROUP_SIDS[sid])
+    return names
+
+
+def windows_set_private_dacl(path: str) -> None:
+    """Give ``path`` a protected DACL for the operator, SYSTEM, and Administrators.
+
+    Inheritance from the parent is removed and the entries are inheritable
+    by files and subdirectories, which Windows propagates to existing
+    children. Raises OSError when the ACL cannot be set (for example on a
+    filesystem without ACLs) or the operator's SID is unknown.
+    """
+
+    if os.name != "nt":
+        raise OSError("Windows ACLs are only available on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    user_sid = windows_current_user_sid()
+    if user_sid is None:
+        raise OSError("cannot determine the current user's SID")
+    summary = windows_security_summary(path)
+    owner_sid = summary[0] if summary is not None else None
+    sddl = "D:P" + "".join(
+        "(A;OICI;FA;;;{})".format(sid)
+        for sid in private_dacl_principals(user_sid, owner_sid)
+    )
+    advapi32, kernel32 = _windows_security_api()
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, _SDDL_REVISION_1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        status = advapi32.SetNamedSecurityInfoW(
+            path,
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if status != 0:
+            raise ctypes.WinError(status)
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 # ---------------------------------------------------------------------------
@@ -1009,11 +1625,31 @@ def ensure_session_directories(
 # ---------------------------------------------------------------------------
 
 
-def intercepted_subcommand(args: Sequence[str]) -> Optional[str]:
-    """Return the self-update subcommand when it is the first forwarded arg."""
+def intercepted_subcommand(
+    args: Sequence[str], subcommands: Sequence[str] = ()
+) -> Optional[str]:
+    """Return the self-update subcommand the arguments could dispatch to.
 
-    if args and args[0] in INTERCEPTED_SUBCOMMANDS:
-        return args[0]
+    Claude Code dispatches a subcommand that follows leading root options
+    (``--verbose update``, ``--model x install``) or ``--``, so any argument
+    that is exactly ``update``, ``upgrade``, or ``install`` is refused,
+    without an option-arity table. The scan stops at the first argument
+    that is another recorded subcommand (``subcommands``, or
+    ``FALLBACK_SCAN_STOPS`` when none are recorded), whose own operands may
+    legitimately be such a word (``plugin install <name>``). A false
+    positive (a one-word prompt such as ``-p install``, which Claude Code
+    itself would dispatch) is only a clear refusal; a false negative would
+    reach Claude Code's own installer. One false negative remains: an
+    option value that equals a subcommand name (``--agent mcp update``)
+    ends the scan early, and ``DISABLE_UPDATES`` stops the updater there.
+    """
+
+    stops = set(subcommands or FALLBACK_SCAN_STOPS) - set(INTERCEPTED_SUBCOMMANDS)
+    for arg in args:
+        if arg in INTERCEPTED_SUBCOMMANDS:
+            return arg
+        if arg in stops:
+            return None
     return None
 
 
@@ -1259,9 +1895,13 @@ def check_slot(runtime_root_fs: str, name: str, platform_key: str) -> SlotCheck:
     must exist, and the binary must exist inside the runtime root with the
     recorded size. The binary's identity (size, modification time, and on
     POSIX the inode) must also equal the verification stamp maintenance
-    wrote right after it last verified the slot in full. A repository
-    cannot supply a matching stamp, because a clone or pull writes new
-    files, so a binary replaced after verification is refused.
+    wrote right after it last verified the slot in full. A git clone or
+    pull cannot carry a matching stamp, because it writes new files with a
+    fresh modification time, so a binary it planted or replaced is refused.
+    On Windows the stamp has no inode, so an archive or copy tool that
+    preserves modification times could restore a same-size binary together
+    with a matching stamp; the stamp is a tripwire against clones and
+    pulls, not proof against every way files can arrive.
     """
 
     slot_dir = os.path.join(runtime_root_fs, SLOTS_DIR_NAME, name)
@@ -2202,17 +2842,155 @@ def map_windows_exit_code(code: Optional[int]) -> int:
     return code
 
 
+def _windows_job_api() -> Any:
+    """Return a private, prototyped ``kernel32`` for the job-object calls."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def attach_kill_on_close_job(pid: int) -> Optional[int]:
+    """Put a Windows child into a kill-on-close job; return the job handle.
+
+    Without a job, killing the launcher (a tool timeout, an SDK
+    cancellation, or an IDE that terminates only its direct child) leaves
+    Claude Code running: still editing files and spending tokens, keeping
+    its slot in use, and holding the caller's pipes open. The job has
+    ``KILL_ON_JOB_CLOSE``, so Windows ends the child when the last handle,
+    held only by this process and never inherited, closes, including when
+    this process is killed. ``SILENT_BREAKAWAY_OK`` keeps everything the
+    child starts itself (tools, background sessions, the daemon) outside
+    the job, as before. Best effort: any failure returns None and the
+    launch goes on without a job.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            """JOBOBJECT_BASIC_LIMIT_INFORMATION."""
+
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            """IO_COUNTERS."""
+
+            _fields_ = [
+                (name, ctypes.c_uint64)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class ExtendedLimits(ctypes.Structure):
+            """JOBOBJECT_EXTENDED_LIMIT_INFORMATION."""
+
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = _windows_job_api()
+        # NULL security attributes: the handle is not inheritable, so no
+        # child ever holds the job open.
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+        )
+        process = None
+        try:
+            if not kernel32.SetInformationJobObject(
+                job,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ):
+                raise OSError("SetInformationJobObject failed")
+            process = kernel32.OpenProcess(
+                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid
+            )
+            if not process or not kernel32.AssignProcessToJobObject(job, process):
+                raise OSError("AssignProcessToJobObject failed")
+        except OSError:
+            kernel32.CloseHandle(job)
+            return None
+        finally:
+            if process:
+                kernel32.CloseHandle(process)
+        return int(job)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def close_job(job: Optional[int]) -> None:
+    """Close a handle from ``attach_kill_on_close_job`` (None is ignored)."""
+
+    if job is None:
+        return
+    try:
+        _windows_job_api().CloseHandle(job)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def spawn_and_wait(argv: List[str], env: Dict[str, str]) -> int:
     """Run Claude Code as a child sharing the console; return its exit code.
 
     The parent ignores Ctrl+C while it waits: the console delivers the
     event to the child too, and the child decides what it means.
     ``close_fds=False`` lets the child inherit the standard handles exactly
-    as a shell would hand them over.
+    as a shell would hand them over. The child is placed in a
+    kill-on-close job right after it starts (``attach_kill_on_close_job``),
+    so it does not outlive a killed launcher. Anything it started in that
+    instant stays outside the job, as its later children do anyway.
     """
 
     restore = True
     previous: Any = None
+    job: Optional[int] = None
     try:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2221,12 +2999,16 @@ def spawn_and_wait(argv: List[str], env: Dict[str, str]) -> int:
         restore = False
     try:
         process = subprocess.Popen(list(argv), env=env, close_fds=False)
+        job = attach_kill_on_close_job(process.pid)
         while True:
             try:
                 return process.wait()
             except KeyboardInterrupt:
                 continue
     finally:
+        # The child has exited (or Popen failed), so closing the job kills
+        # nothing; its own children were never in the job.
+        close_job(job)
         if restore:
             try:
                 signal.signal(
@@ -2405,6 +3187,11 @@ def _launch(
         os.path.join(os.path.dirname(core_path), LAUNCH_CONFIG_NAME)
     )
     repo_root = choose_repo_root(derive_repo_root(core_path, config), environ, os_name)
+    if os_name == "nt" and config.config_dir_spelling == CONFIG_DIR_SPELLING_NATIVE:
+        # One checkout reached as c:\... or through an 8.3 name must give
+        # Claude Code one config-dir and home spelling (forward-slash mode
+        # already upper-cases the drive for its migrated spelling).
+        repo_root = canonical_windows_root(repo_root)
     paths = build_repo_paths(repo_root, config, os_name)
     if fetch is None:
         hosts = update_check_hosts(config)
@@ -2426,11 +3213,16 @@ def _launch(
         )
 
     forwarded = parsed.forwarded
-    blocked = intercepted_subcommand(forwarded)
-    if blocked is not None:
-        raise LauncherError(interception_message(blocked, config), exit_code=2)
+    # The plain first-argument form is refused before slot selection, so it
+    # gets this message even without a usable runtime; leading options are
+    # checked against the selected slot's subcommands below.
+    if forwarded and forwarded[0] in INTERCEPTED_SUBCOMMANDS:
+        raise LauncherError(interception_message(forwarded[0], config), exit_code=2)
     if caller_passed_settings(forwarded):
         raise LauncherError(settings_refusal_message(paths, os_name), exit_code=2)
+    problem = path_entry_problem(paths.shim_dir, os_name)
+    if problem is not None:
+        raise LauncherError(problem, exit_code=1)
 
     if config.legacy_binary is not None:
         selection = select_legacy_binary(long_path_spelling(repo_root), config)
@@ -2450,6 +3242,9 @@ def _launch(
         selection = select_slot(
             long_path_spelling(paths.runtime_root_fs), key, config.wrangler_command
         )
+    blocked = intercepted_subcommand(forwarded, record_subcommands(selection.record))
+    if blocked is not None:
+        raise LauncherError(interception_message(blocked, config), exit_code=2)
     if selection.fallback is not None:
         for line in fallback_warning_lines(selection, config.wrangler_command):
             _emit(stderr, "{} {}".format(MESSAGE_PREFIX, line))
@@ -2487,17 +3282,45 @@ def _launch(
     shared_home = select_shared_home(
         config.shared_home_default, environ, parsed.shared_home, os_name
     )
-    nested = env_lookup(environ, NOTICES_SHOWN_VAR, os_name) == paths.config_dir
+    nested = is_nested_launch(environ, paths, os_name)
     is_wsl = detect_wsl(os_name) if platform_is_wsl is None else platform_is_wsl
     if windows_warning_applies(os_name, is_wsl, config, nested):
         _emit(stderr, "{} {}".format(MESSAGE_PREFIX, WINDOWS_SANDBOX_WARNING))
+    credentials = credential_variables(environ, os_name)
+    if credentials and not nested:
+        _emit(
+            stderr,
+            "{} {}".format(
+                MESSAGE_PREFIX, credential_note(credentials, paths.config_dir)
+            ),
+        )
     if config.update_checks and not nested:
         _maybe_emit_update_notice(
             paths, config, selection.version, fetch, now_fn(), stderr
         )
 
+    slot_dir = nested_claude_slot_dir(selection, config, os_name)
+    if slot_dir is not None and path_entry_problem(slot_dir, os_name) is not None:
+        slot_dir = None
+    if os_name == "nt" and slot_dir is None and not nested:
+        reason = (
+            NESTED_SHIM_REASON_LEGACY
+            if config.legacy_binary is not None
+            else NESTED_SHIM_REASON_SLOT.format(cmd=config.wrangler_command)
+        )
+        _emit(
+            stderr,
+            "{} {}".format(
+                MESSAGE_PREFIX, NESTED_SHIM_FALLBACK_WARNING.format(reason=reason)
+            ),
+        )
     child_env = build_session_environment(
-        environ, paths=paths, config=config, shared_home=shared_home, os_name=os_name
+        environ,
+        paths=paths,
+        config=config,
+        shared_home=shared_home,
+        os_name=os_name,
+        slot_dir=slot_dir,
     )
     ensure_session_directories(paths, shared_home, os_name)
     child_argv = [selection.binary] + build_claude_arguments(
