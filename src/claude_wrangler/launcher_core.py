@@ -188,8 +188,19 @@ CREDENTIAL_ENV_VARS = (
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    # Present in 2.1.296 beside its ANTHROPIC_GOOGLE_CLOUD_* settings.
+    # In 2.1.296's own provider-switch list, though not yet documented.
     "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_GATEWAY",
+    # Credentials and account identity a Claude host app or a remote
+    # session hands the CLI (2.1.296's host-auth checks).
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+    "CLAUDE_CODE_API_BASE_URL",
+    "CLAUDE_CODE_ORGANIZATION_UUID",
+    "CLAUDE_CODE_ACCOUNT_UUID",
 )
 CREDENTIAL_PASSTHROUGH_FLAG = "--set-credential-passthrough"
 

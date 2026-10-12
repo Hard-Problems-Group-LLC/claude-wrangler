@@ -161,10 +161,16 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
    `ANTHROPIC_` or `CLAUDE_CODE_OAUTH_`, plus
    `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`,
    `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`,
-   `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`, and the provider switches
+   `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`, the provider switches
    `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_MANTLE`,
-   `_ANTHROPIC_AWS`, and `_ANTHROPIC_GOOGLE_CLOUD` (case-insensitively on
-   Windows). Matching by prefix covers variables later releases add.
+   `_ANTHROPIC_AWS`, `_ANTHROPIC_GOOGLE_CLOUD`, and `_GATEWAY`, and the
+   host and remote-session account variables
+   `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`,
+   `CLAUDE_CODE_HOST_AUTH_ENV_VAR`, `CLAUDE_CODE_HOST_CREDS_FILE`,
+   `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`,
+   `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_API_BASE_URL`,
+   `CLAUDE_CODE_ORGANIZATION_UUID`, and `CLAUDE_CODE_ACCOUNT_UUID`
+   (case-insensitively on Windows). Matching by prefix covers variables later releases add.
    Unless `launch.json` sets `credential_passthrough` (written by
    `--set-credential-passthrough on`; absent means off), the core
    removes all of them, empty or not, at every ring and for nested

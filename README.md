@@ -402,9 +402,13 @@ Notes:
   every `ANTHROPIC_*` variable, `CLAUDE_CODE_OAUTH_*`,
   `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`, the
   `CLAUDE_CODE_CLIENT_CERT`/`_KEY`/`_KEY_PASSPHRASE` client
-  certificate, and the provider switches (`CLAUDE_CODE_USE_BEDROCK`,
-  `_VERTEX`, `_FOUNDRY`, `_MANTLE`, `_ANTHROPIC_AWS`), at every ring,
-  and names the removed ones (never their values) once per session.
+  certificate, the provider switches (`CLAUDE_CODE_USE_BEDROCK`,
+  `_VERTEX`, `_FOUNDRY`, `_MANTLE`, `_ANTHROPIC_AWS`,
+  `_ANTHROPIC_GOOGLE_CLOUD`, `_GATEWAY`), and the account variables a
+  Claude host app or remote session hands the CLI
+  (`CLAUDE_CODE_HOST_AUTH_ENV_VAR`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN`,
+  and the like), at every ring, and names the removed ones (never their
+  values) once per session.
   When the variables in your shell do belong to the project (set by
   direnv, say), run `claude-wrangler --set-credential-passthrough on .`;
   the launcher then passes them through and says so each session.

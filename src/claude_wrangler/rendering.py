@@ -671,19 +671,34 @@ def _ring_lines(config: Config) -> List[str]:
         "`USERPROFILE`), programs that ask Windows for known folders, the",
         "PowerShell module path, and machine-wide managed settings.",
         "",
+    ] + _credential_lines(config)
+
+
+def _credential_lines(config: Config) -> List[str]:
+    """Return the README paragraph on inherited credentials for the setting."""
+
+    lines = [
         "Inherited credentials: Claude Code prefers credential and provider",
         "variables (`ANTHROPIC_API_KEY`, every other `ANTHROPIC_*` variable,",
         "`CLAUDE_CODE_OAUTH_*`, `AWS_BEARER_TOKEN_BEDROCK`, and switches such",
         "as `CLAUDE_CODE_USE_BEDROCK`) to this project's own login, so one",
-        "set in your shell would make every project share that account. The",
-        "launcher therefore removes them and names the removed ones (never",
-        "their values) once per session. Passthrough is currently {}.".format(
-            "on" if config.credential_passthrough else "off"
-        ),
-        "Run `{} --set-credential-passthrough on .` only when the".format(SCRIPT_NAME),
-        "variables in the launching environment belong to this project.",
-        "",
+        "set in your shell would make every project share that account.",
     ]
+    if config.credential_passthrough:
+        lines += [
+            "Credential passthrough is on for this project: the launcher keeps",
+            "them and names them (never their values) once per session. Run",
+            "`{} --set-credential-passthrough off .` unless the".format(SCRIPT_NAME),
+            "variables in the launching environment belong to this project.",
+        ]
+    else:
+        lines += [
+            "Credential passthrough is off, so the launcher removes them and",
+            "names the removed ones (never their values) once per session. Run",
+            "`{} --set-credential-passthrough on .` only when the".format(SCRIPT_NAME),
+            "variables in the launching environment belong to this project.",
+        ]
+    return lines + [""]
 
 
 def build_local_readme_content(config: Config, *, legacy_pending: bool = False) -> str:

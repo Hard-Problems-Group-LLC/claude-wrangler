@@ -163,6 +163,15 @@ def install(project: Path, source, *args: str, **kwargs: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+def test_discovery_reads_the_credential_passthrough_setting(project):
+    make_legacy(project, extra_metadata={"credential_passthrough": True})
+    assert discover_legacy(project, [LEGACY]).credential_passthrough is True
+    other = project / "other"
+    other.mkdir()
+    make_legacy(other)
+    assert discover_legacy(other, [LEGACY]).credential_passthrough is None
+
+
 def test_discovery_reads_metadata_then_lockfile_then_package_json(project):
     root = make_legacy(project)
     legacy = discover_legacy(project, [LEGACY])

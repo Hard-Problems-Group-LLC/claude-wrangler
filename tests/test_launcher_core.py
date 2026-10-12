@@ -2312,6 +2312,11 @@ def test_credential_names_match_by_prefix_and_list() -> None:
         "CLAUDE_CODE_USE_FOUNDRY",
         "CLAUDE_CODE_USE_MANTLE",
         "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+        "CLAUDE_CODE_USE_GATEWAY",
+        "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "CLAUDE_CODE_ORGANIZATION_UUID",
     ):
         assert core.is_credential_variable(name, "posix"), name
     for name in (

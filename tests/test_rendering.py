@@ -124,14 +124,36 @@ def test_readme_names_shared_ring1_stores_and_cmd_reparsing(config):
         "OpenSSH keys, config, and",
         "PowerShell module path",
         "machine-wide managed settings",
-        "launcher therefore removes them",
-        "Passthrough is currently off.",
+        "Credential passthrough is off, so the launcher removes them",
         "--set-credential-passthrough on .",
         "cmd.exe re-parses the arguments of every `.cmd` file",
         "`.local/claude/wrangler/launch.py`",
         "a nested `claude` runs this project's",
     ):
         assert snippet in text, snippet
+
+
+def test_readme_describes_credential_passthrough_when_on(config):
+    config.credential_passthrough = True
+    text = build_local_readme_content(config)
+    assert "Credential passthrough is on for this project" in text
+    assert "--set-credential-passthrough off ." in text
+    assert "removes them" not in text
+    assert "- Inherited credential passthrough: `on`" in text
+
+
+def test_maintenance_environment_follows_credential_passthrough(config):
+    from claude_wrangler.generator import launcher_session_environment
+
+    base = dict(os.environ)
+    base.update(ANTHROPIC_API_KEY="dummy-key", CLAUDE_CODE_USE_GATEWAY="1")
+    stripped = launcher_session_environment(config, base)
+    assert "ANTHROPIC_API_KEY" not in stripped
+    assert "CLAUDE_CODE_USE_GATEWAY" not in stripped
+    config.credential_passthrough = True
+    kept = launcher_session_environment(config, base)
+    assert kept["ANTHROPIC_API_KEY"] == "dummy-key"
+    assert kept["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
 
 def test_readme_flags_a_pending_migration(config):

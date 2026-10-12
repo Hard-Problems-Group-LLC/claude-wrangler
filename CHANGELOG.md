@@ -379,9 +379,10 @@ where practical.
   `ANTHROPIC_*` variable, `CLAUDE_CODE_OAUTH_*`,
   `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`,
   the `CLAUDE_CODE_CLIENT_CERT`/`_KEY`/`_KEY_PASSPHRASE` client
-  certificate, and the Bedrock, Vertex, Foundry, Mantle, and Claude
-  Platform provider switches, at every ring. The removed names (never
-  their values) are listed once per session.
+  certificate, the Bedrock, Vertex, Foundry, Mantle, Claude Platform,
+  and gateway provider switches, and the account variables a Claude
+  host app or remote session hands the CLI, at every ring. The removed
+  names (never their values) are listed once per session.
   `--set-credential-passthrough on` keeps them for a project whose
   shell variables belong to it; `--inspect` and the local README show
   the setting. Behavior change: a project that relied on a key in the
