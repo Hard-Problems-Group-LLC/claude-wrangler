@@ -67,6 +67,30 @@ the most privileged, and privilege decreases as the number increases.
    settings) is a separate axis from the `$HOME` rings and must stay
    under `.local/claude` at every ring. See
    `session_state_isolation_and_config_dir_pinning.md`.
+7. Home redirection on native Windows
+   Native Windows programs resolve the user's home from `USERPROFILE`
+   (and `HOMEDRIVE`/`HOMEPATH`, `APPDATA`, `LOCALAPPDATA`), not from
+   `HOME`. On native Windows, "`$HOME` redirected" in the ring
+   definitions means all of `HOME`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`,
+   `APPDATA`, `LOCALAPPDATA`, and `XDG_*` point into
+   `.local/claude/HOME`. Redirecting `HOME` alone is effectively ring 0
+   for native processes and must never be presented as ring 1. See
+   `cross_platform_launcher.md`.
+8. Native-Windows default ring
+   Claude Code has no sandbox on native Windows, so rings 3 and 2 do not
+   exist there; WSL2 provides them. With operator confirmation recorded
+   in `AGENTS.md` on 2026-10-12, native Windows defaults to ring 1. The
+   launcher warns once per session that commands run unsandboxed and
+   that isolation covers Claude's state and redirected-home tools but not
+   per-user Windows stores (Credential Manager, the registry, and
+   `HKCU\SOFTWARE\Policies`). A project may turn the warning off for
+   personal work. Client work that needs ring 3 should use WSL2 or a
+   separate Windows account.
+9. Self-update suppression
+   At every ring the launcher disables Claude Code's self-update and
+   installer, because they write to `HOME`-relative locations and at
+   ring 0 would modify the operator's global install. See
+   `session_state_isolation_and_config_dir_pinning.md` requirement 5a.
 
 ## Validation
 
@@ -74,5 +98,7 @@ the most privileged, and privilege decreases as the number increases.
   `HOME`, XDG paths, pinned `CLAUDE_CONFIG_DIR`).
 - Launcher tests must cover the ring 0 escape hatch, including that the
   config-dir pin survives it.
+- Launcher tests must cover the native-Windows ring 1 variable set and
+  the native-Windows sandbox warning.
 - `AGENTS.md` must document the ring definitions and the escalation
   policy for agents.

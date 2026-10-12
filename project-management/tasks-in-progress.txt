@@ -3,3 +3,14 @@ Tasks in Progress
 Track tasks that are actively being implemented. Keep this file small and
 current. Use the same asterisk-plus-blank-line format as the backlog, with
 status notes, blockers, and ISO 8601 timestamps.
+
+*
+
+Windows support and native Claude Code runtime
+(`feature/windows-platform-support`). Started 2026-10-11T21:56:00-07:00.
+Done: research, design, operator decisions, self-update hotfix (ea55dab),
+specifications. Next: implementation (signing/download/platform modules,
+A/B slots, operations rewrite and migration, Python launcher core and
+shims, prerequisites family and install.cmd, Windows-safe tests), then
+Windows Sandbox verification. Blocker ahead: operator must enable Windows
+Sandbox (see ai-human-requests.txt). Owner: AI (Claude) with operator.

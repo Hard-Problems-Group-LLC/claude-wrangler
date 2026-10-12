@@ -10,6 +10,17 @@ owner/requestor, and ISO 8601 timestamps.
 Pending Requests
 ----------------
 
+*
+
+2026-10-12T01:00:00-07:00 Enable the Windows Sandbox optional feature
+(Settings > System > Optional features > More Windows features >
+"Windows Sandbox", or elevated
+`Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM`),
+then reboot. Needed for the empirical verification of Claude Code's
+self-update, housekeeping, background-service, and settings-precedence
+behavior on `feature/windows-platform-support`. Not yet blocking; the AI
+will pause and ask when it is. Requestor: AI (Claude). Owner: operator.
+
 Active Requests
 ---------------
 

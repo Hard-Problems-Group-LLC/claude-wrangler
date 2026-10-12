@@ -41,6 +41,18 @@ the managed TheKnowledge footer.
   dependency manifest.
 - Do not ignore or delete the project-root `.claude/` directory by
   automation; Claude Code keeps trackable project settings there.
+- On Windows checkouts with `core.autocrlf=true`, do not run
+  `TheKnowledge/scripts/update_theknowledge_submodule.py` or
+  `initial-setup --force`. Their forced starter refresh rewrites
+  `.gitignore` with `\r\r\n` line endings, which stops ignoring
+  `.codex-home/`, `.codex-local/`, and
+  `.theknowledge-restricted-names.local`. Refresh TheKnowledge from a
+  Linux or WSL2 checkout instead.
+- Until the test suite is Windows-clean, the standard commit helper is
+  unsafe on Windows: it always pushes, and its quality gate runs pytest
+  against the real `USERPROFILE`. On Windows, run the checks with the
+  home variables redirected and commit with plain `git` after the
+  staging review; push only on explicit operator approval.
 
 ## Security Ring Model
 
@@ -77,8 +89,25 @@ Operating rules:
 
 ### Recorded Ring Requirements
 
-- None recorded yet. Add entries as
-  `<task class>: requires ring <N> because <reason> (YYYY-MM-DD)`.
+Add entries as
+`<task class>: requires ring <N> because <reason> (YYYY-MM-DD)`.
+
+- Default ring on native Windows hosts (operator-confirmed default
+  change): ring 1, because Claude Code has no sandbox on native Windows,
+  so rings 3 and 2 do not exist there. Ring 1 on Windows redirects
+  `HOME`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`,
+  `LOCALAPPDATA`, and `XDG_*`; the launcher warns each session, with a
+  per-project opt-out for personal work. Use WSL2 or a separate Windows
+  account where client work needs ring 3 (2026-10-12).
+- Native-Windows install and entry-point tests: run at ring 1 with
+  `HOME`, `USERPROFILE`, `APPDATA`, and `LOCALAPPDATA` redirected into
+  temporary directories, because some tests invoke installers that
+  resolve the user home from `USERPROFILE`. A real-profile install is
+  ring 0 and is operator-run only (2026-10-12).
+- Claude Code housekeeping at ring 0: requires accepting that a ring-0
+  session may prune old versions in the operator's global
+  `~/.local/share/claude/versions`, because Claude Code's background
+  cleanup ignores the update kill switches; prefer ring 1 (2026-10-12).
 
 <!-- THEKNOWLEDGE_MANAGED_FOOTER_START -->
 ---
