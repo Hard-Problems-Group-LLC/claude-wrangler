@@ -433,6 +433,7 @@ def _legacy_metadata_document(
             "reasonable_permissions_enabled": config.reasonable_permissions_enabled,
             "update_checks": config.update_checks,
             "windows_sandbox_warning": config.windows_sandbox_warning,
+            "credential_passthrough": config.credential_passthrough,
             "release_base_url": config.release_base_url,
             "version_source": config.version_source,
             "available_versions": dict(config.available_versions),

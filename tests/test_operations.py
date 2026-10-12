@@ -161,6 +161,7 @@ def test_fresh_install_promotes_stable_into_slot_a_and_publishes_files(project):
     assert meta["platform"] == KEY
     assert meta["update_checks"] is True
     assert meta["windows_sandbox_warning"] is True
+    assert meta["credential_passthrough"] is False
     assert meta["launcher_python"]
     assert meta["config_dir_spelling"] == "native"
     assert meta["paths"]["local_dir"] == ".local/claude/wrangler"
@@ -417,6 +418,11 @@ def test_toggles_only_rewrite_managed_files(installed):
     assert install(installed, source, "--set-reasonable-permissions") == 0
     assert install(installed, source, "--set-update-checks", "off") == 0
     assert install(installed, source, "--set-windows-sandbox-warning", "off") == 0
+    launch = json.loads(
+        (runtime(installed) / "launch.json").read_text(encoding="utf-8")
+    )
+    assert launch["credential_passthrough"] is False
+    assert install(installed, source, "--set-credential-passthrough", "on") == 0
 
     assert source.pointer_requests == [] and source.manifest_requests == []
     launch = json.loads(
@@ -425,8 +431,10 @@ def test_toggles_only_rewrite_managed_files(installed):
     assert launch["reasonable_permissions"] is True
     assert launch["update_checks"] is False
     assert launch["windows_sandbox_warning"] is False
+    assert launch["credential_passthrough"] is True
     meta = metadata(installed)
     assert meta["reasonable_permissions_enabled"] is True
+    assert meta["credential_passthrough"] is True
     assert meta["claude_version"] == "2.1.287"
 
     assert install(installed, source, "--clear-reasonable-permissions") == 0

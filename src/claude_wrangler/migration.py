@@ -459,6 +459,7 @@ def read_legacy_state(
         reasonable_permissions_enabled=bool_field("reasonable_permissions_enabled"),
         update_checks=bool_field("update_checks"),
         windows_sandbox_warning=bool_field("windows_sandbox_warning"),
+        credential_passthrough=bool_field("credential_passthrough"),
         release_base_url=base_url if isinstance(base_url, str) and base_url else None,
         generated_at=generated_at if isinstance(generated_at, str) else None,
         recorded_paths=parse_recorded_paths(meta.get("paths")),

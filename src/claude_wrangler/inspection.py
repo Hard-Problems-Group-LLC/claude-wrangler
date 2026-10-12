@@ -230,6 +230,7 @@ def gather_inspection_report(
             "reasonable_permissions_enabled": config.reasonable_permissions_enabled,
             "update_checks": config.update_checks,
             "windows_sandbox_warning": config.windows_sandbox_warning,
+            "credential_passthrough": config.credential_passthrough,
             "release_base_url": config.release_base_url,
             "config_dir_spelling": config.config_dir_spelling,
             "version_source": config.version_source,

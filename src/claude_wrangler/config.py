@@ -83,6 +83,7 @@ MISSING_DASH_FLAG_HINTS = {
     "set-reasonable-permissions": "--set-reasonable-permissions",
     "set-update-checks": "--set-update-checks",
     "set-windows-sandbox-warning": "--set-windows-sandbox-warning",
+    "set-credential-passthrough": "--set-credential-passthrough",
     "shared-home": "--shared-home",
     "skip-install": "--skip-install",
     "stop-background-sessions": "--stop-background-sessions",
@@ -467,6 +468,18 @@ def build_parser() -> argparse.ArgumentParser:
             "unsandboxed on or off for this project."
         ),
     )
+    parser.add_argument(
+        "--set-credential-passthrough",
+        choices=ON_OFF,
+        default=None,
+        help=(
+            "Pass credential and provider variables inherited from the "
+            "launching environment (ANTHROPIC_*, CLAUDE_CODE_OAUTH_*, "
+            "AWS_BEARER_TOKEN_BEDROCK, CLAUDE_CODE_USE_BEDROCK, ...) through to "
+            "Claude Code for this project (on), or remove them so the project "
+            "uses its own login (off, the default)."
+        ),
+    )
     return parser
 
 
@@ -500,6 +513,8 @@ def _install_setting_flags(args: argparse.Namespace) -> Tuple[str, ...]:
         flags.append("--set-update-checks")
     if args.set_windows_sandbox_warning is not None:
         flags.append("--set-windows-sandbox-warning")
+    if getattr(args, "set_credential_passthrough", None) is not None:
+        flags.append("--set-credential-passthrough")
     return tuple(flags)
 
 
@@ -663,8 +678,9 @@ def _on_off_setting(
     flag_value: Optional[str],
     recorded: Optional[bool],
     legacy_value: Optional[bool],
+    default: bool = True,
 ) -> bool:
-    """Resolve an on/off project setting: flag, then recorded, then on."""
+    """Resolve an on/off project setting: flag, then recorded, then default."""
 
     if flag_value is not None:
         return flag_value == "on"
@@ -672,7 +688,7 @@ def _on_off_setting(
         return recorded
     if legacy_value is not None:
         return legacy_value
-    return True
+    return default
 
 
 def has_existing_managed_selection(
@@ -705,7 +721,8 @@ def is_reasonable_permissions_reconfigure(
     """Return True when the command should only rewrite managed files.
 
     A settings toggle (`--set-/--clear-reasonable-permissions`,
-    `--set-update-checks`, `--set-windows-sandbox-warning`) on an existing
+    `--set-update-checks`, `--set-windows-sandbox-warning`,
+    `--set-credential-passthrough`) on an existing
     install, without an install-changing request, preserves the recorded
     selection and never downloads, promotes, or migrates.
     """
@@ -1034,6 +1051,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
             args.set_windows_sandbox_warning,
             existing.windows_sandbox_warning,
             legacy.windows_sandbox_warning if legacy is not None else None,
+        ),
+        credential_passthrough=_on_off_setting(
+            getattr(args, "set_credential_passthrough", None),
+            existing.credential_passthrough,
+            legacy.credential_passthrough if legacy is not None else None,
+            default=False,
         ),
         release_base_url=release_base_url,
         ca_bundle=args.ca_bundle,

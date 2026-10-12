@@ -154,16 +154,26 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
    helper variables (`CLAUDE_LOCAL_CORE`, `CLAUDE_LOCAL_PY`, and the
    like) never reach Claude Code.
 
-   Credentials and provider selection in the environment
-   (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-   `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
-   `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`) take precedence
-   over the project's own login in the pinned config dir, so a
-   persistent user-level key would authenticate every project as one
-   account. They are left in place, because per-project credentials set
-   by direnv or a similar tool are legitimate, but the core names the
-   ones present, never their values, once per session. This is a ring-1
-   limitation on every operating system.
+   Credentials, identity, and provider selection in the environment
+   take precedence over the project's own login in the pinned config
+   dir, so a persistent user-level key would authenticate every project
+   as one account. The core treats as such every name starting with
+   `ANTHROPIC_` or `CLAUDE_CODE_OAUTH_`, plus
+   `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`,
+   `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`,
+   `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE`, and the provider switches
+   `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_MANTLE`,
+   `_ANTHROPIC_AWS`, and `_ANTHROPIC_GOOGLE_CLOUD` (case-insensitively on
+   Windows). Matching by prefix covers variables later releases add.
+   Unless `launch.json` sets `credential_passthrough` (written by
+   `--set-credential-passthrough on`; absent means off), the core
+   removes all of them, empty or not, at every ring and for nested
+   launches too, and names the non-empty ones, never their values, once
+   per session with the command that turns passthrough on. With
+   passthrough on, they are kept and the note says so, with the command
+   that turns it off. Credential sources outside the environment
+   (settings-file `env` blocks, `apiKeyHelper`, cloud SDK credential
+   chains) are not affected.
 
 4. **Self-update suppression in three layers**
 
@@ -415,7 +425,8 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
   `PYTHON_MANAGER_AUTOMATIC_INSTALL` reaches Claude Code unchanged.
 - Another session's variables are dropped for a fresh launch and kept
   for a nested launch of the same project; inherited credentials are
-  named once and never echoed.
+  removed by default (kept with passthrough on), named once, and never
+  echoed.
 - Killing the launcher (base interpreter and venv redirector) ends
   Claude Code.
 - Interception behind leading options and `--`, and forwarding of

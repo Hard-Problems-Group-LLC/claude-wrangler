@@ -137,6 +137,7 @@ class LegacyState:
     reasonable_permissions_enabled: Optional[bool] = None
     update_checks: Optional[bool] = None
     windows_sandbox_warning: Optional[bool] = None
+    credential_passthrough: Optional[bool] = None
     release_base_url: Optional[str] = None
     generated_at: Optional[str] = None
     recorded_paths: Dict[str, str] = field(default_factory=dict)
@@ -179,6 +180,8 @@ class Config:
     repair_install: bool = False
     update_checks: bool = True
     windows_sandbox_warning: bool = True
+    # Off by default: the launcher removes inherited credential variables.
+    credential_passthrough: bool = False
     release_base_url: Optional[str] = None
     ca_bundle: Optional[str] = None
     download_timeout_seconds: int = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
@@ -229,6 +232,7 @@ class ExistingState:
     shared_home: Optional[bool] = None
     update_checks: Optional[bool] = None
     windows_sandbox_warning: Optional[bool] = None
+    credential_passthrough: Optional[bool] = None
     release_base_url: Optional[str] = None
     platform: Optional[str] = None
     launcher_python: Optional[str] = None

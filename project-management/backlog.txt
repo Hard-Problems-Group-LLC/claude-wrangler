@@ -210,21 +210,6 @@ need a spec change. Blockers: operator decision.
 
 *
 
-Per-project credential stripping in the launcher (WIN-F1 follow-up,
-added 2026-10-12T07:55:00-07:00). The launcher now drops another Claude
-Code session's identity, messaging, and secure-storage variables and
-names inherited credential variables (`ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
-`CLAUDE_CODE_USE_BEDROCK`/`VERTEX`) once per session, but leaves them in
-place. Add an opt-in per-project switch (for example
-`--set-credential-env strip|keep`, recorded in metadata and
-`launch.json`) that removes them, plus the matching `AWS_*` and
-`GOOGLE_*` companions, for projects whose login must come only from the
-pinned config dir. Stripping by default would break legitimate direnv
-setups. Blockers: operator decision on the default and the flag name.
-
-*
-
 Redirect Claude Code's temporary tree at ring 1 (WIN-G2 follow-up,
 added 2026-10-12T07:55:00-07:00). `TEMP` and `TMP` stay shared, so
 Claude Code's per-project temporary trees land in the operator's
@@ -283,6 +268,9 @@ recheck saw Git Bash fail to start `bin\claude-local.cmd` and
 comes from MSYS quoting before the batch file runs, and the same case
 was not tried against the previous release. Git Bash users normally run
 the sh launcher (`bin/claude-local`), and nested calls now reach the
-slot's `claude.exe`, so the exposure is narrow. Reproduce against HEAD,
-then document it or route Git Bash callers to the sh shim. Blockers:
-none.
+slot's `claude.exe`, so the exposure is narrow. The live end-to-end runs
+of 2026-10-12 did not reproduce it: `./bin/claude-local.cmd --version`
+from Git Bash worked in a copied checkout under a directory named
+`c p`. Still to try: a space in the project directory's own name, a
+PATH lookup of `claude-local.cmd`, and `shim\claude.cmd`. Then
+document it or route Git Bash callers to the sh shim. Blockers: none.

@@ -285,6 +285,7 @@ def read_existing_state(layout: Layout) -> ExistingState:
         shared_home=_optional_bool(metadata, "shared_home"),
         update_checks=_optional_bool(metadata, "update_checks"),
         windows_sandbox_warning=_optional_bool(metadata, "windows_sandbox_warning"),
+        credential_passthrough=_optional_bool(metadata, "credential_passthrough"),
         release_base_url=_optional_str(metadata, "release_base_url"),
         platform=_optional_str(metadata, "platform"),
         launcher_python=_optional_str(metadata, "launcher_python"),

@@ -19,8 +19,9 @@ update checks
 (``native_runtime_distribution_and_verification.md`` requirement 12), the
 reasonable-permissions default, the warn-only Node.js parity check, the
 native-Windows sandbox warning, the nested-``claude`` PATH order, the
-handling of another Claude Code session's variables and of inherited
-credentials, private session directories (mode 0700, or a private DACL on
+handling of another Claude Code session's variables, the removal of
+inherited credentials (unless the project turned credential passthrough
+on), private session directories (mode 0700, or a private DACL on
 Windows), and process semantics (including the Windows kill-on-close
 job).
 
@@ -164,17 +165,33 @@ PARENT_SESSION_GATED_VARS = (
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_EFFORT",
 )
-# Credentials and provider selection that Claude Code reads from the
-# environment ahead of the project's own login in the pinned config dir.
-# The launcher names them (never their values) once per session.
+# Credentials, account identity, and provider or endpoint selection that
+# Claude Code reads from the environment ahead of the project's own login in
+# the pinned config dir (code.claude.com/docs/en/env-vars and
+# /authentication): every ANTHROPIC_* variable (API keys, auth tokens,
+# custom headers, base URLs, profiles, organization, workspace, and
+# federation IDs, model choices), Claude Code's OAuth and API-key
+# variables, the Bedrock API key, the mTLS client certificate, and the
+# provider switches. Matching by prefix also covers variables a later
+# Claude Code release adds. Unless the project turned credential
+# passthrough on, the launcher removes every inherited one; either way it
+# names the ones that were set (never their values) once per session.
+CREDENTIAL_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_OAUTH_")
 CREDENTIAL_ENV_VARS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_CLIENT_CERT",
+    "CLAUDE_CODE_CLIENT_KEY",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    # Present in 2.1.296 beside its ANTHROPIC_GOOGLE_CLOUD_* settings.
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
 )
+CREDENTIAL_PASSTHROUGH_FLAG = "--set-credential-passthrough"
 
 SHARED_HOME_FLAG = "--shared-home"
 ISOLATED_HOME_FLAG = "--isolated-home"
@@ -218,11 +235,20 @@ NESTED_SHIM_REASON_SLOT = (
     "the active slot's directory holds more than claude.exe; run "
     "`{cmd} --repair-install .`"
 )
-CREDENTIAL_ENV_NOTE = (
-    "note: {names} {verb} set in the environment that started this launcher. "
-    "Claude Code uses {pronoun} ahead of this project's own login in {config}, "
-    "so every project started from this environment shares that account or "
-    "endpoint. Unset {pronoun} unless {subject} {belong} to this project."
+# Shown when inherited credential variables were removed (the default).
+CREDENTIAL_STRIPPED_NOTE = (
+    "note: removed {names}, inherited from the environment that started this "
+    "launcher, so this project uses its own login in {config}. If {subject} "
+    "{belong} to this project, run `{cmd} {flag} on .` to pass {pronoun} "
+    "through."
+)
+# Shown when the project turned credential passthrough on.
+CREDENTIAL_PASSTHROUGH_NOTE = (
+    "note: {names} {verb} passed through from the environment that started "
+    "this launcher (credential passthrough is on). Claude Code uses {pronoun} "
+    "ahead of this project's own login in {config}, so every project started "
+    "this way shares that account or endpoint. Run `{cmd} {flag} off .` "
+    "unless {subject} {belong} to this project."
 )
 
 # Windows security identifiers and flags for the private session-directory
@@ -342,6 +368,9 @@ class LaunchConfig:
     config_dir_spelling: str = CONFIG_DIR_SPELLING_NATIVE
     legacy_binary: Optional[Tuple[str, ...]] = None
     legacy_version: Optional[str] = None
+    # Off unless the project opted in: inherited credential variables are
+    # removed from Claude Code's environment.
+    credential_passthrough: bool = False
 
 
 @dataclass(frozen=True)
@@ -760,6 +789,13 @@ def parse_launch_config(data: Any) -> LaunchConfig:
         config_dir_spelling=spelling,
         legacy_binary=legacy_binary,
         legacy_version=legacy_version,
+        # A launch.json written before the setting existed lacks the field;
+        # its absence keeps the safe default (credentials removed).
+        credential_passthrough=(
+            _config_bool(data, "credential_passthrough")
+            if "credential_passthrough" in data
+            else False
+        ),
     )
 
 
@@ -1127,26 +1163,53 @@ def parent_session_variables(environ: Mapping[str, str], os_name: str) -> List[s
     return names
 
 
+def is_credential_variable(name: str, os_name: str) -> bool:
+    """Return True for a credential, identity, or provider variable name.
+
+    Windows environment names are case insensitive, so they are compared
+    upper-cased there; POSIX names must match exactly.
+    """
+
+    comparable = name.upper() if os_name == "nt" else name
+    return comparable in CREDENTIAL_ENV_VARS or comparable.startswith(
+        CREDENTIAL_ENV_PREFIXES
+    )
+
+
 def credential_variables(environ: Mapping[str, str], os_name: str) -> List[str]:
     """Return the credential or provider variables set (non-empty) in environ."""
 
-    return [name for name in CREDENTIAL_ENV_VARS if env_lookup(environ, name, os_name)]
+    return sorted(
+        name
+        for name, value in environ.items()
+        if value and is_credential_variable(name, os_name)
+    )
 
 
-def credential_note(names: Sequence[str], config_dir: str) -> str:
+def credential_note(
+    names: Sequence[str],
+    config_dir: str,
+    *,
+    passthrough: bool = False,
+    command: str = "claude-wrangler",
+) -> str:
     """Render the once-per-session note naming inherited credential variables.
 
-    Only the variable names appear, never their values.
+    Only the variable names appear, never their values. The note says the
+    variables were removed, or, with ``passthrough``, that they were kept.
     """
 
     single = len(names) == 1
-    return CREDENTIAL_ENV_NOTE.format(
+    template = CREDENTIAL_PASSTHROUGH_NOTE if passthrough else CREDENTIAL_STRIPPED_NOTE
+    return template.format(
         names=", ".join(names),
         verb="is" if single else "are",
         pronoun="it" if single else "them",
         subject="it" if single else "they",
         belong="belongs" if single else "belong",
         config=config_dir,
+        cmd=command,
+        flag=CREDENTIAL_PASSTHROUGH_FLAG,
     )
 
 
@@ -1166,7 +1229,10 @@ def build_session_environment(
     suppression variables are set at every ring. Unless this is a nested
     launch of the same project, the variables of another Claude Code
     session (``parent_session_variables``) are dropped, and the cmd shims'
-    own helper variables never reach Claude Code.
+    own helper variables never reach Claude Code. Inherited credential,
+    identity, and provider variables (``is_credential_variable``) are
+    removed at every ring unless ``config.credential_passthrough`` is on,
+    so the project uses its own login in the pinned config dir.
 
     ``PATH`` gets the nested-``claude`` shim directory first. With
     ``slot_dir`` (Windows, see ``nested_claude_slot_dir``) the selected
@@ -1186,6 +1252,11 @@ def build_session_environment(
         env_pop(env, name, os_name)
     if not is_nested_launch(base, paths, os_name):
         for name in parent_session_variables(env, os_name):
+            env.pop(name, None)
+    if not config.credential_passthrough:
+        # Empty ones too: an empty provider switch is harmless, but the
+        # child should see no inherited account settings at all.
+        for name in [key for key in env if is_credential_variable(key, os_name)]:
             env.pop(name, None)
     if not shared_home:
         for name, value in redirected_home_environment(paths.home_dir, os_name).items():
@@ -3291,7 +3362,13 @@ def _launch(
         _emit(
             stderr,
             "{} {}".format(
-                MESSAGE_PREFIX, credential_note(credentials, paths.config_dir)
+                MESSAGE_PREFIX,
+                credential_note(
+                    credentials,
+                    paths.config_dir,
+                    passthrough=config.credential_passthrough,
+                    command=config.wrangler_command,
+                ),
             ),
         )
     if config.update_checks and not nested:

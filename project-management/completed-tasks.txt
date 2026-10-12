@@ -4,6 +4,21 @@ Record completed tasks with newest entries at the top. Use asterisk-plus-blank
 line formatting. Include concise outcomes, owners, blocker resolution notes,
 and ISO 8601 timestamps.
 
+* Inherited credentials removed by default
+  (`feature/windows-platform-support`, operator decision
+  2026-10-12T13:16:00-07:00: "do not inherit API keys"). The launcher
+  now removes every inherited `ANTHROPIC_*` variable,
+  `CLAUDE_CODE_OAUTH_*`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
+  `AWS_BEARER_TOKEN_BEDROCK`, the mTLS client certificate variables, and
+  the provider switches, at every ring, and names the removed ones once
+  per session. `--set-credential-passthrough on|off` (default off) keeps
+  them per project; metadata, `launch.json`, `--inspect`, and the local
+  README carry the setting. The variable list came from the 2.1.296
+  binary's strings checked against code.claude.com's env-vars and
+  authentication pages; AWS and Google SDK credential chains stay, since
+  commands Claude Code runs use them too. Owner: AI (Claude). Completed
+  2026-10-12T13:35:00-07:00.
+
 * Windows entry-point, launcher, and isolation review with fixes
   (`feature/windows-platform-support`). A four-stage review (reviewer,
   skeptic, fixer, re-checker) confirmed 16 Windows findings and refuted

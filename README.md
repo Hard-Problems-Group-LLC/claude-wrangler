@@ -44,6 +44,9 @@ The utility also supports:
 - per-project switches for launcher update notices
   (`--set-update-checks on|off`) and the native-Windows sandbox note
   (`--set-windows-sandbox-warning on|off`)
+- removal of inherited credential variables such as `ANTHROPIC_API_KEY`
+  by default, so one shell key never logs every project into the same
+  account (`--set-credential-passthrough on|off`)
 - automatic migration of projects installed by npm-based releases
 
 ## Why Project-Local Pinning
@@ -392,11 +395,21 @@ Notes:
   3.9+) with an argument list instead.
 - A session started from inside another Claude Code session (your
   global one, or another project's) does not inherit that session's
-  identity, messaging pipe, or token. Credentials in the environment
-  (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and the like) are
-  kept, because Claude Code prefers them to this project's own login,
-  and the launcher names them once per session so a user-wide key is
-  not mistaken for the project's account.
+  identity, messaging pipe, or token.
+- Credentials in the environment are removed by default. Claude Code
+  prefers them to this project's own login, so a key set in your shell
+  would make every project share one account. The launcher removes
+  every `ANTHROPIC_*` variable, `CLAUDE_CODE_OAUTH_*`,
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`, the
+  `CLAUDE_CODE_CLIENT_CERT`/`_KEY`/`_KEY_PASSPHRASE` client
+  certificate, and the provider switches (`CLAUDE_CODE_USE_BEDROCK`,
+  `_VERTEX`, `_FOUNDRY`, `_MANTLE`, `_ANTHROPIC_AWS`), at every ring,
+  and names the removed ones (never their values) once per session.
+  When the variables in your shell do belong to the project (set by
+  direnv, say), run `claude-wrangler --set-credential-passthrough on .`;
+  the launcher then passes them through and says so each session.
+  Credentials in the project's `.claude/settings.json` `env` block are
+  unaffected, because Claude Code applies those itself.
 - On Windows the launcher waits for Claude Code and returns its exit
   code. Ctrl+C is left to Claude Code, and a session that Ctrl+C ends
   reports exit code 130, as on POSIX. Killing the launcher process
@@ -740,11 +753,13 @@ The tool is intentionally suspicious.
   ask Windows for known folders, such as .NET tools, which get the real
   profile; the PowerShell module path; and machine-wide managed
   settings under `C:\Program Files\ClaudeCode`.
-- **Credentials in the environment.** `ANTHROPIC_API_KEY`,
-  `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and the Bedrock and
-  Vertex switches take precedence over a project's own login on every
-  operating system. The launcher names them once per session but does
-  not remove them.
+- **Credentials in the environment.** The launcher removes inherited
+  credential and provider variables (see Starting Claude Code) unless
+  the project turned `--set-credential-passthrough` on. It cannot
+  reach other credential sources: AWS and Google Cloud SDK credentials
+  (`AWS_PROFILE`, `GOOGLE_APPLICATION_CREDENTIALS`, and the like) stay
+  visible to the commands Claude Code runs, and an `apiKeyHelper` in
+  a settings file runs as configured.
 - **Windows Credential Manager outlives uninstall.** Claude Code may
   keep a login there under a name derived from the config-dir path.
   `--uninstall` cannot remove it and says so; run `/logout` in a project

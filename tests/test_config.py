@@ -308,6 +308,7 @@ def test_new_install_defaults(tmp_path):
     assert config.download_timeout_seconds == DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
     assert config.update_checks is True
     assert config.windows_sandbox_warning is True
+    assert config.credential_passthrough is False
     assert config.shared_home is False
     assert config.legacy is None
 
@@ -348,6 +349,12 @@ def test_toggle_only_preserves_existing_selection(tmp_path):
     config = config_from_args(parsed("--set-update-checks", "off", str(tmp_path)))
     assert config.reconfigure_only is True
     assert config.update_checks is False
+    config = config_from_args(
+        parsed("--set-credential-passthrough", "on", str(tmp_path))
+    )
+    assert config.reconfigure_only is True
+    assert config.credential_passthrough is True
+    assert config.claude_version == "2.1.287"
 
 
 def test_recorded_settings_and_paths_are_honored(tmp_path):
@@ -355,6 +362,7 @@ def test_recorded_settings_and_paths_are_honored(tmp_path):
         tmp_path,
         update_checks=False,
         windows_sandbox_warning=False,
+        credential_passthrough=True,
         release_base_url="https://mirror.example.com/r",
         shared_home=True,
         paths={"claude_home_dir": "state/home", "launcher": "tools/claude-local"},
@@ -362,6 +370,7 @@ def test_recorded_settings_and_paths_are_honored(tmp_path):
     config = config_from_args(parsed(str(tmp_path)))
     assert config.update_checks is False
     assert config.windows_sandbox_warning is False
+    assert config.credential_passthrough is True
     assert config.release_base_url == "https://mirror.example.com/r"
     assert config.shared_home is True
     assert config.layout.claude_home_relative == "state/home"
@@ -417,6 +426,7 @@ def test_determine_target_selection_for_reports_uses_existing_state():
         clear_reasonable_permissions=False,
         set_update_checks=None,
         set_windows_sandbox_warning=None,
+        set_credential_passthrough=None,
         repair_install=False,
     )
     assert determine_target_selection(args, existing, "inspect")[:3] == (

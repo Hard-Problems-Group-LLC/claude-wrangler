@@ -372,6 +372,20 @@ where practical.
 
 ### Security
 
+- The launcher removes inherited credential, identity, and provider
+  variables before starting Claude Code, because Claude Code prefers
+  them to the project's own login and a key set in a shell would
+  otherwise log every project into the same account. Removed: every
+  `ANTHROPIC_*` variable, `CLAUDE_CODE_OAUTH_*`,
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `AWS_BEARER_TOKEN_BEDROCK`,
+  the `CLAUDE_CODE_CLIENT_CERT`/`_KEY`/`_KEY_PASSPHRASE` client
+  certificate, and the Bedrock, Vertex, Foundry, Mantle, and Claude
+  Platform provider switches, at every ring. The removed names (never
+  their values) are listed once per session.
+  `--set-credential-passthrough on` keeps them for a project whose
+  shell variables belong to it; `--inspect` and the local README show
+  the setting. Behavior change: a project that relied on a key in the
+  launching shell needs that switch.
 - Release manifests are verified before they are parsed: the OpenPGP
   and raw RSA signatures must both verify against trust anchors
   compiled into the package, never read from the project, the network,
@@ -434,8 +448,7 @@ where practical.
   README documents cmd's re-parsing of `bin\claude-local.cmd`.
 - A project session started from another Claude Code session no longer
   inherits that session's identity, messaging pipe and token, or
-  secure-storage key, and the launcher names inherited credential
-  variables (never their values) once per session. The IDE port, entry
+  secure-storage key. The IDE port, entry
   point, and effort variables are dropped only when `CLAUDECODE` shows
   that another Claude Code session started the launch, because IDE
   terminals and Agent SDK hosts set them too.

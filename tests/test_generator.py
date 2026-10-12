@@ -1189,9 +1189,9 @@ def test_another_sessions_variables_never_reach_this_project(launched):
         "CLAUDE_CODE_SSE_PORT",
     ):
         assert name not in child_env, name
-    # Credentials are named, never echoed, and left for the operator to unset.
-    assert child_env["ANTHROPIC_API_KEY"] == "dummy-value-for-test"
-    assert b"ANTHROPIC_API_KEY" in completed.stderr
+    # Inherited credentials are removed, named, and never echoed.
+    assert "ANTHROPIC_API_KEY" not in child_env
+    assert b"removed ANTHROPIC_API_KEY" in completed.stderr
     assert b"dummy-value-for-test" not in completed.stderr
 
 

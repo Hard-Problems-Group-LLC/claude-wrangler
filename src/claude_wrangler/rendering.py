@@ -89,6 +89,7 @@ def build_metadata(
         "reasonable_permissions_enabled": config.reasonable_permissions_enabled,
         "update_checks": config.update_checks,
         "windows_sandbox_warning": config.windows_sandbox_warning,
+        "credential_passthrough": config.credential_passthrough,
         "release_base_url": config.release_base_url or DEFAULT_RELEASE_BASE_URL,
         "platform": config.platform_key,
         "launcher_python": config.launcher_python,
@@ -195,6 +196,7 @@ def build_launch_config(
         "reasonable_permissions": bool(config.reasonable_permissions_enabled),
         "windows_sandbox_warning": bool(config.windows_sandbox_warning),
         "update_checks": bool(config.update_checks),
+        "credential_passthrough": bool(config.credential_passthrough),
         "channel": channel,
         "suppression_env": suppression_env(),
         "settings_override": settings_override(),
@@ -667,10 +669,19 @@ def _ring_lines(config: Config) -> List[str]:
         "Shared at ring 1 on every OS, as on Linux: OpenSSH keys, config, and",
         "agent (Windows OpenSSH finds `~\\.ssh` from the account profile, not",
         "`USERPROFILE`), programs that ask Windows for known folders, the",
-        "PowerShell module path, machine-wide managed settings, and",
-        "credentials passed in environment variables. The launcher names any",
-        "`ANTHROPIC_API_KEY`-style credential variables it inherits, because",
-        "Claude Code prefers them to this project's own login.",
+        "PowerShell module path, and machine-wide managed settings.",
+        "",
+        "Inherited credentials: Claude Code prefers credential and provider",
+        "variables (`ANTHROPIC_API_KEY`, every other `ANTHROPIC_*` variable,",
+        "`CLAUDE_CODE_OAUTH_*`, `AWS_BEARER_TOKEN_BEDROCK`, and switches such",
+        "as `CLAUDE_CODE_USE_BEDROCK`) to this project's own login, so one",
+        "set in your shell would make every project share that account. The",
+        "launcher therefore removes them and names the removed ones (never",
+        "their values) once per session. Passthrough is currently {}.".format(
+            "on" if config.credential_passthrough else "off"
+        ),
+        "Run `{} --set-credential-passthrough on .` only when the".format(SCRIPT_NAME),
+        "variables in the launching environment belong to this project.",
         "",
     ]
 
@@ -765,6 +776,9 @@ def build_local_readme_content(config: Config, *, legacy_pending: bool = False) 
                 "enabled" if config.reasonable_permissions_enabled else "disabled"
             ),
             "- Update checks: `{}`".format("on" if config.update_checks else "off"),
+            "- Inherited credential passthrough: `{}`".format(
+                "on" if config.credential_passthrough else "off"
+            ),
             "- Known stable version: `{}`".format(
                 config.available_versions.get("stable") or "unavailable"
             ),

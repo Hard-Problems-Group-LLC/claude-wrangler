@@ -2238,31 +2238,121 @@ def test_cmd_shim_helper_variables_never_reach_claude() -> None:
         assert name not in env, name
 
 
-def test_inherited_credentials_are_named_once_per_session(project: Project) -> None:
-    secret = "dummy-value-for-test"
-    extra = {"ANTHROPIC_API_KEY": secret, "CLAUDE_CODE_USE_BEDROCK": "1"}
-    fresh = run(project, ["-p", "x"], extra_env=extra)
+INHERITED_CREDENTIALS = {
+    "ANTHROPIC_API_KEY": "dummy-value-for-test",
+    "ANTHROPIC_AUTH_TOKEN": "dummy-auth-token",
+    "ANTHROPIC_BASE_URL": "https://gateway.example.invalid",
+    "ANTHROPIC_FOUNDRY_API_KEY": "dummy-foundry-key",
+    "CLAUDE_CODE_OAUTH_TOKEN": "dummy-oauth-token",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "dummy-refresh-token",
+    "AWS_BEARER_TOKEN_BEDROCK": "dummy-bedrock-key",
+    "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE": "dummy-passphrase",
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+}
+
+
+def test_inherited_credentials_are_removed_and_named_once_per_session(
+    project: Project,
+) -> None:
+    fresh = run(project, ["-p", "x"], extra_env=INHERITED_CREDENTIALS)
     assert fresh.code == 0
+    for name in INHERITED_CREDENTIALS:
+        assert name not in fresh.env, name
     notes = [line for line in fresh.stderr.splitlines() if "ANTHROPIC_API_KEY" in line]
     assert len(notes) == 1
-    assert "CLAUDE_CODE_USE_BEDROCK" in notes[0]
-    assert secret not in fresh.stderr
-    # Credentials are left in place: stripping them would break deliberate
-    # per-project setups.
-    assert fresh.env["ANTHROPIC_API_KEY"] == secret
+    assert "removed" in notes[0] and "CLAUDE_CODE_USE_BEDROCK" in notes[0]
+    assert "--set-credential-passthrough on" in notes[0]
+    for value in INHERITED_CREDENTIALS.values():
+        if value != "1":
+            assert value not in fresh.stderr
     nested = run(
         project,
         ["-p", "x"],
-        extra_env=dict(extra, **{core.NOTICES_SHOWN_VAR: project.config_dir("posix")}),
+        extra_env=dict(
+            INHERITED_CREDENTIALS,
+            **{core.NOTICES_SHOWN_VAR: project.config_dir("posix")},
+        ),
     )
     assert "ANTHROPIC_API_KEY" not in nested.stderr
+    assert "ANTHROPIC_API_KEY" not in nested.env
+
+
+def test_credential_passthrough_keeps_inherited_credentials(project: Project) -> None:
+    project.write_config(credential_passthrough=True)
+    fresh = run(project, ["-p", "x"], extra_env=INHERITED_CREDENTIALS)
+    assert fresh.code == 0
+    for name, value in INHERITED_CREDENTIALS.items():
+        assert fresh.env[name] == value, name
+    notes = [line for line in fresh.stderr.splitlines() if "ANTHROPIC_API_KEY" in line]
+    assert len(notes) == 1
+    assert "passed through" in notes[0]
+    assert "--set-credential-passthrough off" in notes[0]
+    assert "dummy-value-for-test" not in fresh.stderr
+
+
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_credentials_are_removed_at_every_ring(os_name: str) -> None:
+    base = dict(base_environ(os_name), ANTHROPIC_API_KEY="k", CLAUDE_CODE_USE_VERTEX="")
+    for shared_home in (False, True):
+        env = session_env(os_name, shared_home=shared_home, base=base)
+        # The empty provider switch goes too.
+        assert "ANTHROPIC_API_KEY" not in env and "CLAUDE_CODE_USE_VERTEX" not in env
+
+
+def test_credential_names_match_by_prefix_and_list() -> None:
+    for name in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_PROFILE",
+        "ANTHROPIC_SOME_FUTURE_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    ):
+        assert core.is_credential_variable(name, "posix"), name
+    for name in (
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+        "CLAUDE_CONFIG_DIR",
+        "AWS_PROFILE",
+        "GH_TOKEN",
+    ):
+        assert not core.is_credential_variable(name, "posix"), name
+    # Windows names are case insensitive; POSIX names are not.
+    assert core.is_credential_variable("Anthropic_Api_Key", "nt")
+    assert not core.is_credential_variable("anthropic_api_key", "posix")
+
+
+def test_windows_removes_credentials_spelled_in_any_case() -> None:
+    base = dict(base_environ("nt"), Anthropic_Api_Key="k", claude_code_use_bedrock="1")
+    env = session_env("nt", shared_home=False, base=base)
+    assert "Anthropic_Api_Key" not in env and "claude_code_use_bedrock" not in env
+
+
+def test_launch_config_without_the_passthrough_field_removes_credentials() -> None:
+    assert load_config().credential_passthrough is False
+    assert load_config(credential_passthrough=True).credential_passthrough is True
+    with pytest.raises(core.LaunchConfigError):
+        load_config(credential_passthrough=1)
 
 
 def test_credential_note_grammar() -> None:
     one = core.credential_note(["ANTHROPIC_API_KEY"], "/r/.local/claude")
-    assert "ANTHROPIC_API_KEY is set" in one and "unless it belongs" in one
+    assert "removed ANTHROPIC_API_KEY" in one and "If it belongs" in one
+    assert "to pass it through" in one
     two = core.credential_note(["A", "B"], "/r/.local/claude")
-    assert "A, B are set" in two and "unless they belong" in two
+    assert "removed A, B" in two and "If they belong" in two
+    kept = core.credential_note(["A"], "/r/.local/claude", passthrough=True)
+    assert "A is passed through" in kept and "unless it belongs" in kept
+    kept_two = core.credential_note(
+        ["A", "B"], "/r/.local/claude", passthrough=True, command="cw"
+    )
+    assert "A, B are passed through" in kept_two
+    assert "`cw --set-credential-passthrough off .`" in kept_two
 
 
 # ---------------------------------------------------------------------------
