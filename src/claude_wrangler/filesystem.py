@@ -1,4 +1,13 @@
-"""Managed filesystem mutation helpers."""
+"""Managed filesystem mutation helpers.
+
+Line-ending policy: every helper here reads and writes text byte-exactly
+(UTF-8, no platform newline translation), so a file generated on Windows
+is identical to one generated on POSIX. Python's default text mode would
+silently turn `\\n` into `\\r\\n` on Windows, which breaks generated POSIX
+shell scripts, and re-writing already-CRLF text in that mode is how
+`\\r\\r\\n` sequences appear in `.gitignore` files, where Git then keeps a
+stray `\\r` in each pattern and stops matching it.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +20,58 @@ from .constants import GITIGNORE_BEGIN, GITIGNORE_END, README_MARKER, SCRIPT_MAR
 from .models import ClaudeWranglerError, Config
 from .runtime import eprint
 
+LF = "\n"
+CRLF = "\r\n"
+
+
+def read_text_exact(path: Path) -> str:
+    """Return a UTF-8 file's text without any newline translation."""
+
+    return path.read_bytes().decode("utf-8")
+
+
+def write_text_exact(path: Path, text: str) -> None:
+    """Write text as UTF-8 bytes exactly as given, with no newline translation."""
+
+    path.write_bytes(text.encode("utf-8"))
+
+
+def normalize_newlines(text: str, newline: str) -> str:
+    """Return text with every CRLF, CR, or LF line break spelled as newline."""
+
+    if newline not in (LF, CRLF):
+        raise ClaudeWranglerError(
+            "Unsupported newline convention: {!r}".format(newline)
+        )
+    unified = text.replace(CRLF, LF).replace("\r", LF)
+    if newline == LF:
+        return unified
+    return unified.replace(LF, CRLF)
+
+
+def detect_newline_convention(text: str) -> str:
+    """Return CRLF only when every line break in text is CRLF, else LF.
+
+    LF is the default for empty, LF-only, and mixed files. A file that is
+    consistently CRLF (typical for a Windows checkout with
+    `core.autocrlf=true`) keeps CRLF so an edit does not flip every line.
+    """
+
+    lf_count = text.count(LF)
+    if lf_count and text.count(CRLF) == lf_count:
+        return CRLF
+    return LF
+
 
 def _block_end_index(text: str, marker: str) -> int:
-    """Return the index just after the marker line, even at EOF."""
+    """Return the index just after the marker line, even at EOF.
+
+    The search stops at LF, so a CRLF (or a damaged `\\r\\r\\n`) line
+    ending on the marker line is consumed together with the marker.
+    """
 
     start = text.index(marker)
-    newline_index = text.find("\n", start)
+    newline_index = text.find(LF, start)
     if newline_index == -1:
         return len(text)
     return newline_index + 1
@@ -33,11 +88,16 @@ def upsert_gitignore_block(
     other tools, such as TheKnowledge's managed-ignores block or
     codex-wrangler's block, are left exactly as found even when their
     entries overlap with ours.
+
+    The block is written with LF line endings on every platform, unless
+    the existing file is consistently CRLF, in which case the block
+    follows that convention. Bytes outside the block are never rewritten,
+    and the block itself can never contain `\\r\\r\\n`.
     """
 
     existing_text = ""
     if gitignore_path.exists():
-        existing_text = gitignore_path.read_text(encoding="utf-8")
+        existing_text = read_text_exact(gitignore_path)
 
     if GITIGNORE_BEGIN in existing_text and GITIGNORE_END not in existing_text:
         raise ClaudeWranglerError(
@@ -45,19 +105,27 @@ def upsert_gitignore_block(
             "{}. Refusing to guess.".format(gitignore_path)
         )
 
+    newline = detect_newline_convention(existing_text)
+    managed_block = normalize_newlines(block_text, newline)
+
     if GITIGNORE_BEGIN in existing_text and GITIGNORE_END in existing_text:
         begin_index = existing_text.index(GITIGNORE_BEGIN)
         end_index = _block_end_index(existing_text, GITIGNORE_END)
         replacement = (
-            existing_text[:begin_index] + block_text + existing_text[end_index:]
+            existing_text[:begin_index] + managed_block + existing_text[end_index:]
         )
     else:
         prefix = existing_text
-        if prefix and not prefix.endswith("\n"):
-            prefix += "\n"
-        if prefix and not prefix.endswith("\n\n"):
-            prefix += "\n"
-        replacement = prefix + block_text
+        if prefix.endswith("\r"):
+            # Complete a dangling CR instead of appending a second one,
+            # which would create `\r\r\n`.
+            prefix += LF
+        elif prefix and not prefix.endswith(LF):
+            prefix += newline
+        # Separate the appended block from user entries by one blank line.
+        if prefix and not prefix.endswith(newline + newline):
+            prefix += newline
+        replacement = prefix + managed_block
 
     if replacement == existing_text:
         eprint("[claude-wrangler] .gitignore block already up to date")
@@ -69,16 +137,20 @@ def upsert_gitignore_block(
         return
 
     gitignore_path.parent.mkdir(parents=True, exist_ok=True)
-    gitignore_path.write_text(replacement, encoding="utf-8")
+    write_text_exact(gitignore_path, replacement)
 
 
 def remove_gitignore_block(gitignore_path: Path, dry_run: bool) -> bool:
-    """Remove the managed `.gitignore` block if it exists."""
+    """Remove the managed `.gitignore` block if it exists.
+
+    Bytes outside the block are preserved; only trailing blank lines are
+    trimmed, and the final line break follows the file's own convention.
+    """
 
     if not gitignore_path.exists():
         return False
 
-    existing_text = gitignore_path.read_text(encoding="utf-8")
+    existing_text = read_text_exact(gitignore_path)
     if GITIGNORE_BEGIN not in existing_text:
         return False
     if GITIGNORE_END not in existing_text:
@@ -87,17 +159,18 @@ def remove_gitignore_block(gitignore_path: Path, dry_run: bool) -> bool:
             "{}. Refusing to guess.".format(gitignore_path)
         )
 
+    newline = detect_newline_convention(existing_text)
     begin_index = existing_text.index(GITIGNORE_BEGIN)
     end_index = _block_end_index(existing_text, GITIGNORE_END)
     replacement = existing_text[:begin_index] + existing_text[end_index:]
-    replacement = replacement.rstrip() + ("\n" if replacement.strip() else "")
+    replacement = replacement.rstrip() + (newline if replacement.strip() else "")
 
     action = "Would remove" if dry_run else "Removing"
     eprint("[claude-wrangler] {} managed block from {}".format(action, gitignore_path))
     if dry_run:
         return True
 
-    gitignore_path.write_text(replacement, encoding="utf-8")
+    write_text_exact(gitignore_path, replacement)
     return True
 
 
@@ -109,11 +182,20 @@ def write_text_file(
     executable: bool = False,
     managed_markers: Sequence[str] = (),
     managed_content_predicate: Optional[Callable[[str], bool]] = None,
+    newline: Optional[str] = None,
 ) -> None:
-    """Write a deterministic text file with conservative overwrite rules."""
+    """Write a deterministic text file with conservative overwrite rules.
+
+    The content is written byte-exactly on every platform. Pass `newline`
+    ("\\n" or "\\r\\n") to normalize every line break first, for example
+    CRLF for `.cmd` files; leave it as None to keep content as given.
+    """
+
+    if newline is not None:
+        content = normalize_newlines(content, newline)
 
     if path.exists():
-        existing = path.read_text(encoding="utf-8")
+        existing = read_text_exact(path)
         if existing == content:
             eprint("[claude-wrangler] Unchanged: {}".format(path))
             if executable and not dry_run:
@@ -136,7 +218,7 @@ def write_text_file(
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    write_text_exact(path, content)
     if executable:
         path.chmod(path.stat().st_mode | 0o111)
 
@@ -150,10 +232,7 @@ def write_metadata(path: Path, payload: Dict[str, object], dry_run: bool) -> Non
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_text_exact(path, json.dumps(payload, indent=2, sort_keys=True) + LF)
 
 
 def ensure_managed_directories(config: Config) -> None:
@@ -223,7 +302,12 @@ def remove_file_if_managed(
     dry_run: bool,
     label: str,
 ) -> bool:
-    """Remove a generated file only when ownership can be proven."""
+    """Remove a generated file only when ownership can be proven.
+
+    Content is compared without regard to line-ending convention, so a
+    generated file that Git or an editor converted between LF and CRLF
+    still proves ownership.
+    """
 
     if not path.exists() and not path.is_symlink():
         return False
@@ -236,9 +320,12 @@ def remove_file_if_managed(
             )
         )
 
-    actual_content = path.read_text(encoding="utf-8")
+    actual_content = read_text_exact(path)
     marker_present = SCRIPT_MARKER in actual_content or README_MARKER in actual_content
-    if actual_content != expected_content and not (marker_present and force):
+    content_matches = normalize_newlines(actual_content, LF) == normalize_newlines(
+        expected_content, LF
+    )
+    if not content_matches and not (marker_present and force):
         raise ClaudeWranglerError(
             "Refusing to remove {} because it does not exactly match the "
             "expected generated content. Use --force to override.".format(path)

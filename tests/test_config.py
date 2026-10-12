@@ -1,6 +1,8 @@
 """Tests for argument parsing and configuration normalization."""
 
 import argparse
+import json
+import os
 
 import pytest
 
@@ -105,6 +107,38 @@ def test_determine_shared_home_honors_explicit_flag():
 def test_resolve_relative_within_root_rejects_escape(tmp_path):
     with pytest.raises(ClaudeWranglerError):
         resolve_relative_within_root(tmp_path, "../escape", "test")
+
+
+def test_resolve_relative_within_root_rejects_absolute_path(tmp_path):
+    with pytest.raises(ClaudeWranglerError, match="must be relative"):
+        resolve_relative_within_root(tmp_path, str(tmp_path / "inside"), "test")
+
+
+def test_resolve_relative_within_root_returns_posix_spelling(tmp_path):
+    relative, resolved = resolve_relative_within_root(
+        tmp_path, "bin/../bin/./custom-claude", "test"
+    )
+
+    assert relative == "bin/custom-claude"
+    assert resolved == (tmp_path / "bin" / "custom-claude").resolve()
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="backslash is a path separator only on Windows"
+)
+def test_resolve_relative_within_root_normalizes_windows_separators(tmp_path):
+    relative, _ = resolve_relative_within_root(tmp_path, "bin\\custom-claude", "test")
+
+    assert relative == "bin/custom-claude"
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="rooted and drive-relative paths exist only on Windows"
+)
+@pytest.mark.parametrize("raw", ["\\escape", "C:escape", "/escape"])
+def test_resolve_relative_within_root_rejects_windows_anchored_paths(tmp_path, raw):
+    with pytest.raises(ClaudeWranglerError, match="must be relative"):
+        resolve_relative_within_root(tmp_path, raw, "test")
 
 
 def test_parse_args_requires_upgrade_channel():
@@ -282,18 +316,19 @@ def test_config_from_args_toggle_only_preserves_existing_selection(tmp_path):
         ' {"version": "2.1.150"}}}',
         encoding="utf-8",
     )
+    # json.dumps escapes Windows backslashes; %-formatting the path into a
+    # JSON literal produced invalid escapes such as `\U` on Windows.
     (local_dir / ".claude-wrangler.json").write_text(
-        (
-            "{"
-            '"project_root": "%s", '
-            '"claude_selector": "latest", '
-            '"claude_channel": "stable", '
-            '"claude_version": "2.1.150", '
-            '"version_source": "existing metadata", '
-            '"reasonable_permissions_enabled": false'
-            "}"
-        )
-        % tmp_path,
+        json.dumps(
+            {
+                "project_root": str(tmp_path),
+                "claude_selector": "latest",
+                "claude_channel": "stable",
+                "claude_version": "2.1.150",
+                "version_source": "existing metadata",
+                "reasonable_permissions_enabled": False,
+            }
+        ),
         encoding="utf-8",
     )
 

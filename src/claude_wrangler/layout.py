@@ -31,10 +31,19 @@ def resolve_relative_within_root(
     raw_relative_path: str,
     label: str,
 ) -> Tuple[str, Path]:
-    """Resolve a relative path and prove it stays beneath project_root."""
+    """Resolve a relative path and prove it stays beneath project_root.
+
+    The returned relative spelling always uses POSIX `/` separators, even
+    on Windows, because it is recorded in metadata and embedded in the
+    `.gitignore` block and generated launcher scripts, all of which must
+    read the same on every operating system that shares a checkout.
+    """
 
     relative_path = Path(raw_relative_path)
-    if relative_path.is_absolute():
+    # On Windows, `\foo` (rooted, no drive) and `C:foo` (drive-relative)
+    # are not "absolute" to pathlib yet would not stay under the project
+    # root, so any anchor at all is rejected.
+    if relative_path.is_absolute() or relative_path.drive or relative_path.root:
         raise ClaudeWranglerError(
             "{} must be relative to the project root, not absolute: {}".format(
                 label, raw_relative_path
@@ -57,7 +66,7 @@ def resolve_relative_within_root(
             )
         ) from exc
 
-    return str(normalized_relative), resolved
+    return normalized_relative.as_posix(), resolved
 
 
 def build_layout(

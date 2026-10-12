@@ -1,14 +1,31 @@
-"""Helpers for installing claude-wrangler into a dedicated user venv."""
+"""Helpers for installing claude-wrangler into a dedicated user venv.
+
+The user-facing launcher is a symlink to the venv's console script on
+POSIX. On Windows it is a copied `claude-wrangler.exe`: pip's console
+launcher embeds the absolute path of its venv interpreter, so a copy keeps
+working from any directory, while symlinks need Developer Mode or an
+elevated token. A running `.exe` cannot be overwritten or deleted on
+Windows but can be renamed, so a refresh renames a busy launcher aside and
+later refreshes delete those retired copies once they are no longer in use.
+The installers never edit `PATH`; they print the command that adds the
+launcher directory when it is missing.
+"""
 
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
+import ntpath
 import os
 from pathlib import Path
+import posixpath
+import shlex
+import shutil
 import subprocess
 import sys
-from typing import Optional, Sequence
+from typing import List, Mapping, Optional, Sequence
+import uuid
 
 from claude_wrangler.install_scope import (
     default_pyenv_root as default_install_pyenv_root,
@@ -22,6 +39,17 @@ DEFAULT_LAUNCHER_NAME = "claude-wrangler"
 DEFAULT_VENV = default_tool_venv(Path.home(), DEFAULT_LAUNCHER_NAME)
 DEFAULT_BIN_DIR = default_user_bin_dir(Path.home())
 PYTHON_ENVIRONMENTS_FILE = "python-environments.json"
+WINDOWS_LAUNCHER_SUFFIX = ".exe"
+# A replaced Windows launcher that was still running is renamed to
+# "<launcher>.old-<token>" so the new copy can take its name.
+RETIRED_LAUNCHER_INFIX = ".old-"
+STAGED_LAUNCHER_SUFFIX = ".new"
+
+
+def _windows(windows: Optional[bool]) -> bool:
+    """Return the injected Windows flag, defaulting to the running OS."""
+
+    return os.name == "nt" if windows is None else windows
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -82,8 +110,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Directory that will receive the user-facing launcher symlink. "
-            "Defaults to <user-home>/.local/bin."
+            "Directory that will receive the user-facing launcher: a symlink, "
+            "or a copied .exe on Windows. Defaults to <user-home>/.local/bin."
         ),
     )
     parser.add_argument(
@@ -104,32 +132,47 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def venv_bin_dir(venv_path: Path) -> Path:
+def venv_bin_dir(venv_path: Path, *, windows: Optional[bool] = None) -> Path:
     """Return the platform-specific venv executable directory."""
 
-    return venv_path / ("Scripts" if os.name == "nt" else "bin")
+    return venv_path / ("Scripts" if _windows(windows) else "bin")
 
 
-def pyenv_python_path(pyenv_root: Path, environment_name: str) -> Path:
-    """Return the Python path for one installed pyenv environment name."""
+def pyenv_python_path(
+    pyenv_root: Path,
+    environment_name: str,
+    *,
+    windows: Optional[bool] = None,
+) -> Path:
+    """Return the Python path for one installed pyenv environment name.
 
-    executable = "python.exe" if os.name == "nt" else "python"
-    bin_dir = "Scripts" if os.name == "nt" else "bin"
-    return pyenv_root / "versions" / environment_name / bin_dir / executable
+    POSIX pyenv keeps the interpreter at `versions/<name>/bin/python`;
+    pyenv-win keeps full Windows installs, with `python.exe` directly under
+    `versions/<name>`.
+    """
+
+    version_dir = pyenv_root / "versions" / environment_name
+    if _windows(windows):
+        return version_dir / "python.exe"
+    return version_dir / "bin" / "python"
 
 
-def venv_python_path(venv_path: Path) -> Path:
+def venv_python_path(venv_path: Path, *, windows: Optional[bool] = None) -> Path:
     """Return the virtual environment Python executable path."""
 
-    executable = "python.exe" if os.name == "nt" else "python"
-    return venv_bin_dir(venv_path) / executable
+    executable = "python.exe" if _windows(windows) else "python"
+    return venv_bin_dir(venv_path, windows=windows) / executable
 
 
-def installed_command_path(venv_path: Path) -> Path:
+def installed_command_path(venv_path: Path, *, windows: Optional[bool] = None) -> Path:
     """Return the venv-installed claude-wrangler command path."""
 
-    executable = "claude-wrangler.exe" if os.name == "nt" else "claude-wrangler"
-    return venv_bin_dir(venv_path) / executable
+    executable = (
+        DEFAULT_LAUNCHER_NAME + WINDOWS_LAUNCHER_SUFFIX
+        if _windows(windows)
+        else DEFAULT_LAUNCHER_NAME
+    )
+    return venv_bin_dir(venv_path, windows=windows) / executable
 
 
 def build_package_spec(repo_root: Path, *, dev: bool) -> str:
@@ -176,9 +219,16 @@ def managed_runtime_python(
     selection = load_managed_runtime_name(repo_root)
     if selection is None:
         return None
-    candidate = pyenv_python_path(default_pyenv_root(user_home), selection)
-    if candidate.is_file():
-        return candidate
+    pyenv_root = default_pyenv_root(user_home)
+    roots = [pyenv_root]
+    if os.name == "nt":
+        # pyenv-win installs under <home>/.pyenv/pyenv-win and normally sets
+        # PYENV_ROOT to that directory; accept the unset-variable layout too.
+        roots.append(pyenv_root / "pyenv-win")
+    for root in roots:
+        candidate = pyenv_python_path(root, selection)
+        if candidate.is_file():
+            return candidate
     return None
 
 
@@ -253,27 +303,255 @@ def install_build_bootstrap(venv_python: Path) -> None:
     subprocess.run(build_bootstrap_command(venv_python), check=True)
 
 
-def ensure_launcher(bin_dir: Path, launcher_name: str, target: Path) -> Path:
-    """Create or refresh the stable user-facing launcher symlink."""
+def launcher_path(
+    bin_dir: Path,
+    launcher_name: str,
+    *,
+    windows: Optional[bool] = None,
+) -> Path:
+    """Return the launcher path; Windows needs a PATHEXT-visible `.exe` name."""
+
+    if _windows(windows) and not launcher_name.lower().endswith(
+        WINDOWS_LAUNCHER_SUFFIX
+    ):
+        return bin_dir / (launcher_name + WINDOWS_LAUNCHER_SUFFIX)
+    return bin_dir / launcher_name
+
+
+def _symlink_points_to(link: Path, target: Path) -> bool:
+    """Return True when `link` is a symlink that resolves to `target`."""
+
+    return link.is_symlink() and link.resolve(strict=False) == target.resolve(
+        strict=False
+    )
+
+
+def _same_file_contents(left: Path, right: Path) -> bool:
+    """Return True when both regular files exist with identical bytes."""
+
+    try:
+        return (
+            left.is_file()
+            and right.is_file()
+            and filecmp.cmp(str(left), str(right), shallow=False)
+        )
+    except OSError:
+        return False
+
+
+def retired_launcher_paths(path: Path) -> List[Path]:
+    """Return renamed-aside copies of one launcher, sorted by name."""
+
+    prefix = path.name + RETIRED_LAUNCHER_INFIX
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError:
+        return []
+    return sorted(entry for entry in entries if entry.name.startswith(prefix))
+
+
+def cleanup_retired_launchers(path: Path) -> List[Path]:
+    """Delete retired launcher copies that are no longer running.
+
+    Best effort: a copy that is still running cannot be deleted on Windows
+    and stays until a later refresh.
+    """
+
+    removed: List[Path] = []
+    for retired in retired_launcher_paths(path):
+        try:
+            retired.unlink()
+        except OSError:
+            continue
+        removed.append(retired)
+    return removed
+
+
+def _retire_launcher(path: Path) -> Path:
+    """Rename one in-use launcher aside so a new copy can take its name."""
+
+    retired = path.with_name(
+        "{}{}{}".format(path.name, RETIRED_LAUNCHER_INFIX, uuid.uuid4().hex[:12])
+    )
+    os.replace(str(path), str(retired))
+    return retired
+
+
+def _install_launcher_copy(target: Path, path: Path) -> None:
+    """Copy `target` to `path`, renaming a running launcher aside first."""
+
+    staged = path.with_name(path.name + STAGED_LAUNCHER_SUFFIX)
+    shutil.copy2(str(target), str(staged))
+    try:
+        try:
+            os.replace(str(staged), str(path))
+            return
+        except PermissionError:
+            # Windows refuses to overwrite a running .exe but allows renaming
+            # it, so move the busy launcher aside and retry once.
+            if not path.exists():
+                raise
+        retired = _retire_launcher(path)
+        try:
+            os.replace(str(staged), str(path))
+        except OSError:
+            # Put the previous launcher back rather than leave none.
+            try:
+                os.replace(str(retired), str(path))
+            except OSError:
+                pass
+            raise
+    except OSError:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def ensure_launcher(
+    bin_dir: Path,
+    launcher_name: str,
+    target: Path,
+    *,
+    windows: Optional[bool] = None,
+) -> Path:
+    """Create or refresh the stable user-facing launcher.
+
+    POSIX gets a symlink named `launcher_name`. Windows gets a copied
+    `<launcher_name>.exe`; an older extensionless symlink to the same target
+    is removed, and an unchanged copy is left alone so a running launcher is
+    not renamed aside without need.
+    """
 
     bin_dir.mkdir(parents=True, exist_ok=True)
-    launcher_path = bin_dir / launcher_name
-    if launcher_path.is_symlink() or launcher_path.exists():
-        launcher_path.unlink()
-    launcher_path.symlink_to(target)
-    return launcher_path
+    if not _windows(windows):
+        path = bin_dir / launcher_name
+        if path.is_symlink() or path.exists():
+            path.unlink()
+        path.symlink_to(target)
+        return path
+
+    path = launcher_path(bin_dir, launcher_name, windows=True)
+    legacy = bin_dir / launcher_name
+    if legacy != path and _symlink_points_to(legacy, target):
+        legacy.unlink()
+    cleanup_retired_launchers(path)
+    if not path.is_symlink() and _same_file_contents(target, path):
+        return path
+    _install_launcher_copy(target, path)
+    return path
 
 
-def remove_launcher_if_owned(bin_dir: Path, launcher_name: str, target: Path) -> bool:
-    """Remove one launcher only when it points at the expected owned target."""
+def remove_launcher_if_owned(
+    bin_dir: Path,
+    launcher_name: str,
+    target: Path,
+    *,
+    windows: Optional[bool] = None,
+) -> bool:
+    """Remove one launcher only when it is the expected owned launcher.
 
-    launcher_path = bin_dir / launcher_name
-    if not launcher_path.is_symlink():
-        return False
-    if launcher_path.resolve(strict=False) != target.resolve(strict=False):
-        return False
-    launcher_path.unlink()
-    return True
+    A symlink is owned when it resolves to `target`. On Windows a copied
+    `.exe` is owned when its bytes match `target`; a copy that is still
+    running is renamed aside for a later cleanup instead.
+    """
+
+    if not _windows(windows):
+        path = bin_dir / launcher_name
+        if not _symlink_points_to(path, target):
+            return False
+        path.unlink()
+        return True
+
+    removed = False
+    path = launcher_path(bin_dir, launcher_name, windows=True)
+    for candidate in dict.fromkeys([path, bin_dir / launcher_name]):
+        if _symlink_points_to(candidate, target):
+            candidate.unlink()
+            removed = True
+        elif (
+            not candidate.is_symlink()
+            and candidate.suffix.lower() == WINDOWS_LAUNCHER_SUFFIX
+            and _same_file_contents(target, candidate)
+        ):
+            try:
+                candidate.unlink()
+            except PermissionError:
+                _retire_launcher(candidate)
+            removed = True
+    cleanup_retired_launchers(path)
+    return removed
+
+
+def _comparable_path(value: str, windows: bool) -> str:
+    """Return a normalized spelling of one directory for PATH comparisons."""
+
+    expanded = os.path.expandvars(os.path.expanduser(value.strip().strip('"')))
+    if windows:
+        return ntpath.normcase(ntpath.normpath(expanded)).rstrip("\\")
+    return posixpath.normpath(expanded).rstrip("/") or "/"
+
+
+def directory_on_path(
+    directory: Path,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    windows: Optional[bool] = None,
+) -> bool:
+    """Return True when `directory` is one of the PATH entries."""
+
+    windows = _windows(windows)
+    env = os.environ if environ is None else environ
+    raw_path = env.get("PATH")
+    if raw_path is None and windows:
+        raw_path = env.get("Path", "")
+    separator = ";" if windows else ":"
+    wanted = _comparable_path(str(directory), windows)
+    return any(
+        entry.strip() and _comparable_path(entry, windows) == wanted
+        for entry in (raw_path or "").split(separator)
+    )
+
+
+def path_hint(
+    bin_dir: Path,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    windows: Optional[bool] = None,
+) -> Optional[str]:
+    """Return how to add `bin_dir` to PATH, or None when it is already there.
+
+    The installers only print this; they never edit PATH or run setx,
+    which truncates long values.
+    """
+
+    windows = _windows(windows)
+    if directory_on_path(bin_dir, environ=environ, windows=windows):
+        return None
+    if windows:
+        quoted = str(bin_dir).replace("'", "''")
+        return (
+            "{} is not on PATH. To add it for your user, run this in "
+            "PowerShell, then open a new terminal:\n"
+            "  [Environment]::SetEnvironmentVariable('Path', "
+            "[Environment]::GetEnvironmentVariable('Path', 'User') + "
+            "';{}', 'User')".format(bin_dir, quoted)
+        )
+    return (
+        "{} is not on PATH. Add this line to your shell profile, then open a "
+        'new shell:\n  export PATH={}:"$PATH"'.format(
+            bin_dir, shlex.quote(str(bin_dir))
+        )
+    )
+
+
+def print_path_hint(bin_dir: Path) -> None:
+    """Print the PATH hint for `bin_dir` when it is not on PATH."""
+
+    hint = path_hint(bin_dir)
+    if hint is not None:
+        print("PATH: {}".format(hint))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -313,7 +591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             check=True,
         )
-        launcher_path = ensure_launcher(
+        installed_launcher = ensure_launcher(
             bin_dir,
             args.launcher_name,
             installed_command_path(venv_path),
@@ -332,7 +610,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print("Python: {}".format(python_executable))
     print("Virtualenv: {}".format(venv_path))
-    print("Launcher: {}".format(launcher_path))
+    print("Launcher: {}".format(installed_launcher))
+    print_path_hint(bin_dir)
     return 0
 
 
@@ -343,15 +622,21 @@ __all__ = [
     "build_install_command",
     "build_bootstrap_command",
     "build_package_spec",
+    "cleanup_retired_launchers",
     "default_pyenv_root",
+    "directory_on_path",
     "ensure_launcher",
     "installed_command_path",
+    "launcher_path",
     "load_managed_runtime_name",
     "main",
     "managed_runtime_python",
     "parse_args",
+    "path_hint",
+    "print_path_hint",
     "pyenv_python_path",
     "remove_launcher_if_owned",
+    "retired_launcher_paths",
     "select_install_python",
     "venv_bin_dir",
     "venv_python_path",

@@ -1,4 +1,12 @@
-"""Project-specific install hook for repo-bound dev and standard installs."""
+"""Project-specific install hook for repo-bound dev and standard installs.
+
+Stage 2 of the managed installer runs this hook with the target venv and
+launcher directory. Launcher publication follows `installer.ensure_launcher`:
+a symlink on POSIX and a copied `claude-wrangler.exe` on Windows. A
+filesystem error while publishing the launcher (for example a locked file
+or a missing symlink privilege) is reported as a clean FAIL, and a launcher
+directory that is not on `PATH` produces a hint, never a `PATH` edit.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ from claude_wrangler.installer import (
     build_install_command,
     ensure_launcher,
     installed_command_path,
+    print_path_hint,
     remove_launcher_if_owned,
 )
 
@@ -166,7 +175,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bin_dir=bin_dir,
             launcher_name=args.launcher_name,
         )
-    except (RuntimeError, subprocess.CalledProcessError, ValueError) as error:
+    except (RuntimeError, subprocess.CalledProcessError, ValueError, OSError) as error:
         print("[install-project] FAIL: {}".format(error), file=sys.stderr)
         return 1
 
@@ -181,6 +190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Launcher: no launcher change.")
     else:
         print("Launcher: {}".format(launcher_path))
+        print_path_hint(bin_dir)
     return 0
 
 

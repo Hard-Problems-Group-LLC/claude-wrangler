@@ -24,7 +24,11 @@ def test_helper_command_targets_theknowledge_script() -> None:
     command = git_commit_with_changelog.helper_command(["-m", "example"])
 
     assert command[0] == sys.executable
-    assert command[1].endswith("TheKnowledge/scripts/git_standard_commit_push.py")
+    # The helper path keeps native separators for subprocess use, so compare
+    # paths rather than a POSIX-spelled string suffix.
+    assert Path(command[1]) == (
+        ROOT / "TheKnowledge" / "scripts" / "git_standard_commit_push.py"
+    )
     assert command[-2:] == ["-m", "example"]
 
 

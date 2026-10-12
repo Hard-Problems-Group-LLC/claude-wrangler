@@ -26,7 +26,9 @@ def load_tool_validation_profiles_module():
 
 def test_ensure_virtualenv_keeps_matching_existing_environment(tmp_path, monkeypatch):
     module = load_dev_setup_module()
-    venv_python = tmp_path / "venv" / "bin" / "python"
+    # dev_setup.py picks Scripts/python.exe on Windows and bin/python
+    # elsewhere; ask the module instead of hard-coding the POSIX layout.
+    venv_python = module.venv_python_path(tmp_path / "venv")
     venv_python.parent.mkdir(parents=True)
     venv_python.write_text("", encoding="utf-8")
     commands = []
@@ -42,7 +44,9 @@ def test_ensure_virtualenv_keeps_matching_existing_environment(tmp_path, monkeyp
 
 def test_ensure_virtualenv_rebuilds_when_python_version_differs(tmp_path, monkeypatch):
     module = load_dev_setup_module()
-    venv_python = tmp_path / "venv" / "bin" / "python"
+    # dev_setup.py picks Scripts/python.exe on Windows and bin/python
+    # elsewhere; ask the module instead of hard-coding the POSIX layout.
+    venv_python = module.venv_python_path(tmp_path / "venv")
     venv_python.parent.mkdir(parents=True)
     venv_python.write_text("", encoding="utf-8")
     commands = []

@@ -1,0 +1,14 @@
+# Windows batch files keep CRLF line endings in every checkout, including
+# Linux and macOS ones. cmd.exe reads batch files with CRLF assumptions:
+# LF-only copies can mis-parse labels, GOTO targets, and long lines.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# *.sh and *.py are deliberately not pinned to LF here. TheKnowledge's
+# drift report compares managed starter files (install.sh, the stage-2
+# scripts, and so on) byte for byte against the TheKnowledge working tree,
+# which has no .gitattributes of its own, so an eol=lf rule here would make
+# every managed script report as drifted on Windows checkouts that use
+# core.autocrlf. The generated files that POSIX shells read at run time
+# (bin/claude-local and its peers) are written by claude-wrangler with
+# explicit LF line endings instead.

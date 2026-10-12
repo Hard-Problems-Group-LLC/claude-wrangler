@@ -23,7 +23,11 @@ STANDARD_HELPER = REPO_ROOT / "TheKnowledge" / "scripts" / "git_standard_commit_
 
 
 def helper_command(arguments: Sequence[str]) -> list[str]:
-    """Return the delegated standard-helper command line."""
+    """Return the delegated standard-helper command line.
+
+    The helper path uses native separators because it is passed straight
+    to `subprocess.run`, never embedded in generated text.
+    """
 
     return [sys.executable, str(STANDARD_HELPER), *arguments]
 
@@ -31,7 +35,8 @@ def helper_command(arguments: Sequence[str]) -> list[str]:
 def main(argv: Sequence[str] | None = None) -> int:
     """Sync the changelog before delegating to TheKnowledge's commit helper."""
 
-    arguments = list(argv or sys.argv[1:])
+    # An explicit empty list means "no arguments", not "read sys.argv".
+    arguments = list(sys.argv[1:] if argv is None else argv)
     dry_run = "--dry-run" in arguments
     if "-h" not in arguments and "--help" not in arguments and PENDING_QUEUE.is_file():
         changelog_file, entry_count, changed = sync_changelog_from_pending_queue(
