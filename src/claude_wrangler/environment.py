@@ -1,15 +1,44 @@
-"""Runtime-environment detection for launchers, inspection, and self-tests."""
+"""Runtime-environment diagnostics for inspection and self-tests.
+
+The native runtime needs neither Node.js nor npm; `node`, `npm`, and `npx`
+are reported only as information, and the checked-in Node.js selector check
+is advisory (the generated launcher's parity check is warn-only). The
+launcher environment for each security ring is computed with the launcher
+core's own functions, so the report shows exactly what a launch exports on
+this host's operating system.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+
+from . import launcher_core
 
 EXPLICIT_NODE_VERSION_PATTERN = re.compile(r"^v?\d+(?:\.\d+){0,2}$")
+# Variables the ring report lists, in display order.
+RING_VARIABLES = (
+    "CLAUDE_CONFIG_DIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "CLAUDE_LOCAL_SHARED_HOME",
+    "CLAUDE_LOCAL_MANAGED_BY",
+    "DISABLE_UPDATES",
+    "DISABLE_AUTOUPDATER",
+    "DISABLE_INSTALLATION_CHECKS",
+)
 
 
 def normalize_node_version(raw_version: str) -> str:
@@ -34,7 +63,10 @@ def _read_trimmed_text(path: Path) -> Optional[str]:
 
     if not path.is_file():
         return None
-    text = path.read_text(encoding="utf-8").strip()
+    try:
+        text = path.read_bytes().decode("utf-8", "replace").strip()
+    except OSError:
+        return None
     return text or None
 
 
@@ -47,12 +79,13 @@ def detect_node_selector_signals(project_root: Path) -> List[Dict[str, Optional[
         raw_value = _read_trimmed_text(path)
         if raw_value is None:
             continue
+        first_line = raw_value.splitlines()[0].strip()
         signals.append(
             {
                 "kind": filename,
                 "path": str(path),
-                "raw_value": raw_value,
-                "explicit_version": explicit_node_version(raw_value),
+                "raw_value": first_line,
+                "explicit_version": explicit_node_version(first_line),
             }
         )
 
@@ -91,8 +124,8 @@ def detect_package_manager_declaration(
         return None
 
     try:
-        payload = json.loads(package_json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.loads(package_json_path.read_bytes().decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return {
             "path": str(package_json_path),
             "raw_value": None,
@@ -125,15 +158,53 @@ def detect_package_manager_declaration(
     }
 
 
-def resolve_command_metadata(command_name: str) -> Dict[str, Any]:
-    """Return resolved-path and version details for one runtime command."""
+def command_name(name: str, os_name: Optional[str] = None) -> str:
+    """Return the platform spelling of a Node.js tool (`npm.cmd` on Windows)."""
 
-    resolved_path = shutil.which(command_name)
+    nt = (os.name if os_name is None else os_name) == "nt"
+    if nt and name in ("npm", "npx"):
+        return name + ".cmd"
+    return name
+
+
+def find_command(
+    command: str,
+    environ: Optional[Mapping[str, str]] = None,
+    os_name: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve ``command`` from absolute PATH entries only.
+
+    ``shutil.which`` searches the current directory first on Windows
+    (unless ``NoDefaultCurrentDirectoryInExePath`` is set), so running
+    `--inspect` from the root of an untrusted clone would execute that
+    clone's ``node.cmd``. The launcher core's resolver never searches the
+    current directory and skips relative PATH entries.
+    """
+
+    env = os.environ if environ is None else environ
+    effective_os = os.name if os_name is None else os_name
+    return launcher_core.find_executable_on_path(
+        command,
+        launcher_core.env_lookup(env, "PATH", effective_os),
+        effective_os,
+        launcher_core.env_lookup(env, "PATHEXT", effective_os),
+    )
+
+
+def resolve_command_metadata(command: str) -> Dict[str, Any]:
+    """Return resolved-path and version details for one command (informational).
+
+    The command is found with `find_command`, never in the current
+    directory, before its `--version` runs.
+    """
+
+    resolved_path = find_command(command)
     metadata: Dict[str, Any] = {
-        "requested_name": command_name,
+        "requested_name": command,
         "resolved_path": resolved_path,
         "version": None,
         "found": resolved_path is not None,
+        "required": False,
     }
     if resolved_path is None:
         return metadata
@@ -143,6 +214,7 @@ def resolve_command_metadata(command_name: str) -> Dict[str, Any]:
             [resolved_path, "--version"],
             check=False,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=5,
         )
@@ -159,52 +231,82 @@ def resolve_command_metadata(command_name: str) -> Dict[str, Any]:
     return metadata
 
 
-def build_home_configuration(
+def ring_environment(
+    launch: launcher_core.LaunchConfig,
+    project_root: Path,
+    *,
     shared_home: bool,
-    claude_home_dir: Path,
-    config_dir: Path,
-) -> Dict[str, Any]:
-    """Return the HOME, XDG, and config-dir paths the launcher will expose.
+    os_name: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
+    """Return the variables a launch exports at one ring on one OS.
 
-    `CLAUDE_CONFIG_DIR` is pinned in both modes: escalating the `$HOME`
-    fidelity ring never forks Claude session state out of the project.
+    Variables the ring leaves inherited (the operator's home at ring 0)
+    are reported as None.
     """
 
-    config_dir_value = str(config_dir.resolve())
-    if shared_home:
-        return {
-            "mode": "shared user HOME",
-            "inherits_from_parent_process": True,
-            "launcher_environment": {
-                "CLAUDE_CONFIG_DIR": config_dir_value,
-                "HOME": None,
-                "XDG_CONFIG_HOME": None,
-                "XDG_CACHE_HOME": None,
-                "XDG_STATE_HOME": None,
-                "XDG_DATA_HOME": None,
-            },
-        }
+    effective_os = os.name if os_name is None else os_name
+    paths = launcher_core.build_repo_paths(str(project_root), launch, effective_os)
+    env = launcher_core.build_session_environment(
+        {}, paths=paths, config=launch, shared_home=shared_home, os_name=effective_os
+    )
+    report: Dict[str, Optional[str]] = {}
+    for name in RING_VARIABLES:
+        if name in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"):
+            if effective_os != "nt":
+                continue
+        report[name] = env.get(name)
+    report["PATH_PREFIX"] = paths.shim_dir
+    return report
 
-    home_dir = str(claude_home_dir.resolve())
+
+def build_home_configuration(
+    launch: launcher_core.LaunchConfig,
+    project_root: Path,
+    shared_home: bool,
+    *,
+    os_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the HOME, XDG, and config-dir values the launcher will expose.
+
+    `CLAUDE_CONFIG_DIR` is pinned at both rings: escalating the `$HOME`
+    fidelity ring never forks Claude session state out of the project.
+    On native Windows ring 1 also redirects USERPROFILE, HOMEDRIVE and
+    HOMEPATH, APPDATA, and LOCALAPPDATA.
+    """
+
+    effective_os = os.name if os_name is None else os_name
+    rings = {
+        "ring1": ring_environment(
+            launch, project_root, shared_home=False, os_name=effective_os
+        ),
+        "ring0": ring_environment(
+            launch, project_root, shared_home=True, os_name=effective_os
+        ),
+    }
     return {
-        "mode": "project-local isolated HOME",
-        "inherits_from_parent_process": False,
-        "launcher_environment": {
-            "CLAUDE_CONFIG_DIR": config_dir_value,
-            "HOME": home_dir,
-            "XDG_CONFIG_HOME": "{}/.config".format(home_dir),
-            "XDG_CACHE_HOME": "{}/.cache".format(home_dir),
-            "XDG_STATE_HOME": "{}/.local/state".format(home_dir),
-            "XDG_DATA_HOME": "{}/.local/share".format(home_dir),
-        },
+        "mode": "shared user HOME" if shared_home else "project-local isolated HOME",
+        "default_ring": 0 if shared_home else 1,
+        "host_os": "windows" if effective_os == "nt" else "posix",
+        "inherits_from_parent_process": shared_home,
+        "launcher_environment": rings["ring0" if shared_home else "ring1"],
+        "rings": rings,
+        "escape_hatches": [
+            "claude-local --shared-home (ring 0 for one session)",
+            "CLAUDE_LOCAL_SHARED_HOME=1 (ring 0)",
+            "claude-local --isolated-home (ring 1 for one session)",
+        ],
     }
 
 
 def assess_node_selector_alignment(
     selector_signals: List[Dict[str, Optional[str]]],
-    node_command: Dict[str, Optional[str]],
+    node_command: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Assess whether resolved Node.js matches explicit checked-in selectors."""
+    """Assess whether resolved Node.js matches explicit checked-in selectors.
+
+    Advisory only: Claude Code does not need Node.js, so a missing `node`
+    is `not_required` rather than a failure.
+    """
 
     if not selector_signals:
         return {
@@ -223,17 +325,19 @@ def assess_node_selector_alignment(
 
     explicit_signal_count = 0
     mismatch_descriptions: List[str] = []
-    enriched_signals: List[Dict[str, Optional[str]]] = []
+    enriched_signals: List[Dict[str, Any]] = []
 
     for signal in selector_signals:
-        enriched = dict(signal)
+        enriched: Dict[str, Any] = dict(signal)
         explicit_version = signal.get("explicit_version")
         matches_resolved_version = None
         if isinstance(explicit_version, str) and explicit_version:
             explicit_signal_count += 1
             if normalized_resolved_version is not None:
+                expected_parts = explicit_version.split(".")
+                actual_parts = normalized_resolved_version.split(".")
                 matches_resolved_version = (
-                    explicit_version == normalized_resolved_version
+                    actual_parts[: len(expected_parts)] == expected_parts
                 )
                 if not matches_resolved_version:
                     mismatch_descriptions.append(
@@ -247,10 +351,10 @@ def assess_node_selector_alignment(
 
     if not node_command.get("found"):
         summary = (
-            "Checked-in Node.js selectors are present, but `node` is not "
-            "available in PATH."
+            "Checked-in Node.js selectors are present, but `node` is not on "
+            "PATH. Claude Code does not need it; project tooling may."
         )
-        status = "unknown"
+        status = "node_not_found"
     elif explicit_signal_count and normalized_resolved_version is None:
         summary = (
             "Checked-in Node.js selectors are present, but `node --version` "
@@ -293,18 +397,17 @@ def assess_node_selector_alignment(
 
 def collect_runtime_diagnostics(
     project_root: Path,
+    launch: launcher_core.LaunchConfig,
     shared_home: bool,
-    claude_home_dir: Path,
-    config_dir: Path,
-    npm_command_name: str,
-    npx_command_name: str,
+    *,
+    os_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Collect runtime-resolution details for inspection and self-tests."""
 
     resolved_commands = {
-        "node": resolve_command_metadata("node"),
-        "npm": resolve_command_metadata(npm_command_name),
-        "npx": resolve_command_metadata(npx_command_name),
+        "node": resolve_command_metadata(command_name("node", os_name)),
+        "npm": resolve_command_metadata(command_name("npm", os_name)),
+        "npx": resolve_command_metadata(command_name("npx", os_name)),
     }
     selector_signals = detect_node_selector_signals(project_root)
     selector_alignment = assess_node_selector_alignment(
@@ -312,6 +415,7 @@ def collect_runtime_diagnostics(
         resolved_commands["node"],
     )
     return {
+        "node_required": False,
         "resolved_commands": resolved_commands,
         "node_selector_signals": selector_alignment["signals"],
         "selector_alignment": {
@@ -323,8 +427,6 @@ def collect_runtime_diagnostics(
         },
         "package_manager_declaration": detect_package_manager_declaration(project_root),
         "home_configuration": build_home_configuration(
-            shared_home,
-            claude_home_dir,
-            config_dir,
+            launch, project_root, shared_home, os_name=os_name
         ),
     }

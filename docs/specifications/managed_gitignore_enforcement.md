@@ -32,8 +32,13 @@ artifacts.
    or deleting user-owned rules.
 5. Required entries
    The managed block must contain an explanatory comment plus ignore
-   rules for `.local/`, `bin/claude-local`, and
+   rules for `.local/`, `bin/claude-local`, `bin/claude-local.cmd`, and
    `README-LOCAL-Start-Claude.md`.
+5a. Line endings
+   Block edits are byte-exact outside the managed block. The block uses
+   LF for new, LF, or mixed files on every operating system, and CRLF
+   only when the existing file is consistently CRLF. An edit must never
+   produce `\r\r\n`.
 6. Paths that must stay trackable
    The managed block must not ignore the project-root `.claude/`
    directory. Claude Code uses `.claude/` for tracked project

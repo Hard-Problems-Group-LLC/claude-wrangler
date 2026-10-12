@@ -33,12 +33,16 @@ the managed TheKnowledge footer.
   or installer guards collide with the Codex equivalents
   (`.codex-local/`, `.codex-home/`, `bin/codex-local`,
   `README-LOCAL-Start-Codex.md`).
-- Treat `.local/claude/` (managed npm install, redirected HOME, pinned
-  `CLAUDE_CONFIG_DIR` state), `bin/claude-local`, and
+- Treat `.local/claude/` (the native runtime root
+  `.local/claude/wrangler/` with its A/B slots, launcher core, and
+  metadata; the redirected HOME; pinned `CLAUDE_CONFIG_DIR` state; and
+  any npm-era `.local/claude/npm/` tree left for migration),
+  `bin/claude-local`, `bin/claude-local.cmd`, and
   `README-LOCAL-Start-Claude.md` as local operator tooling or generated
-  artifacts when they exist. Do not classify
+  artifacts when they exist. Do not classify a legacy
   `.local/claude/npm/package.json` as this repository's tracked
-  dependency manifest.
+  dependency manifest, and change runtime slots only through
+  `claude-wrangler` (`--rollback`, `--repair-install`), never by hand.
 - Do not ignore or delete the project-root `.claude/` directory by
   automation; Claude Code keeps trackable project settings there.
 - On Windows checkouts with `core.autocrlf=true`, do not run

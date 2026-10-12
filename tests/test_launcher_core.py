@@ -714,8 +714,16 @@ def test_main_ring1_redirects_home_and_creates_only_managed_dirs(
     if os_name == "nt":
         assert outcome.env["USERPROFILE"] == outcome.env["HOME"]
     assert outcome.env["CLAUDE_CONFIG_DIR"] == project.config_dir(os_name)
-    assert (project.root / ".local" / "claude" / "HOME").is_dir()
-    assert not (project.root / ".local" / "claude" / "HOME" / "AppData").exists()
+    assert outcome.env[core.SHARED_HOME_VAR] == "0"
+    home = project.root / ".local" / "claude" / "HOME"
+    assert home.is_dir()
+    if os_name == "nt":
+        # APPDATA and LOCALAPPDATA point here at ring 1, so both must exist.
+        assert (home / "AppData" / "Roaming").is_dir()
+        assert (home / "AppData" / "Local").is_dir()
+        assert sorted(path.name for path in home.iterdir()) == ["AppData"]
+    else:
+        assert list(home.iterdir()) == []
 
 
 @pytest.mark.parametrize("os_name", ["posix", "nt"])
@@ -734,6 +742,8 @@ def test_main_ring0_keeps_home_but_pins_config_dir(
     assert outcome.env.get("USERPROFILE") == base.get("USERPROFILE")
     assert outcome.env["CLAUDE_CONFIG_DIR"] == project.config_dir(os_name)
     assert outcome.env["DISABLE_UPDATES"] == "1"
+    # Nested launches inherit the ring this session chose.
+    assert outcome.env[core.SHARED_HOME_VAR] == "1"
     assert not (project.root / ".local" / "claude" / "HOME").exists()
 
 
@@ -875,8 +885,66 @@ def test_main_command_gets_compact_settings_override_first(project: Project) -> 
 
 
 def test_recorded_subcommand_omits_settings_override(project: Project) -> None:
+    # A slot promoted before the install-time --settings probe existed.
     outcome = run(project, ["mcp", "list"])
     assert outcome.argv[1:] == ["mcp", "list"]
+
+
+def test_probed_subcommands_keep_settings_unless_they_rejected_it(
+    tmp_path: Path,
+) -> None:
+    bare = Project(tmp_path / "repo")
+    bare.install_slot(
+        "a",
+        "2.1.250",
+        subcommands=("mcp", "doctor", "plugin"),
+        record_overrides={"settings_rejected": ["doctor"]},
+    )
+    bare.set_pointer("a")
+    accepted = run(bare, ["mcp", "list"])
+    assert accepted.argv[1] == "--settings"
+    assert json.loads(accepted.argv[2]) == SETTINGS_OVERRIDE
+    assert accepted.argv[3:] == ["mcp", "list"]
+    rejected = run(bare, ["doctor"])
+    assert rejected.argv[1:] == ["doctor"]
+    main_command = run(bare, ["-p", "hi"])
+    assert main_command.argv[1] == "--settings"
+
+
+@pytest.mark.parametrize("value", [None, "doctor", [1], {"doctor": True}])
+def test_unusable_settings_rejected_falls_back_to_omitting(
+    tmp_path: Path, value: Any
+) -> None:
+    bare = Project(tmp_path / "repo")
+    overrides = {} if value is None else {"settings_rejected": value}
+    bare.install_slot("a", "2.1.250", record_overrides=overrides)
+    bare.set_pointer("a")
+    assert (
+        core.record_settings_rejected(
+            json.loads((bare.runtime / "slots" / "a" / ".complete.json").read_text())
+        )
+        is None
+    )
+    assert run(bare, ["mcp", "list"]).argv[1:] == ["mcp", "list"]
+
+
+def test_build_claude_arguments_honors_the_probe_result() -> None:
+    def build(args: List[str], rejected: Optional[List[str]]) -> List[str]:
+        """Build arguments for a slot with three recorded subcommands."""
+
+        return core.build_claude_arguments(
+            args,
+            subcommands=("mcp", "doctor", "plugin"),
+            settings_override={"env": {}},
+            reasonable_permissions=False,
+            settings_rejected=rejected,
+        )
+
+    assert build(["mcp"], None) == ["mcp"]
+    assert build(["mcp"], [])[0] == "--settings"
+    assert build(["mcp"], ["mcp"]) == ["mcp"]
+    assert build(["plugin", "list"], ["mcp"])[0] == "--settings"
+    assert build([], ["mcp"])[0] == "--settings"
 
 
 def test_missing_subcommand_list_treats_everything_as_main_command(
@@ -1166,13 +1234,20 @@ def test_stale_cache_is_refreshed_once_then_notice(project: Project) -> None:
     )
     outcome = run(project, [], fetch=pointer_fetch(b"2.1.301\n"))
     assert outcome.fetches == [core.DEFAULT_RELEASE_BASE_URL + "/stable"]
-    assert "2.1.301" in outcome.stderr
+    notices = [line for line in outcome.stderr.splitlines() if "2.1.301" in line]
+    assert len(notices) == 1
+    assert "unverified" in notices[0]
+    assert "`claude-wrangler --upgrade --channel stable`" in notices[0]
+    assert "is available" not in notices[0]
     cache = project.read_json("update-check.json")
+    # The unsigned pointer never replaces the manifest-verified version.
     assert cache == {
         "checked_at": "2026-10-12T12:00:00Z",
         "channel": "stable",
-        "latest_version": "2.1.301",
+        "latest_version": "2.1.250",
+        "pointer_version": "2.1.301",
         "installed_version": "2.1.250",
+        "error": None,
     }
 
 
@@ -1261,10 +1336,77 @@ def test_check_updates_refreshes_prints_and_exits(project: Project) -> None:
     )
     assert outcome.code == 0
     assert not outcome.launched
-    assert "latest:    2.1.300" in outcome.stdout
-    assert "installed: 2.1.250 (slot a)" in outcome.stdout
+    assert "channel pointer: 2.1.300 (unsigned, not verified)" in outcome.stdout
+    assert "verified:        2.1.250" in outcome.stdout
+    assert "installed:       2.1.250 (slot a)" in outcome.stdout
+    assert "unverified until its signed manifest is checked" in outcome.stdout
     assert "`claude-wrangler --upgrade --channel stable`" in outcome.stdout
-    assert project.read_json("update-check.json")["latest_version"] == "2.1.300"
+    assert "`claude-wrangler --update`" in outcome.stdout
+    cache = project.read_json("update-check.json")
+    assert cache["latest_version"] == "2.1.250"
+    assert cache["pointer_version"] == "2.1.300"
+
+
+def test_check_updates_reports_a_newer_verified_release(project: Project) -> None:
+    project.write_cache(latest_version="2.1.300")
+    outcome = run(project, ["--check-updates"], fetch=pointer_fetch(b"2.1.300"))
+    assert outcome.code == 0
+    assert "verified:        2.1.300 (signed manifest checked" in outcome.stdout
+    assert "Update available." in outcome.stdout
+
+
+def test_check_updates_without_verified_data_says_how_to_verify(
+    project: Project,
+) -> None:
+    project.write_cache(latest_version=None)
+    outcome = run(project, ["--check-updates"], fetch=pointer_fetch(b"2.1.250"))
+    assert outcome.code == 0
+    assert "verified:        none recorded; run `claude-wrangler --update`" in (
+        outcome.stdout
+    )
+    assert "Up to date." in outcome.stdout
+
+
+def test_unsigned_pointer_never_overrides_the_verified_notice(
+    project: Project,
+) -> None:
+    project.write_cache(
+        checked_at=core.format_timestamp(NOW - timedelta(hours=25)),
+        latest_version="2.1.300",
+    )
+    outcome = run(project, [], fetch=pointer_fetch(b"2.1.999"))
+    notices = [line for line in outcome.stderr.splitlines() if "2.1." in line]
+    assert len(notices) == 1
+    assert "Claude Code 2.1.300 is available" in notices[0]
+    assert "2.1.999" not in outcome.stderr
+    cache = project.read_json("update-check.json")
+    assert cache["latest_version"] == "2.1.300"
+    assert cache["pointer_version"] == "2.1.999"
+
+
+def test_failed_refresh_keeps_the_last_pointer_for_the_channel(
+    project: Project,
+) -> None:
+    project.write_cache(
+        checked_at="2026-01-01T00:00:00Z",
+        latest_version=None,
+        pointer_version="2.1.299",
+    )
+    outcome = run(project, [])
+    assert outcome.launched
+    cache = project.read_json("update-check.json")
+    assert cache["pointer_version"] == "2.1.299"
+    assert cache["latest_version"] is None
+    assert cache["error"] == "network unreachable"
+    assert "unverified" in outcome.stderr
+    # Another channel's pointer and verified version are never carried over.
+    project.write_config(channel="latest")
+    other = run(project, [])
+    cache = project.read_json("update-check.json")
+    assert cache["channel"] == "latest"
+    assert cache["pointer_version"] is None
+    assert cache["latest_version"] is None
+    assert "2.1.299" not in other.stderr
 
 
 def test_check_updates_up_to_date_and_disabled_note(project: Project) -> None:
@@ -1673,3 +1815,156 @@ def test_end_to_end_launch_exports_ring1_environment(tmp_path: Path) -> None:
         assert child_env["HOMEDRIVE"] + child_env["HOMEPATH"] == home
         assert child_env["APPDATA"] == os.path.join(home, "AppData", "Roaming")
         assert child_env["LOCALAPPDATA"] == os.path.join(home, "AppData", "Local")
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 extensions: mirror URL, update-check errors, config-dir spelling,
+# ring export, MSYS argument conversion, and the migration-pending mode
+# ---------------------------------------------------------------------------
+
+
+def test_release_base_url_is_optional_and_validated() -> None:
+    assert load_config().release_base_url == core.DEFAULT_RELEASE_BASE_URL
+    mirror = load_config(release_base_url="https://mirror.example.com/r/")
+    assert mirror.release_base_url == "https://mirror.example.com/r"
+    assert core.update_check_hosts(mirror) == (
+        "downloads.claude.ai",
+        "mirror.example.com",
+    )
+    for bad in (
+        "http://mirror.example.com",
+        "https://user:pw@mirror.example.com",
+        "https://mirror.example.com/?q=1",
+        "https://",
+        42,
+    ):
+        with pytest.raises(core.LaunchConfigError):
+            load_config(release_base_url=bad)
+
+
+def test_update_checks_use_the_recorded_mirror(project: Project) -> None:
+    project.write_config(release_base_url="https://mirror.example.com/r")
+    project.write_cache(checked_at="2026-01-01T00:00:00Z")
+    outcome = run(project, [], fetch=pointer_fetch(b"2.1.301\n"))
+    assert outcome.fetches == ["https://mirror.example.com/r/stable"]
+
+
+def test_fetch_allows_the_mirror_host_only_when_listed() -> None:
+    with pytest.raises(core.UpdateCheckError):
+        core.fetch_url_bytes("https://mirror.example.com/r/stable", 1.0)
+
+
+def test_failed_refresh_records_the_error(project: Project) -> None:
+    project.write_cache(checked_at="2026-01-01T00:00:00Z", latest_version="2.1.299")
+    outcome = run(project, ["--check-updates"])
+    assert outcome.code == 1
+    cache = project.read_json("update-check.json")
+    assert cache["error"] == "network unreachable"
+    assert cache["latest_version"] == "2.1.299"
+    success = run(project, ["--check-updates"], fetch=pointer_fetch(b"2.1.300\n"))
+    assert success.code == 0
+    assert project.read_json("update-check.json")["error"] is None
+
+
+def test_forward_slash_config_dir_spelling_on_windows(project: Project) -> None:
+    project.write_config(config_dir_spelling="forward-slash")
+    outcome = run(project, [], os_name="nt")
+    expected = project.config_dir("nt").replace("\\", "/")
+    expected = expected[0].upper() + expected[1:]
+    assert outcome.env["CLAUDE_CONFIG_DIR"] == expected
+    assert outcome.env[core.NOTICES_SHOWN_VAR] == expected
+    posix = run(project, [], os_name="posix")
+    assert posix.env["CLAUDE_CONFIG_DIR"] == project.config_dir("posix")
+
+
+def test_config_dir_spelling_is_validated() -> None:
+    assert load_config().config_dir_spelling == "native"
+    with pytest.raises(core.LaunchConfigError):
+        load_config(config_dir_spelling="backslash")
+
+
+@pytest.mark.parametrize("os_name", ["posix", "nt"])
+def test_msys_argument_override_is_removed_from_the_child(
+    project: Project, os_name: str
+) -> None:
+    outcome = run(
+        project,
+        [],
+        os_name=os_name,
+        extra_env={
+            core.MSYS_ARGS_VAR: "1",
+            "MSYS_NO_PATHCONV": "1",
+            "MSYS2_ARG_CONV_EXCL": "*",
+        },
+    )
+    for name in (core.MSYS_ARGS_VAR, "MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL"):
+        assert name not in outcome.env
+    kept = run(project, [], os_name=os_name, extra_env={"MSYS_NO_PATHCONV": "1"})
+    assert kept.env["MSYS_NO_PATHCONV"] == "1"
+
+
+def test_ring_choice_is_exported_for_nested_launches(project: Project) -> None:
+    ring1 = run(project, [])
+    assert ring1.env[core.SHARED_HOME_VAR] == "0"
+    ring0 = run(project, ["--shared-home"])
+    assert ring0.env[core.SHARED_HOME_VAR] == "1"
+    nested = run(project, [], extra_env={core.SHARED_HOME_VAR: "1"})
+    assert nested.env["HOME"] == "/home/operator"
+
+
+def write_legacy_binary(project: Project, version: Optional[str] = "2.1.287") -> str:
+    """Create an npm-layout binary and switch launch.json to legacy mode."""
+
+    relative = (
+        ".local/claude/npm/node_modules/@anthropic-ai/claude-code-{}/claude".format(KEY)
+    )
+    binary = project.root.joinpath(*relative.split("/"))
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"legacy native binary")
+    binary.chmod(0o755)
+    project.write_config(legacy={"binary": relative, "version": version})
+    return str(binary)
+
+
+def test_legacy_mode_runs_the_npm_layout_binary_without_node(tmp_path: Path) -> None:
+    project = Project(tmp_path / "repo")
+    binary = write_legacy_binary(project)
+    outcome = run(project, ["-p", "hi"], node=(None, None))
+    assert outcome.code == 0
+    assert outcome.argv[0] == binary
+    assert outcome.argv[1] == "--settings"
+    assert outcome.argv[-2:] == ["-p", "hi"]
+    assert outcome.env["DISABLE_UPDATES"] == "1"
+    assert "migration pending" in outcome.stderr
+    assert not (project.runtime / "fallback.json").exists()
+
+
+def test_legacy_mode_refuses_a_missing_or_escaping_binary(tmp_path: Path) -> None:
+    project = Project(tmp_path / "repo")
+    project.write_config(
+        legacy={"binary": ".local/claude/npm/node_modules/x/claude", "version": None}
+    )
+    missing = run(project, [])
+    assert missing.code == 1 and not missing.launched
+    assert "legacy Claude Code binary is missing" in missing.stderr
+    with pytest.raises(core.LaunchConfigError):
+        load_config(legacy={"binary": "../outside/claude", "version": None})
+    with pytest.raises(core.LaunchConfigError):
+        load_config(legacy={"binary": "a/claude", "version": "latest"})
+
+
+def test_legacy_mode_update_notice_uses_the_legacy_version(tmp_path: Path) -> None:
+    project = Project(tmp_path / "repo")
+    write_legacy_binary(project, version="2.1.287")
+    project.write_cache(latest_version="2.1.300")
+    outcome = run(project, [])
+    assert "Claude Code 2.1.300 is available" in outcome.stderr
+    assert "this project runs 2.1.287" in outcome.stderr
+
+
+def test_ring1_on_windows_creates_appdata_directories(project: Project) -> None:
+    paths = core.build_repo_paths(str(project.root), load_config(), "nt")
+    core.ensure_session_directories(paths, False, "nt")
+    home = Path(paths.home_dir_fs)
+    assert (home / "AppData" / "Roaming").is_dir()
+    assert (home / "AppData" / "Local").is_dir()

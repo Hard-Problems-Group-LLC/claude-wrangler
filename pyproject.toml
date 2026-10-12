@@ -23,6 +23,8 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Topic :: Software Development :: Build Tools",
   "Topic :: Utilities",
@@ -57,3 +59,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+
+# The bootstrap path, the launcher core, and the verifier must stay
+# Python 3.9 compatible, so both tools target the declared floor.
+[tool.black]
+target-version = ["py39"]
+
+[tool.ruff]
+target-version = "py39"

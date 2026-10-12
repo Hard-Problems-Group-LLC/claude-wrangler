@@ -1,5 +1,16 @@
 # Bounded Managed NPM Operations
 
+> **Status: superseded** by
+> `native_runtime_distribution_and_verification.md`.
+> claude-wrangler no longer runs npm. Install, upgrade, update, and
+> repair fetch Claude Code's signed native binary with bounded,
+> verified HTTPS downloads (requirement 8 there, with
+> `--download-timeout-seconds`), and npm-era projects move to the
+> native runtime through `legacy_npm_layout_migration.md`. The retired
+> `--npm-timeout-seconds` and `--npm-install-loglevel` flags are still
+> accepted so old scripts keep working, but they only print a warning.
+> The text below is kept for history; do not implement against it.
+
 ## Purpose
 
 Ensure managed npm operations fail with actionable diagnostics instead

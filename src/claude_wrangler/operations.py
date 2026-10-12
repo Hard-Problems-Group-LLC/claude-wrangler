@@ -1,69 +1,148 @@
-"""Operational behaviors for install, inspect, uninstall, and self-test."""
+"""Maintenance operations: install, upgrade, repair, migrate, update, rollback,
+and uninstall of the project-local native Claude Code runtime.
+
+Every mutating operation holds the runtime root's maintenance lock from
+state selection through publication of generated files
+(`ab_runtime_slots.md` requirement 4). The configuration is read before the
+lock, so each operation re-checks a digest of the metadata it was derived
+from once the lock is held and stops, changing nothing, when another
+maintainer published in between; the CLI then re-reads the state and runs
+the command again. The managed `.gitignore` block is written under the
+lock too. Side effects that leave the machine
+or run binaries go through a `services.Services` object so tests run fully
+offline. Inspection and self-test live in `inspection.py`.
+"""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import json
 import os
-import platform
 from pathlib import Path
-import re
-import sys
-from typing import Any, Dict, List, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
+import uuid
 
+from .atomicio import atomic_write_text
 from .constants import (
-    CLAUDE_PACKAGE_NAME,
-    GITIGNORE_BEGIN,
-    GITIGNORE_END,
-    README_MARKER,
-    SCHEMA_VERSION,
+    LEGACY_LOCAL_DIR,
+    LEGACY_SCHEMA_VERSION,
+    METADATA_FILENAME,
     SCRIPT_NAME,
-    SCRIPT_MARKER,
     SCRIPT_VERSION,
 )
-from .environment import collect_runtime_diagnostics
+from .distribution import (
+    VERSION_FLOOR,
+    DistributionError,
+    channel_deprecation_message,
+    check_version_floor,
+    is_exact_version,
+)
 from .filesystem import (
-    ensure_managed_directories,
     maybe_remove_empty_parent,
-    require_safe_managed_path,
-    remove_file_if_managed,
+    normalize_newlines,
     remove_gitignore_block,
     remove_tree,
+    remove_tree_except,
     upsert_gitignore_block,
     write_metadata,
-    write_text_file,
 )
-from .layout import (
-    infer_installed_version_from_lockfile,
-    infer_requested_version_from_package_json,
-    read_json_file,
+from .generator import (
+    LegacyLaunch,
+    check_config_settings,
+    generated_file_status,
+    launcher_session_environment,
+    planned_files,
+    remove_generated_files,
+    write_generated_files,
 )
-from .models import ClaudeWranglerError, Config, SelfTestResult
+from .migration import (
+    build_projection,
+    cleanup_legacy_tree,
+    discover_legacy,
+    legacy_binary_candidates,
+    legacy_dir_candidates,
+    legacy_dir_from_launcher,
+    legacy_is_authoritative,
+    projection_text,
+    select_legacy_launch_binary,
+)
+from .layout import managed_state_fingerprint
+from .models import ClaudeWranglerError, Config, LegacyState
 from .releases import (
-    fetch_available_claude_versions,
-    resolve_install_version,
-    resolve_upgrade_version,
+    apply_catalog,
+    newer_release_note,
+    refresh_catalog,
+    update_check_cache,
 )
 from .rendering import (
     build_available_versions_table,
     build_gitignore_block,
     build_install_summary,
-    build_known_versions,
-    build_launcher_content,
-    build_local_package_json,
-    build_local_readme_content,
     build_metadata,
-    local_package_json_looks_managed,
 )
-from .runtime import (
-    detect_npm_binaries,
-    ensure_command_exists,
-    eprint,
-    run_command,
-    utc_now_iso,
+from .runtime import eprint, format_utc
+from .services import Services, default_services
+from .slots import (
+    LOCK_NAME,
+    SLOT_NAMES,
+    PointerError,
+    RuntimeStore,
+    check_runtime_root_placement,
+    is_link_like,
+)
+from .slots import remove_tree as remove_runtime_tree
+from .transaction import (
+    RuntimeInUseError,
+    active_slot_for,
+    artifact_for,
+    in_use_fail_closed,
+    native_runtime_complete,
+    other_slot,
+    prepare_candidate,
+    processes_under,
+    promote_candidate,
+    read_pointer_quietly,
+    require_idle,
+    select_platform_key,
+    slot_binaries,
+    verify_slot_offline,
 )
 
-CLAUDE_VERSION_OUTPUT_PATTERN = re.compile(r"^\d+\.\d+\.\d+")
+# Re-exported for the CLI and tests.
+__all__ = [
+    "ManagedStateChangedError",
+    "RuntimeInUseError",
+    "ensure_gitignore_block",
+    "install_like_operation",
+    "rollback_operation",
+    "uninstall_operation",
+    "update_operation",
+]
+
+
+class ManagedStateChangedError(ClaudeWranglerError):
+    """Raised under the lock when another maintainer changed the state read.
+
+    The command derived its configuration before taking the maintenance
+    lock. It stops before changing anything, and `cli.main` re-reads the
+    state and runs the command again.
+    """
+
+
+def require_unchanged_state(config: Config) -> None:
+    """Refuse to act on metadata another maintainer changed since it was read.
+
+    Call with the maintenance lock held. A config built without a digest
+    (for example, constructed directly) skips the check.
+    """
+
+    if config.state_fingerprint is None:
+        return
+    if managed_state_fingerprint(config.state_paths) != config.state_fingerprint:
+        raise ManagedStateChangedError(
+            "Another claude-wrangler run changed this project's managed state "
+            "after this command read it; nothing was changed."
+        )
 
 
 def ensure_gitignore_block(config: Config) -> None:
@@ -76,972 +155,1233 @@ def ensure_gitignore_block(config: Config) -> None:
     )
 
 
-def write_managed_supporting_files(config: Config) -> None:
-    """Write the managed launcher, README, .gitignore block, and metadata."""
+def runtime_store(config: Config) -> RuntimeStore:
+    """Return the slot store for the configured runtime root."""
 
-    ensure_managed_directories(config)
-    write_text_file(
-        config.layout.launcher_path,
-        build_launcher_content(config),
-        force=config.force,
-        dry_run=config.dry_run,
-        executable=True,
-        managed_markers=(SCRIPT_MARKER,),
-    )
-    write_text_file(
-        config.layout.readme_path,
-        build_local_readme_content(config),
-        force=config.force,
-        dry_run=config.dry_run,
-        managed_markers=(README_MARKER,),
-    )
-    ensure_gitignore_block(config)
-    write_metadata(
-        config.layout.metadata_path,
-        build_metadata(config),
-        dry_run=config.dry_run,
-    )
+    return RuntimeStore(config.layout.local_dir, project_root=config.project_root)
 
 
-def require_existing_managed_install(config: Config) -> None:
-    """Reject update-like operations when no managed install can be proven."""
+def check_runtime_placement(config: Config, environ: Mapping[str, str]) -> None:
+    """Refuse a runtime root Claude Code owns or prunes, before creating it."""
 
-    metadata_exists = config.layout.metadata_path.exists()
-    package_json_exists = config.layout.local_package_json_path.exists()
-    if metadata_exists or package_json_exists:
-        return
-    raise ClaudeWranglerError(
-        "No managed Claude install was found under {}. Run `claude-wrangler .` "
-        "first, then rerun `claude-wrangler --update`.".format(config.project_root)
-    )
-
-
-def npm_local_environment(config: Config) -> Dict[str, str]:
-    """Return an environment that keeps npm cache writes project-local."""
-
-    env = dict(os.environ)
-    env["NPM_CONFIG_CACHE"] = str(config.layout.local_dir / ".npm-cache")
-    return env
-
-
-def npm_install_environment(config: Config) -> Dict[str, str]:
-    """Return an environment that avoids optional install-time npm checks."""
-
-    env = npm_local_environment(config)
-    env["NPM_CONFIG_AUDIT"] = "false"
-    env["NPM_CONFIG_FOREGROUND_SCRIPTS"] = "true"
-    env["NPM_CONFIG_FUND"] = "false"
-    env["NPM_CONFIG_LOGLEVEL"] = config.npm_install_loglevel
-    env["NPM_CONFIG_PROGRESS"] = "false"
-    env["NPM_CONFIG_UPDATE_NOTIFIER"] = "false"
-    return env
-
-
-def local_claude_bin_path(config: Config) -> Path:
-    """Return the expected local Claude executable path for this platform."""
-
-    binary_name = "claude.cmd" if os.name == "nt" else "claude"
-    return config.layout.local_node_modules_dir / ".bin" / binary_name
-
-
-def managed_npm_install_command(config: Config, npm_name: str) -> List[str]:
-    """Return the npm install command for the managed Claude package tree."""
-
-    return [
-        npm_name,
-        "install",
-        "--prefix",
-        str(config.layout.local_dir),
-        "--no-audit",
-        "--no-fund",
-        "--foreground-scripts",
-        "--loglevel={}".format(config.npm_install_loglevel),
-        "--progress=false",
+    layout = config.layout
+    home = layout.claude_home_dir
+    extra = [
+        home / ".config",
+        home / ".cache",
+        home / ".local" / "state",
+        home / ".local" / "share",
     ]
-
-
-def local_claude_package_json_path(config: Config) -> Path:
-    """Return the managed Claude Code package manifest path."""
-
-    scope, name = CLAUDE_PACKAGE_NAME.split("/", 1)
-    return config.layout.local_node_modules_dir / scope / name / "package.json"
-
-
-def expected_claude_platform_package_names() -> List[str]:
-    """Return the acceptable platform packages for this host.
-
-    Claude Code ships per-platform optional dependencies. Linux hosts may
-    legitimately receive either the glibc or the musl variant, so both are
-    returned as acceptable candidates there.
-    """
-
-    raw_machine = platform.machine().lower()
-    if raw_machine in ("x86_64", "amd64"):
-        arch = "x64"
-    elif raw_machine in ("aarch64", "arm64"):
-        arch = "arm64"
-    else:
-        return []
-
-    if sys.platform.startswith("linux"):
-        base = "{}-linux-{}".format(CLAUDE_PACKAGE_NAME, arch)
-        return [base, "{}-musl".format(base)]
-    if sys.platform == "darwin":
-        return ["{}-darwin-{}".format(CLAUDE_PACKAGE_NAME, arch)]
-    if sys.platform in ("win32", "cygwin", "msys"):
-        return ["{}-win32-{}".format(CLAUDE_PACKAGE_NAME, arch)]
-    return []
-
-
-def local_platform_package_json_path(
-    config: Config,
-    package_name: str,
-) -> Path:
-    """Return the expected platform package manifest path for one candidate."""
-
-    scope, name = package_name.split("/", 1)
-    return config.layout.local_node_modules_dir / scope / name / "package.json"
-
-
-def first_installed_platform_package(
-    config: Config,
-    package_names: List[str],
-) -> Optional[Path]:
-    """Return the first candidate platform package manifest that exists."""
-
-    for package_name in package_names:
-        candidate = local_platform_package_json_path(config, package_name)
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def read_package_version(package_json_path: Optional[Path]) -> Optional[str]:
-    """Read a package.json version string, or return None when unavailable."""
-
-    if package_json_path is None or not package_json_path.exists():
-        return None
-    try:
-        payload = json.loads(package_json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    version = payload.get("version") if isinstance(payload, dict) else None
-    return version if isinstance(version, str) and version else None
-
-
-def infer_requested_version_with_error(
-    package_json_path: Path,
-) -> tuple[Optional[str], Optional[str]]:
-    """Infer requested Claude version and preserve parse errors for inspection."""
-
-    try:
-        return infer_requested_version_from_package_json(package_json_path), None
-    except ClaudeWranglerError as exc:
-        return None, str(exc)
-
-
-def infer_lockfile_version_with_error(
-    lockfile_path: Path,
-) -> tuple[Optional[str], Optional[str]]:
-    """Infer installed Claude version and preserve parse errors for inspection."""
-
-    try:
-        return infer_installed_version_from_lockfile(lockfile_path), None
-    except ClaudeWranglerError as exc:
-        return None, str(exc)
-
-
-def read_metadata_with_error(
-    metadata_path: Path,
-) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Read managed metadata and preserve parse errors for inspection."""
-
-    try:
-        return read_json_file(metadata_path), None
-    except ClaudeWranglerError as exc:
-        return None, str(exc)
-
-
-def looks_like_claude_version_output(version_text: str) -> bool:
-    """Return True when one --version output looks like Claude Code's."""
-
-    if not version_text:
-        return False
-    if "claude code" in version_text.lower():
-        return True
-    return CLAUDE_VERSION_OUTPUT_PATTERN.match(version_text) is not None
-
-
-def verify_local_claude_binary(config: Config) -> None:
-    """Run a cheap smoke test against the managed local Claude executable."""
-
-    local_claude_bin = local_claude_bin_path(config)
-    if not local_claude_bin.exists():
-        raise ClaudeWranglerError(
-            "Local Claude executable was not created: {}. The npm install is "
-            "incomplete; rerun the install or upgrade after repairing the "
-            "managed local directory.".format(local_claude_bin)
-        )
-    if os.name != "nt" and not os.access(local_claude_bin, os.X_OK):
-        raise ClaudeWranglerError(
-            "Local Claude executable is not executable: {}".format(local_claude_bin)
-        )
-
-    version_result = run_command(
-        [str(local_claude_bin), "--version"],
-        cwd=str(config.project_root),
-        capture_output=True,
-    )
-    version_text = (
-        (version_result.stdout or "") + (version_result.stderr or "")
-    ).strip()
-    if not looks_like_claude_version_output(version_text):
-        raise ClaudeWranglerError(
-            "Local Claude executable did not report a Claude Code version: "
-            "{}".format(version_text or "<no output>")
-        )
-
-
-def remove_managed_install_file(config: Config, path: Path, label: str) -> bool:
-    """Remove one managed npm artifact file after path safety checks."""
-
-    if not path.exists():
-        return False
-    if not path.is_file():
-        raise ClaudeWranglerError(
-            "Expected {} to be a file, but found something else: {}".format(
-                label,
-                path,
-            )
-        )
-    require_safe_managed_path(path, config.project_root, label)
-    action = "Would remove" if config.dry_run else "Removing"
-    eprint("[claude-wrangler] {} {}: {}".format(action, label, path))
-    if config.dry_run:
-        return True
-    path.unlink()
-    return True
-
-
-# npm replaces a package directory by first renaming the existing one to a
-# hidden ".<name>-<token>" staging directory, then swapping in the new tree.
-# An interrupted or crashed install leaves that staging directory behind, and
-# because npm recomputes the same staging name on the next attempt, every
-# retry then fails with "ENOTEMPTY: directory not empty, rename". These
-# orphans are pure npm scratch state -- never installed packages and never
-# project-local Claude session state under .local/claude/HOME -- so they are
-# safe to prune before a fresh install so an interrupted run self-heals.
-ORPHANED_NPM_STAGING_PATTERN = re.compile(r"^\..+-[A-Za-z0-9_]{6,}$")
-
-
-def _orphaned_npm_staging_dirs(node_modules_dir: Path) -> List[Path]:
-    """Return hidden npm rename-staging directories left by a broken install."""
-
-    if not node_modules_dir.is_dir():
-        return []
-    search_dirs = [node_modules_dir]
-    for entry in sorted(node_modules_dir.iterdir()):
-        if entry.name.startswith("@") and entry.is_dir() and not entry.is_symlink():
-            search_dirs.append(entry)
-    orphans: List[Path] = []
-    for search_dir in search_dirs:
-        for entry in sorted(search_dir.iterdir()):
-            if not entry.name.startswith("."):
-                continue
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            if ORPHANED_NPM_STAGING_PATTERN.match(entry.name):
-                orphans.append(entry)
-    return orphans
-
-
-def prune_orphaned_npm_staging_dirs(config: Config) -> None:
-    """Clear npm rename-staging leftovers so an interrupted install self-heals.
-
-    This removes only npm's transient ".<name>-<token>" scratch directories
-    inside the managed node_modules tree. It never removes installed packages
-    or any project-local Claude session state, so it is cheap and safe to run
-    before every managed install.
-    """
-
-    for orphan in _orphaned_npm_staging_dirs(config.layout.local_node_modules_dir):
-        remove_tree(
-            orphan,
-            label="orphaned npm staging directory",
-            project_root=config.project_root,
-            dry_run=config.dry_run,
-        )
-
-
-def repair_managed_npm_install(config: Config) -> None:
-    """Remove managed npm install artifacts before a clean reinstall."""
-
-    remove_tree(
-        config.layout.local_node_modules_dir,
-        label="managed local node_modules",
-        project_root=config.project_root,
-        dry_run=config.dry_run,
-    )
-    remove_managed_install_file(
-        config,
-        config.layout.local_package_lock_path,
-        label="managed local package-lock",
-    )
-    remove_tree(
-        config.layout.local_dir / ".npm-cache" / "_npx",
-        label="managed local npx scratch cache",
-        project_root=config.project_root,
-        dry_run=config.dry_run,
-    )
-    remove_tree(
-        config.layout.local_dir / ".npm-cache" / "_cacache" / "tmp",
-        label="managed local npm cache temp files",
-        project_root=config.project_root,
-        dry_run=config.dry_run,
+    for name in (
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+    ):
+        value = environ.get(name)
+        if value:
+            extra.append(Path(value))
+    real_home = environ.get("HOME") or environ.get("USERPROFILE")
+    if real_home:
+        base = Path(real_home)
+        extra.extend([base, base / ".local" / "share", base / ".local" / "state"])
+    check_runtime_root_placement(
+        layout.local_dir,
+        home_dir=home,
+        config_dir=layout.config_dir,
+        extra_bases=extra,
     )
 
 
-def install_like_operation(config: Config) -> int:
-    """Shared implementation for install and upgrade-style operations."""
+def _launcher_env_factory(
+    config: Config, services: Services
+) -> Callable[[], Mapping[str, str]]:
+    """Return a callable building the project's launcher environment lazily."""
 
-    if config.reconfigure_only:
-        resolved_config = config
-    else:
-        npm_name, _ = detect_npm_binaries()
-        ensure_command_exists("node")
-        ensure_command_exists(npm_name)
+    def build() -> Mapping[str, str]:
+        """Build the ring environment the launcher would hand Claude Code."""
 
-        if config.operation == "upgrade":
-            resolved_config = resolve_upgrade_version(config)
-        else:
-            resolved_config = resolve_install_version(
-                config,
-                npm_name,
-                env=npm_local_environment(config),
-                timeout_seconds=config.npm_timeout_seconds,
-            )
+        return launcher_session_environment(config, services.environ)
 
-    eprint(
-        "[claude-wrangler] Target project root: {}".format(resolved_config.project_root)
-    )
-    eprint("[claude-wrangler] Operation: {}".format(resolved_config.operation))
-    eprint(
-        "[claude-wrangler] Claude selector: {}".format(resolved_config.claude_selector)
-    )
-    eprint(
-        "[claude-wrangler] Claude version: {}".format(resolved_config.claude_version)
-    )
-    eprint(
-        "[claude-wrangler] Version source: {}".format(resolved_config.version_source)
-    )
-    eprint(
-        "[claude-wrangler] HOME isolation: {}".format(
-            "shared user HOME"
-            if resolved_config.shared_home
-            else "project-local isolated HOME"
-        )
-    )
-    eprint(
-        "[claude-wrangler] Pinned CLAUDE_CONFIG_DIR: {}".format(
-            resolved_config.layout.config_dir
-        )
-    )
-    eprint(
-        "[claude-wrangler] Reasonable permissions default: {}".format(
-            "enabled" if resolved_config.reasonable_permissions_enabled else "disabled"
-        )
-    )
-
-    write_text_file(
-        resolved_config.layout.local_package_json_path,
-        build_local_package_json(resolved_config.claude_version),
-        force=resolved_config.force,
-        dry_run=resolved_config.dry_run,
-        managed_content_predicate=local_package_json_looks_managed,
-    )
-    write_managed_supporting_files(resolved_config)
-
-    if resolved_config.reconfigure_only:
-        eprint(
-            "[claude-wrangler] Skipping npm install because this command only "
-            "updates managed launcher state."
-        )
-    elif resolved_config.dry_run:
-        if resolved_config.repair_install:
-            repair_managed_npm_install(resolved_config)
-        prune_orphaned_npm_staging_dirs(resolved_config)
-        eprint(
-            "[claude-wrangler] Would set: NPM_CONFIG_CACHE={}".format(
-                npm_local_environment(resolved_config)["NPM_CONFIG_CACHE"]
-            )
-        )
-        eprint(
-            "[claude-wrangler] Would run: {}".format(
-                " ".join(managed_npm_install_command(resolved_config, npm_name))
-            )
-        )
-    elif resolved_config.skip_install:
-        eprint("[claude-wrangler] Skipping npm install by request")
-    else:
-        if resolved_config.repair_install:
-            repair_managed_npm_install(resolved_config)
-        prune_orphaned_npm_staging_dirs(resolved_config)
-        run_command(
-            managed_npm_install_command(resolved_config, npm_name),
-            cwd=str(resolved_config.project_root),
-            env=npm_install_environment(resolved_config),
-            timeout_seconds=resolved_config.npm_timeout_seconds,
-        )
-        verify_local_claude_binary(resolved_config)
-
-    print(build_install_summary(resolved_config))
-    return 0
+    return build
 
 
-def update_operation(config: Config) -> int:
-    """Refresh the locally known Claude channel versions without upgrading."""
+def _rediscover_legacy(config: Config) -> Optional[LegacyState]:
+    """Re-read the legacy layout under the lock (discovery never writes)."""
 
-    require_existing_managed_install(config)
-
-    npm_name, _ = detect_npm_binaries()
-    ensure_command_exists("node")
-    ensure_command_exists(npm_name)
-
-    available_versions = fetch_available_claude_versions(
-        npm_name,
-        config.project_root,
-        env=npm_local_environment(config),
-        timeout_seconds=config.npm_timeout_seconds,
-    )
-    updated_config = replace(
-        config,
-        available_versions=available_versions,
-        available_versions_updated_at=utc_now_iso(),
-    )
-
-    eprint(
-        "[claude-wrangler] Target project root: {}".format(updated_config.project_root)
-    )
-    eprint("[claude-wrangler] Operation: update")
-    eprint("[claude-wrangler] Refreshing locally known stable/latest/next versions")
-
-    write_managed_supporting_files(updated_config)
-
-    print(
-        "NOTE: This command updates available version information, but does not "
-        'perform an upgrade; use "claude-wrangler --upgrade --channel '
-        '<stable|latest|next> [--version <latest|x.y.z>]" for that.'
-    )
-    print("")
-    print(build_available_versions_table(updated_config.available_versions))
-    if updated_config.available_versions_updated_at:
-        print("")
-        print("Updated at: {}".format(updated_config.available_versions_updated_at))
-    return 0
-
-
-def launcher_matches_expected(config: Config) -> bool:
-    """Return True when the launcher exactly matches the expected content."""
-
-    path = config.layout.launcher_path
-    if not path.exists() or not path.is_file():
-        return False
-    actual = path.read_text(encoding="utf-8")
-    return actual == build_launcher_content(config)
-
-
-def readme_matches_expected(config: Config) -> bool:
-    """Return True when the generated local README exactly matches expectation."""
-
-    path = config.layout.readme_path
-    if not path.exists() or not path.is_file():
-        return False
-    actual = path.read_text(encoding="utf-8")
-    return actual == build_local_readme_content(config)
-
-
-def gather_inspection_report(config: Config) -> Dict[str, Any]:
-    """Collect a conservative JSON inspection report for the target project."""
-
-    npm_name, npx_name = detect_npm_binaries()
-    metadata, metadata_parse_error = read_metadata_with_error(
-        config.layout.metadata_path
-    )
-    runtime_environment = collect_runtime_diagnostics(
-        config.project_root,
-        config.shared_home,
-        config.layout.claude_home_dir,
-        config.layout.config_dir,
-        npm_name,
-        npx_name,
-    )
-
-    gitignore_text = (
-        config.layout.gitignore_path.read_text(encoding="utf-8")
-        if config.layout.gitignore_path.exists()
-        else ""
-    )
-    gitignore_managed_block_present = (
-        GITIGNORE_BEGIN in gitignore_text and GITIGNORE_END in gitignore_text
-    )
-    local_claude_bin = local_claude_bin_path(config)
-    local_claude_package_json = local_claude_package_json_path(config)
-    expected_platform_packages = expected_claude_platform_package_names()
-    installed_platform_package_json = first_installed_platform_package(
-        config,
-        expected_platform_packages,
-    )
-    requested_claude_version, local_package_json_parse_error = (
-        infer_requested_version_with_error(config.layout.local_package_json_path)
-    )
-    installed_lockfile_version, local_package_lock_parse_error = (
-        infer_lockfile_version_with_error(config.layout.local_package_lock_path)
-    )
-
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "script_name": SCRIPT_NAME,
-        "script_version": SCRIPT_VERSION,
-        "generated_at": utc_now_iso(),
-        "project_root": str(config.project_root),
-        "operation": "inspect",
-        "known_versions": build_known_versions(
-            config.available_versions,
-            config.available_versions_updated_at,
+    candidates = [
+        config.legacy.dir_relative if config.legacy is not None else None,
+        config.legacy_migrated_from,
+        legacy_dir_from_launcher(
+            config.layout.launcher_path, config.layout.launch_config_path
         ),
-        "requested_configuration": {
+        LEGACY_LOCAL_DIR,
+    ]
+    return discover_legacy(config.project_root, legacy_dir_candidates(*candidates))
+
+
+def _legacy_metadata_document(
+    config: Config, legacy: LegacyState, generated_at: str
+) -> Dict[str, object]:
+    """Return updated schema-1 metadata for a migration-pending legacy layout.
+
+    `--update` and the settings toggles persist their results here (the
+    format npm-era releases read) until migration writes schema 2.
+    """
+
+    payload: Dict[str, object] = dict(legacy.metadata or {})
+    payload.update(
+        {
+            "schema_version": LEGACY_SCHEMA_VERSION,
+            "script_name": SCRIPT_NAME,
+            "script_version": SCRIPT_VERSION,
+            "generated_at": generated_at,
+            "project_root": str(config.project_root),
             "claude_selector": config.claude_selector,
             "claude_channel": config.claude_channel,
             "claude_version": config.claude_version,
             "shared_home": config.shared_home,
-            "reasonable_permissions_enabled": (config.reasonable_permissions_enabled),
+            "reasonable_permissions_enabled": config.reasonable_permissions_enabled,
+            "update_checks": config.update_checks,
+            "windows_sandbox_warning": config.windows_sandbox_warning,
+            "release_base_url": config.release_base_url,
             "version_source": config.version_source,
-        },
-        "runtime_environment": runtime_environment,
-        "paths": {
-            "local_dir": str(config.layout.local_dir),
-            "claude_home_dir": str(config.layout.claude_home_dir),
-            "claude_config_dir": str(config.layout.config_dir),
-            "launcher": str(config.layout.launcher_path),
-            "readme_local": str(config.layout.readme_path),
-            "local_package_json": str(config.layout.local_package_json_path),
-            "local_package_lock": str(config.layout.local_package_lock_path),
-            "local_claude_bin": str(local_claude_bin),
-            "local_claude_package_json": str(local_claude_package_json),
-            "local_claude_platform_package_json": (
-                str(installed_platform_package_json)
-                if installed_platform_package_json is not None
-                else None
-            ),
-            "metadata": str(config.layout.metadata_path),
-            "gitignore": str(config.layout.gitignore_path),
-        },
-        "state": {
-            "git_repository": (config.project_root / ".git").exists(),
-            "local_dir_exists": config.layout.local_dir.exists(),
-            "local_package_json_exists": config.layout.local_package_json_path.exists(),
-            "local_package_lock_exists": config.layout.local_package_lock_path.exists(),
-            "node_modules_exists": config.layout.local_node_modules_dir.exists(),
-            "local_claude_bin_exists": local_claude_bin.exists(),
-            "local_claude_bin_executable": (
-                os.access(local_claude_bin, os.X_OK)
-                if local_claude_bin.exists()
-                else False
-            ),
-            "expected_claude_platform_packages": expected_platform_packages,
-            "local_claude_platform_package_json_exists": (
-                installed_platform_package_json is not None
-            ),
-            "metadata_exists": metadata is not None,
-            "metadata_parse_error": metadata_parse_error,
-            "metadata": metadata,
             "available_versions": dict(config.available_versions),
             "available_versions_updated_at": config.available_versions_updated_at,
-            "reasonable_permissions_enabled": (config.reasonable_permissions_enabled),
-            "claude_home_exists": config.layout.claude_home_dir.exists(),
-            "claude_config_dir_exists": config.layout.config_dir.exists(),
-            "launcher_exists": config.layout.launcher_path.exists(),
-            "launcher_executable": (
-                os.access(config.layout.launcher_path, os.X_OK)
-                if config.layout.launcher_path.exists()
-                else False
-            ),
-            "launcher_matches_expected": launcher_matches_expected(config),
-            "readme_exists": config.layout.readme_path.exists(),
-            "readme_matches_expected": readme_matches_expected(config),
-            "gitignore_exists": config.layout.gitignore_path.exists(),
-            "gitignore_managed_block_present": gitignore_managed_block_present,
-            "requested_claude_version_in_package_json": requested_claude_version,
-            "local_package_json_parse_error": local_package_json_parse_error,
-            "installed_claude_version_in_package_dir": (
-                read_package_version(local_claude_package_json)
-            ),
-            "installed_claude_platform_package_version": (
-                read_package_version(installed_platform_package_json)
-            ),
-            "installed_claude_version_in_lockfile": installed_lockfile_version,
-            "local_package_lock_parse_error": local_package_lock_parse_error,
-            "node_found": runtime_environment["resolved_commands"]["node"]["found"],
-            "npm_found": runtime_environment["resolved_commands"]["npm"]["found"],
-            "npx_found": runtime_environment["resolved_commands"]["npx"]["found"],
-        },
-        "warnings": [],
-        "issues": [],
-    }
-
-    state = report["state"]
-    warnings = report["warnings"]
-    issues = report["issues"]
-
-    if not state["git_repository"]:
-        warnings.append("Target project root does not appear to be a git repository.")
-    if state["metadata_parse_error"]:
-        issues.append(
-            "Managed metadata could not be parsed: {}".format(
-                state["metadata_parse_error"]
-            )
-        )
-    if state["local_package_json_parse_error"]:
-        issues.append(
-            "Managed package.json could not be parsed: {}".format(
-                state["local_package_json_parse_error"]
-            )
-        )
-    if state["local_package_lock_parse_error"]:
-        issues.append(
-            "Managed package-lock.json could not be parsed: {}".format(
-                state["local_package_lock_parse_error"]
-            )
-        )
-    if state["local_package_json_exists"] and not state["node_modules_exists"]:
-        issues.append(
-            "Managed package manifest exists, but node_modules is missing. "
-            "The install may be incomplete."
-        )
-    if state["node_modules_exists"] and not state["local_claude_bin_exists"]:
-        issues.append(
-            "Managed node_modules exists, but the local Claude executable is "
-            "missing."
-        )
-    if state["local_claude_bin_exists"] and not state["local_claude_bin_executable"]:
-        issues.append("Local Claude executable exists but is not executable.")
-    if (
-        state["expected_claude_platform_packages"]
-        and state["node_modules_exists"]
-        and not state["local_claude_platform_package_json_exists"]
-    ):
-        issues.append(
-            "No expected platform package ({}) has its package.json under "
-            "node_modules.".format(
-                ", ".join(state["expected_claude_platform_packages"])
-            )
-        )
-    if state["launcher_exists"] and not state["launcher_matches_expected"]:
-        warnings.append(
-            "Launcher exists but does not exactly match the expected "
-            "generated content."
-        )
-    if state["readme_exists"] and not state["readme_matches_expected"]:
-        warnings.append(
-            "Local README exists but does not exactly match the expected "
-            "generated content."
-        )
-    if not state["gitignore_managed_block_present"]:
-        warnings.append("Managed .gitignore block is not present.")
-    package_manager = runtime_environment["package_manager_declaration"]
-    if package_manager and package_manager.get("read_error"):
-        warnings.append(
-            "Target project package.json could not be parsed for "
-            "packageManager: {}".format(package_manager["read_error"])
-        )
-    selector_alignment = runtime_environment["selector_alignment"]
-    if (
-        selector_alignment["status"] in ("mismatch", "unknown")
-        and selector_alignment["signals_present"]
-    ):
-        warnings.append(selector_alignment["summary"])
-    requested_claude_version = state["requested_claude_version_in_package_json"]
-    installed_package_dir_version = state["installed_claude_version_in_package_dir"]
-    installed_lockfile_version = state["installed_claude_version_in_lockfile"]
-    if (
-        requested_claude_version
-        and installed_package_dir_version
-        and requested_claude_version != installed_package_dir_version
-    ):
-        issues.append(
-            "Managed package.json requests {} {}, but node_modules contains "
-            "{}.".format(
-                CLAUDE_PACKAGE_NAME,
-                requested_claude_version,
-                installed_package_dir_version,
-            )
-        )
-    if (
-        requested_claude_version
-        and installed_lockfile_version
-        and requested_claude_version != installed_lockfile_version
-    ):
-        issues.append(
-            "Managed package.json requests {} {}, but package-lock records "
-            "{}.".format(
-                CLAUDE_PACKAGE_NAME,
-                requested_claude_version,
-                installed_lockfile_version,
-            )
-        )
-    if not state["node_found"] or not state["npm_found"]:
-        issues.append("Required node/npm commands are not available in PATH.")
-    if metadata and metadata.get("project_root") != str(config.project_root):
-        issues.append(
-            "Managed metadata project_root does not match the inspected "
-            "project root."
-        )
-
-    return report
+            "paths": {
+                "local_dir": legacy.dir_relative,
+                "claude_home_dir": config.layout.claude_home_relative,
+                "claude_config_dir": config.layout.config_dir_relative,
+                "launcher": config.layout.launcher_relative,
+                "readme_local": config.layout.readme_relative,
+            },
+        }
+    )
+    return payload
 
 
-def inspect_operation(config: Config) -> int:
-    """Emit a JSON inspection report to stdout."""
+def _publish_native(
+    config: Config, services: Services, generated_at: Optional[str] = None
+) -> Config:
+    """Write schema-2 metadata, then every generated file, atomically."""
 
-    report = gather_inspection_report(config)
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if not report["issues"] else 1
+    stamp = generated_at or format_utc(services.clock())
+    write_metadata(
+        config.layout.metadata_path,
+        build_metadata(config, generated_at=stamp),
+        dry_run=config.dry_run,
+    )
+    write_generated_files(config)
+    return config
 
 
-def uninstall_operation(config: Config) -> int:
-    """Conservatively remove the managed installation.
+def _publish_legacy_mode(
+    config: Config, services: Services, legacy: LegacyState
+) -> bool:
+    """Render the Node-free legacy launcher and persist legacy metadata.
 
-    The managed config dir holds Claude auth and session history; like the
-    codex-wrangler home-directory removal, it is removed only as part of a
-    proven uninstall, after the launcher and README ownership checks.
+    Returns False (and writes no launcher) when no runnable legacy binary
+    exists, so a launcher never points at a runtime that does not exist.
     """
 
-    report = gather_inspection_report(config)
+    key = None
+    try:
+        key = select_platform_key(services, config.platform_override)
+    except ClaudeWranglerError as exc:
+        eprint("[claude-wrangler] Warning: {}".format(exc))
+    binary = (
+        select_legacy_launch_binary(
+            config.project_root, legacy, key, services.check_structure
+        )
+        if key is not None
+        else None
+    )
+    stamp = format_utc(services.clock())
+    write_metadata(
+        legacy.dir / METADATA_FILENAME,
+        _legacy_metadata_document(config, legacy, stamp),
+        dry_run=config.dry_run,
+    )
+    if binary is None:
+        eprint(
+            "[claude-wrangler] Warning: migration pending and no runnable Claude "
+            "Code binary was found in {}; the launcher was not rewritten. Run "
+            "`{} .` to install the native runtime.".format(legacy.dir, SCRIPT_NAME)
+        )
+        return False
+    write_generated_files(config, LegacyLaunch(binary, legacy.version))
+    eprint(
+        "[claude-wrangler] Migration pending: the launcher runs {} directly (no "
+        "Node.js) until install, upgrade, or repair migrates the project.".format(
+            binary
+        )
+    )
+    return True
 
-    if not report["state"]["metadata_exists"] and not config.force:
+
+def _report_cleanup(result, legacy_dir: Path) -> None:
+    """Print what a legacy cleanup removed, renamed aside, or left."""
+
+    for name in result.removed:
+        eprint("[claude-wrangler] Removed legacy {}".format(legacy_dir / name))
+    for name in result.retired:
+        eprint(
+            "[claude-wrangler] Legacy entry in use; renamed to {} for a later "
+            "install, upgrade, or repair to delete.".format(legacy_dir / name)
+        )
+    for name, reason in result.left:
+        eprint(
+            "[claude-wrangler] Could not remove legacy {} ({}); a later install, "
+            "upgrade, or repair retries.".format(legacy_dir / name, reason)
+        )
+
+
+def _cleanup_runtime(store: RuntimeStore, services: Services) -> None:
+    """Delete staging and retired entries nothing runs from (fail closed)."""
+
+    def report(path: Path, exc: BaseException) -> None:
+        """Report a cleanup failure without failing the operation."""
+
+        eprint(
+            "[claude-wrangler] Could not remove {} ({}); --repair-install retries "
+            "once nothing runs from it.".format(path, exc)
+        )
+
+    removed = store.cleanup_staging_and_retired(
+        in_use_fail_closed(services), on_error=report
+    )
+    for entry in removed:
+        eprint("[claude-wrangler] Cleaned up {}".format(entry))
+
+
+def _retry_legacy_cleanup(
+    config: Config, services: Services, legacy: Optional[LegacyState], stamp: str
+) -> None:
+    """Finish a deferred legacy cleanup when the native runtime is in charge."""
+
+    if legacy is None or not legacy.cleanup_residue:
+        return
+    if not legacy.is_projection and not config.dry_run:
+        version = config.claude_version or legacy.version or ""
+        atomic_write_text(
+            legacy.dir / METADATA_FILENAME,
+            projection_text(
+                build_projection(
+                    config,
+                    legacy,
+                    version=version,
+                    channel=config.claude_channel or "stable",
+                    generated_at=stamp,
+                )
+            ),
+        )
+    result = cleanup_legacy_tree(
+        legacy.dir,
+        in_use=in_use_fail_closed(services),
+        txid=uuid.uuid4().hex[:12],
+        dry_run=config.dry_run,
+    )
+    _report_cleanup(result, legacy.dir)
+
+
+@dataclass
+class InstallOutcome:
+    """What an install-like transaction did."""
+
+    config: Config
+    summary: str
+    interrupted: bool = False
+    notes: List[str] = field(default_factory=list)
+
+
+def _resolve_target(
+    config: Config, source_factory: Callable[[], object]
+) -> Tuple[str, Optional[object]]:
+    """Return the exact target version and the release source if one was built."""
+
+    if config.claude_version and is_exact_version(config.claude_version):
+        return config.claude_version, None
+    source = source_factory()
+    version = source.channel_version(config.claude_channel or "stable")
+    eprint(
+        "[claude-wrangler] The {} channel currently points at {}".format(
+            config.claude_channel, version
+        )
+    )
+    return version, source
+
+
+def _install_release(
+    config: Config,
+    services: Services,
+    store: RuntimeStore,
+    *,
+    version: str,
+    channel: str,
+    source: Optional[object],
+    platform_key: str,
+    adopt_from: Optional[LegacyState] = None,
+    allow_invalid_pointer: bool = False,
+    target_slot: Optional[str] = None,
+) -> Tuple[str, bool, str]:
+    """Download (or adopt), validate, and promote one release.
+
+    Returns `(slot, interrupted, platform_key)`. The active slot is never
+    touched; the release goes into the inactive (or given) slot.
+    """
+
+    check_version_floor(version)
+    if source is None:
+        source = services.release_source(
+            config.release_base_url, config.download_timeout_seconds, config.ca_bundle
+        )
+    bundle = source.fetch_manifest_bundle(version)
+    key = select_platform_key(
+        services, config.platform_override, bundle.verified.artifacts.keys()
+    )
+    artifact_for(bundle, key)
+    active = read_pointer_quietly(store)
+    if target_slot is None:
+        target_slot = other_slot(active) if active is not None else SLOT_NAMES[0]
+    if target_slot == active:
         raise ClaudeWranglerError(
-            "Managed metadata was not found at {}. Refusing to uninstall "
-            "without --force because ownership cannot be proven.".format(
-                config.layout.metadata_path
+            "Refusing to prepare slot {} because it is active.".format(target_slot)
+        )
+    prepared = prepare_candidate(
+        config,
+        services,
+        store,
+        source=source,
+        bundle=bundle,
+        platform_key=key,
+        slot=target_slot,
+        channel=channel,
+        adopt_candidates=(
+            legacy_binary_candidates(adopt_from.dir, key)
+            if adopt_from is not None
+            else ()
+        ),
+        carry_from_slots=[name for name in (active, target_slot) if name is not None],
+    )
+    outcome = promote_candidate(
+        config,
+        services,
+        store,
+        prepared,
+        active_slot=active,
+        launcher_env=_launcher_env_factory(config, services),
+        allow_invalid_pointer=allow_invalid_pointer,
+    )
+    eprint(
+        "[claude-wrangler] Slot {} now holds Claude Code {} and is active".format(
+            outcome.slot, version
+        )
+    )
+    return outcome.slot, outcome.interrupted, key
+
+
+def _migrate(
+    config: Config,
+    services: Services,
+    store: RuntimeStore,
+    legacy: LegacyState,
+) -> InstallOutcome:
+    """Move an npm-era layout onto the native runtime (migration spec 5).
+
+    Order: discover (done), prepare and validate the candidate (adopted or
+    downloaded), promote it, write schema-2 metadata (the commit point),
+    write the launcher, shims, and README, write the schema-1 projection,
+    then clean the npm tree. Before the metadata write the legacy launcher
+    and npm tree are untouched and keep working.
+    """
+
+    # An explicit target (--upgrade, or --channel/--version on install) wins;
+    # otherwise migration keeps the version the npm-era install pinned.
+    explicit = config.operation == "upgrade" or (
+        config.channel_explicit or config.version_explicit
+    )
+    if explicit:
+        version = config.claude_version
+        channel = config.claude_channel or "stable"
+    else:
+        version = legacy.version
+        channel = legacy.channel or config.claude_channel or "stable"
+        if legacy.channel_deprecated:
+            eprint(channel_deprecation_message("next"))
+    eprint(
+        "[claude-wrangler] Migrating the npm-era layout at {} to the native "
+        "runtime".format(legacy.dir)
+    )
+    source: Optional[object] = None
+    if version is None:
+        if not explicit:
+            raise ClaudeWranglerError(
+                "Cannot tell which Claude Code version the npm-era layout in {} "
+                "pins. Run `{} --upgrade --channel <stable|latest> .` to choose "
+                "one explicitly.".format(legacy.dir, SCRIPT_NAME)
+            )
+        version, source = _resolve_target(
+            config,
+            lambda: services.release_source(
+                config.release_base_url,
+                config.download_timeout_seconds,
+                config.ca_bundle,
+            ),
+        )
+    try:
+        check_version_floor(version)
+    except DistributionError as exc:
+        raise ClaudeWranglerError(
+            "The npm-era install pins Claude Code {}, older than {}, the oldest "
+            "native release claude-wrangler installs. It will not upgrade "
+            "silently: run `{} --upgrade --channel {} .` to move to a supported "
+            "release explicitly.".format(version, VERSION_FLOOR, SCRIPT_NAME, channel)
+        ) from exc
+
+    host_key = select_platform_key(services, config.platform_override)
+    active = active_slot_for(store, host_key)
+    interrupted = False
+    key = host_key
+    active_record = store.slot_record(active) if active is not None else None
+    if active_record is not None and active_record.version == version:
+        eprint(
+            "[claude-wrangler] Slot {} already holds Claude Code {}; reusing it".format(
+                active, version
             )
         )
-
-    remove_file_if_managed(
-        config.layout.launcher_path,
-        build_launcher_content(config),
-        force=config.force,
-        dry_run=config.dry_run,
-        label="launcher",
-    )
-    remove_file_if_managed(
-        config.layout.readme_path,
-        build_local_readme_content(config),
-        force=config.force,
-        dry_run=config.dry_run,
-        label="local README",
-    )
-    remove_gitignore_block(config.layout.gitignore_path, dry_run=config.dry_run)
-    remove_tree(
-        config.layout.local_dir,
-        label="managed local directory",
-        project_root=config.project_root,
-        dry_run=config.dry_run,
-    )
-    if not config.shared_home:
-        remove_tree(
-            config.layout.claude_home_dir,
-            label="managed Claude home directory",
-            project_root=config.project_root,
-            dry_run=config.dry_run,
+    else:
+        _slot, interrupted, key = _install_release(
+            config,
+            services,
+            store,
+            version=version,
+            channel=channel,
+            source=source,
+            platform_key=host_key,
+            adopt_from=legacy,
         )
-    remove_tree(
-        config.layout.config_dir,
-        label="managed Claude config directory",
-        project_root=config.project_root,
-        dry_run=config.dry_run,
+
+    stamp = format_utc(services.clock())
+    migrated = replace(
+        config,
+        claude_version=version,
+        claude_channel=channel,
+        claude_selector=(
+            config.claude_selector if explicit else (legacy.selector or version)
+        ),
+        version_source=(
+            config.version_source
+            if explicit
+            else "migrated from the npm-era layout ({})".format(
+                legacy.version_source or "legacy"
+            )
+        ),
+        platform_key=key,
+        legacy_migrated_from=legacy.dir_relative,
+        legacy_migrated_at=stamp,
     )
-    maybe_remove_empty_parent(
-        config.layout.config_dir,
-        stop_at=config.project_root,
-        dry_run=config.dry_run,
+    if migrated.claude_selector not in ("latest",) and not is_exact_version(
+        migrated.claude_selector
+    ):
+        migrated = replace(migrated, claude_selector=version)
+    _publish_native(migrated, services, generated_at=stamp)
+    atomic_write_text(
+        legacy.dir / METADATA_FILENAME,
+        projection_text(
+            build_projection(
+                migrated, legacy, version=version, channel=channel, generated_at=stamp
+            )
+        ),
     )
-    maybe_remove_empty_parent(
-        config.layout.launcher_path,
-        stop_at=config.project_root,
-        dry_run=config.dry_run,
+    eprint(
+        "[claude-wrangler] Wrote the schema-1 compatibility projection {}".format(
+            legacy.dir / METADATA_FILENAME
+        )
     )
+    result = cleanup_legacy_tree(
+        legacy.dir,
+        in_use=in_use_fail_closed(services),
+        txid=uuid.uuid4().hex[:12],
+    )
+    _report_cleanup(result, legacy.dir)
+    return InstallOutcome(
+        migrated,
+        "migrated from {} (Claude Code {})".format(legacy.dir_relative, version),
+        interrupted,
+    )
+
+
+@dataclass
+class RepairReport:
+    """What `--repair-install` found and changed before any download."""
+
+    cleaned: List[str] = field(default_factory=list)
+    verified: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    pointer_before: Optional[str] = None
+    pointer_after: Optional[str] = None
+    fallback: Optional[Dict[str, object]] = None
+    notes: List[str] = field(default_factory=list)
+
+
+def _read_fallback(config: Config) -> Optional[Dict[str, object]]:
+    """Return the launcher's fallback.json record, if any."""
+
+    path = config.layout.fallback_path
+    try:
+        payload = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _repair_runtime(
+    config: Config, services: Services, store: RuntimeStore, host_key: str
+) -> Tuple[RepairReport, Optional[str]]:
+    """Run repair requirement 10 up to (not including) a re-download.
+
+    Clears `.staging/`, deletes `.retired/` entries no longer in use,
+    re-verifies both slots offline, and repairs the pointer by choosing the
+    verified slot whose version matches metadata. When the active slot is
+    corrupt but the other slot verifies, the pointer moves to it first so
+    the corrupt slot becomes the inactive one a re-download replaces.
+    Returns the report and the slot that should be active, if any.
+    """
+
+    report = RepairReport()
+    report.fallback = _read_fallback(config)
+    if report.fallback is not None:
+        eprint(
+            "[claude-wrangler] The launcher recorded a fallback: {}".format(
+                json.dumps(report.fallback, sort_keys=True)
+            )
+        )
+    if store.root.is_dir():
+        _cleanup_runtime(store, services)
+    verifications = {
+        name: verify_slot_offline(store, name, services, host_key)
+        for name in SLOT_NAMES
+    }
+    for name, result in verifications.items():
+        report.verified[name] = result.as_dict()
+        if result.present and not result.ok:
+            eprint("[claude-wrangler] Repair: {}".format(result.problem))
+    pointer = read_pointer_quietly(store)
+    report.pointer_before = pointer
+    pinned = config.claude_version
+    good = [name for name in SLOT_NAMES if verifications[name].ok]
+    chosen: Optional[str] = None
+    if pointer is not None and verifications[pointer].ok:
+        chosen = pointer
+    else:
+        matching = [name for name in good if verifications[name].version == pinned]
+        if matching:
+            chosen = matching[0]
+        elif good:
+            chosen = good[0]
+        if chosen is not None and not config.dry_run:
+            store.set_active(chosen)
+            eprint(
+                "[claude-wrangler] Repaired the active-slot pointer: slot {} "
+                "(Claude Code {})".format(chosen, verifications[chosen].version)
+            )
+            if pinned is not None and verifications[chosen].version != pinned:
+                # The launcher's own fallback already ran this slot; say so,
+                # because a failed re-download leaves it active.
+                eprint(
+                    "[claude-wrangler] Repair: slot {} runs Claude Code {} until "
+                    "the pinned {} is re-downloaded into slot {}; if that "
+                    "download fails, the project keeps running {} and a later "
+                    "--repair-install retries.".format(
+                        chosen,
+                        verifications[chosen].version,
+                        pinned,
+                        other_slot(chosen),
+                        verifications[chosen].version,
+                    )
+                )
+    report.pointer_after = chosen if chosen is not None else pointer
+    return report, chosen
+
+
+def _needs_release(
+    store: RuntimeStore, active: Optional[str], version: str, key: str
+) -> bool:
+    """Return True unless the active slot already holds ``version`` for ``key``."""
+
+    if active is None:
+        return True
+    record = store.slot_record(active)
+    if record is None or record.version != version:
+        return True
+    return store.slot_problem(active, key) is not None
+
+
+def _install_locked(
+    config: Config, services: Services, store: RuntimeStore
+) -> InstallOutcome:
+    """Install, upgrade, or repair with the maintenance lock held.
+
+    A plain install keeps the pinned version (downloading it only when the
+    active slot lacks it); `--channel`, `--version`, and `--upgrade` choose
+    a new target. A new release always goes into the inactive slot.
+    """
+
+    store.validate()
+    legacy = _rediscover_legacy(config)
+    host_key = select_platform_key(services, config.platform_override)
+    native_generated_at = (
+        config.existing_metadata.get("generated_at")
+        if isinstance(config.existing_metadata, dict)
+        else None
+    )
+
+    repair: Optional[RepairReport] = None
+    verified_active: Optional[str] = None
+    if config.repair_install:
+        repair, verified_active = _repair_runtime(config, services, store, host_key)
+    native_complete = native_runtime_complete(store, host_key)
+    if legacy_is_authoritative(legacy, native_complete, native_generated_at):
+        return _migrate(config, services, store, legacy)
+
+    if config.repair_install:
+        active = verified_active
+    else:
+        try:
+            active = store.active_slot()
+        except PointerError as exc:
+            raise ClaudeWranglerError(
+                "{} Run `{} --repair-install .`.".format(exc, SCRIPT_NAME)
+            ) from exc
+
+    working = config
+    keeps_pin = config.operation == "install" and not (
+        config.channel_explicit or config.version_explicit
+    )
+    if keeps_pin and not config.claude_version and active is not None:
+        # No recorded pin (for example, lost metadata): keep what is active.
+        record = store.slot_record(active)
+        if record is not None:
+            working = replace(working, claude_version=record.version)
+
+    version, source = _resolve_target(
+        working,
+        lambda: services.release_source(
+            config.release_base_url, config.download_timeout_seconds, config.ca_bundle
+        ),
+    )
+    channel = working.claude_channel or "stable"
+    interrupted = False
+    key = host_key
+    if _needs_release(store, active, version, host_key):
+        target_slot: Optional[str] = None
+        if config.repair_install:
+            pointer = read_pointer_quietly(store)
+            target_slot = other_slot(pointer) if pointer is not None else SLOT_NAMES[0]
+        _slot, interrupted, key = _install_release(
+            working,
+            services,
+            store,
+            version=version,
+            channel=channel,
+            source=source,
+            platform_key=host_key,
+            allow_invalid_pointer=config.repair_install,
+            target_slot=target_slot,
+        )
+        summary = "installed Claude Code {} for {}".format(version, key)
+    else:
+        summary = "Claude Code {} already installed for {} (slot {})".format(
+            version, key, active
+        )
+        eprint("[claude-wrangler] {}".format(summary))
+
+    final = replace(
+        working,
+        claude_version=version,
+        claude_channel=channel,
+        platform_key=key,
+    )
+    stamp = format_utc(services.clock())
+    _publish_native(final, services, generated_at=stamp)
+    _retry_legacy_cleanup(final, services, legacy, stamp)
+    _cleanup_runtime(store, services)
+    notes: List[str] = []
+    if repair is not None:
+        if config.layout.fallback_path.exists():
+            try:
+                config.layout.fallback_path.unlink()
+                notes.append("cleared the resolved launcher fallback record")
+            except OSError as exc:
+                notes.append("could not clear fallback.json: {}".format(exc))
+        notes.append(
+            "repair: active-slot pointer {} -> {}".format(
+                repair.pointer_before, read_pointer_quietly(store)
+            )
+        )
+    return InstallOutcome(final, summary, interrupted, notes)
+
+
+def _print_plan(config: Config, services: Services) -> int:
+    """Describe what an install-like operation would do (no network, no writes)."""
+
+    store = runtime_store(config)
+    host_key: Optional[str] = None
+    try:
+        host_key = select_platform_key(services, config.platform_override)
+    except ClaudeWranglerError as exc:
+        eprint("[claude-wrangler] Would fail: {}".format(exc))
+    native_complete = host_key is not None and native_runtime_complete(store, host_key)
+    generated_at = (
+        config.existing_metadata.get("generated_at")
+        if isinstance(config.existing_metadata, dict)
+        else None
+    )
+    legacy = config.legacy
+    eprint("[claude-wrangler] Dry run: nothing is downloaded, promoted, or written")
+    if config.reconfigure_only or config.skip_install:
+        eprint("[claude-wrangler] Would only rewrite managed files from stored state")
+    elif legacy is not None and legacy_is_authoritative(
+        legacy, native_complete, generated_at
+    ):
+        eprint(
+            "[claude-wrangler] Would migrate the npm-era layout at {} (pinned "
+            "version {})".format(legacy.dir, legacy.version or "unknown")
+        )
+    else:
+        if config.repair_install:
+            eprint(
+                "[claude-wrangler] Would clear staging, delete idle retired slots, "
+                "re-verify both slots offline, and repair the pointer"
+            )
+        active = active_slot_for(store, host_key) if host_key else None
+        record = store.slot_record(active) if active is not None else None
+        if (
+            record is not None
+            and config.claude_version is not None
+            and record.version == config.claude_version
+        ):
+            eprint(
+                "[claude-wrangler] Claude Code {} is already installed (slot {})".format(
+                    record.version, active
+                )
+            )
+        else:
+            eprint(
+                "[claude-wrangler] Would install Claude Code {} ({} channel) for {} "
+                "into the inactive slot".format(
+                    config.claude_version
+                    or "the current {} release".format(config.claude_channel),
+                    config.claude_channel,
+                    host_key or "this host",
+                )
+            )
+    write_generated_files(config)
+    return 0
+
+
+def _reconfigure(
+    config: Config, services: Services, store: RuntimeStore
+) -> InstallOutcome:
+    """Rewrite managed files from stored state (toggles and --skip-install)."""
+
+    store.validate()
+    legacy = _rediscover_legacy(config)
+    host_key = None
+    try:
+        host_key = select_platform_key(services, config.platform_override)
+    except ClaudeWranglerError:
+        host_key = None
+    native_complete = native_runtime_complete(store, host_key)
+    generated_at = (
+        config.existing_metadata.get("generated_at")
+        if isinstance(config.existing_metadata, dict)
+        else None
+    )
+    if legacy_is_authoritative(legacy, native_complete, generated_at):
+        _publish_legacy_mode(config, services, legacy)
+        return InstallOutcome(config, "migration pending; managed files rewritten")
+    working = config
+    active = active_slot_for(store, host_key) if host_key else None
+    if active is not None:
+        record = store.slot_record(active)
+        if record is not None:
+            working = replace(
+                working, claude_version=record.version, platform_key=host_key
+            )
+    _publish_native(working, services)
+    return InstallOutcome(working, "managed files rewritten; runtime unchanged")
+
+
+def install_like_operation(config: Config, services: Optional[Services] = None) -> int:
+    """Install, upgrade, or repair the native runtime, or rewrite managed files."""
+
+    services = services or default_services()
+    eprint("[claude-wrangler] Target project root: {}".format(config.project_root))
+    eprint("[claude-wrangler] Operation: {}".format(config.operation))
+    if config.dry_run:
+        ensure_gitignore_block(config)
+        return _print_plan(config, services)
+    check_config_settings(config.layout.config_settings_path)
+    check_runtime_placement(config, services.environ)
+    if config.platform_override is not None:
+        # Refuse another operating system's build before creating anything.
+        select_platform_key(services, config.platform_override)
+    store = runtime_store(config)
+    with store.lock():
+        require_unchanged_state(config)
+        ensure_gitignore_block(config)
+        if config.reconfigure_only or config.skip_install:
+            outcome = _reconfigure(config, services, store)
+        else:
+            outcome = _install_locked(config, services, store)
+    print(build_install_summary(outcome.config, outcome.summary))
+    for note in outcome.notes:
+        print(note)
+    if outcome.interrupted:
+        raise KeyboardInterrupt
+    return 0
+
+
+def update_operation(config: Config, services: Optional[Services] = None) -> int:
+    """Refresh the known channel versions from signed manifests; never upgrade."""
+
+    services = services or default_services()
+    if config.existing_metadata is None and config.legacy is None:
+        raise ClaudeWranglerError(
+            "No managed Claude install was found under {}. Run `{} .` first, then "
+            "rerun `{} --update`.".format(config.project_root, SCRIPT_NAME, SCRIPT_NAME)
+        )
+    eprint("[claude-wrangler] Target project root: {}".format(config.project_root))
+    eprint("[claude-wrangler] Operation: update")
+    eprint("[claude-wrangler] Refreshing stable and latest from signed manifests")
+    if config.dry_run:
+        ensure_gitignore_block(config)
+        eprint("[claude-wrangler] Dry run: the release server is not contacted")
+        return 0
+    check_config_settings(config.layout.config_settings_path)
+    check_runtime_placement(config, services.environ)
+    store = runtime_store(config)
+    with store.lock():
+        require_unchanged_state(config)
+        ensure_gitignore_block(config)
+        source = services.release_source(
+            config.release_base_url, config.download_timeout_seconds, config.ca_bundle
+        )
+        results = refresh_catalog(source)
+        checked_at = format_utc(services.clock())
+        updated = apply_catalog(config, results, checked_at)
+        previous = None
+        try:
+            previous = json.loads(
+                config.layout.update_check_path.read_bytes().decode("utf-8")
+            )
+        except (OSError, UnicodeDecodeError, ValueError):
+            previous = None
+        cache = update_check_cache(
+            updated,
+            results,
+            checked_at,
+            previous if isinstance(previous, dict) else None,
+        )
+        atomic_write_text(
+            config.layout.update_check_path,
+            json.dumps(cache, indent=2, sort_keys=True) + "\n",
+        )
+        legacy = _rediscover_legacy(config)
+        host_key = None
+        try:
+            host_key = select_platform_key(services, config.platform_override)
+        except ClaudeWranglerError:
+            host_key = None
+        generated_at = (
+            config.existing_metadata.get("generated_at")
+            if isinstance(config.existing_metadata, dict)
+            else None
+        )
+        if legacy_is_authoritative(
+            legacy, native_runtime_complete(store, host_key), generated_at
+        ):
+            _publish_legacy_mode(updated, services, legacy)
+        else:
+            active = active_slot_for(store, host_key) if host_key else None
+            if active is not None:
+                record = store.slot_record(active)
+                if record is not None:
+                    updated = replace(updated, claude_version=record.version)
+            _publish_native(updated, services)
 
     print(
-        "Uninstall complete for {}{}.".format(
-            config.project_root,
-            " (dry-run)" if config.dry_run else "",
+        "NOTE: This command updates available version information, but does not "
+        'perform an upgrade; use "claude-wrangler --upgrade --channel '
+        '<stable|latest> [--version <latest|x.y.z>]" for that.'
+    )
+    print("")
+    print(
+        build_available_versions_table(
+            updated.available_versions, updated.available_version_details
         )
+    )
+    print("")
+    print("Checked at: {}".format(checked_at))
+    errors = {
+        channel: result.error for channel, result in results.items() if not result.ok
+    }
+    for channel, error in sorted(errors.items()):
+        print("ERROR: {} channel: {}".format(channel, error))
+    note = newer_release_note(updated)
+    if note:
+        print(note)
+    return 1 if errors else 0
+
+
+def rollback_operation(config: Config, services: Optional[Services] = None) -> int:
+    """Make the other slot active after an in-use check and offline re-verification."""
+
+    services = services or default_services()
+    eprint("[claude-wrangler] Target project root: {}".format(config.project_root))
+    eprint("[claude-wrangler] Operation: rollback")
+    store = runtime_store(config)
+    if not store.root.is_dir():
+        raise ClaudeWranglerError(
+            "No native runtime exists under {}; nothing to roll back.".format(
+                store.root
+            )
+        )
+    check_config_settings(config.layout.config_settings_path)
+    host_key = select_platform_key(services, config.platform_override)
+    with store.lock():
+        require_unchanged_state(config)
+        ensure_gitignore_block(config)
+        store.validate()
+        try:
+            active = store.active_slot()
+        except PointerError as exc:
+            raise ClaudeWranglerError(
+                "{} Run `{} --repair-install .` instead of rolling back.".format(
+                    exc, SCRIPT_NAME
+                )
+            ) from exc
+        if active is None:
+            raise ClaudeWranglerError(
+                "No active runtime slot exists; nothing to roll back."
+            )
+        target = other_slot(active)
+        record = store.slot_record(target)
+        problem = store.slot_problem(target, host_key)
+        if record is None or problem is not None:
+            raise ClaudeWranglerError(
+                "There is no complete rollback slot ({}).".format(
+                    problem or "slot {} is empty".format(target)
+                )
+            )
+        require_idle(
+            config,
+            services,
+            store.slot_dir(target),
+            purpose="Refusing to roll back to slot {}".format(target),
+            stop_binaries=slot_binaries(store, active) + slot_binaries(store, target),
+            launcher_env=_launcher_env_factory(config, services),
+        )
+        verification = verify_slot_offline(store, target, services, host_key)
+        if not verification.ok:
+            raise ClaudeWranglerError(
+                "Refusing to roll back: {}".format(verification.problem)
+            )
+        if config.dry_run:
+            eprint(
+                "[claude-wrangler] Would make slot {} (Claude Code {}) active".format(
+                    target, record.version
+                )
+            )
+            return 0
+        store.set_active(target)
+        channel = (
+            record.channel
+            if record.channel in ("stable", "latest")
+            else (config.claude_channel)
+        )
+        rolled = replace(
+            config,
+            claude_version=record.version,
+            claude_selector=record.version,
+            claude_channel=channel,
+            version_source="rollback to slot {}".format(target),
+            platform_key=host_key,
+            launcher_python=config.launcher_python,
+        )
+        _publish_native(rolled, services)
+    print(
+        "Rolled back: slot {} (Claude Code {}) is active; slot {} is kept as the "
+        "rollback target.".format(target, record.version, active)
     )
     return 0
 
 
-def selftest_operation(config: Config) -> int:
-    """Run a pessimistic verification suite against the managed install."""
+def _managed_residue(config: Config, legacy: Optional[LegacyState]) -> List[str]:
+    """Return managed paths that still exist after an uninstall attempt."""
 
-    npm_name, _ = detect_npm_binaries()
+    layout = config.layout
+    candidates = [
+        layout.local_dir,
+        layout.launcher_path,
+        layout.launcher_cmd_path,
+        layout.readme_path,
+        layout.config_dir,
+    ]
+    if not config.shared_home:
+        candidates.append(layout.claude_home_dir)
+    if legacy is not None:
+        candidates.append(legacy.dir)
+    return [str(path) for path in candidates if os.path.lexists(str(path))]
 
-    report = gather_inspection_report(config)
-    results: List[SelfTestResult] = []
 
-    def record(name: str, ok: bool, detail: str) -> None:
-        results.append(SelfTestResult(name=name, ok=ok, detail=detail))
+def _outermost_missing_dir(path: Path, stop_at: Path) -> Optional[Path]:
+    """Return the outermost missing directory from ``stop_at`` down to ``path``."""
 
-    state = report["state"]
-    runtime_environment = report["runtime_environment"]
-    resolved_commands = runtime_environment["resolved_commands"]
-    record(
-        "metadata_exists", bool(state["metadata_exists"]), "managed metadata missing"
-    )
-    record(
-        "launcher_matches_expected",
-        bool(state["launcher_matches_expected"]),
-        "launcher missing or not exactly as expected",
-    )
-    record(
-        "readme_matches_expected",
-        bool(state["readme_matches_expected"]),
-        "local README missing or not exactly as expected",
-    )
-    record(
-        "gitignore_managed_block_present",
-        bool(state["gitignore_managed_block_present"]),
-        "managed .gitignore block missing",
-    )
-    record(
-        "installed_claude_version_present",
-        bool(state["installed_claude_version_in_lockfile"]),
-        "installed Claude version could not be inferred from package-lock.json",
-    )
-    record(
-        "node_command_found",
-        bool(state["node_found"]),
-        "node command is not available in PATH",
-    )
-    record(
-        "npm_command_found",
-        bool(state["npm_found"]),
-        "npm command is not available in PATH",
-    )
-    record(
-        "local_claude_bin_exists",
-        bool(state.get("local_claude_bin_exists")),
-        "local Claude executable is missing from node_modules/.bin",
-    )
-    record(
-        "local_claude_bin_executable",
-        bool(state.get("local_claude_bin_executable")),
-        "local Claude executable is not executable",
-    )
-    selector_alignment = runtime_environment["selector_alignment"]
-    record(
-        "runtime_selector_alignment",
-        selector_alignment["status"] != "mismatch",
-        selector_alignment["summary"],
-    )
+    missing: Optional[Path] = None
+    current = path
+    while current != stop_at and current != current.parent:
+        if os.path.lexists(str(current)):
+            break
+        missing = current
+        current = current.parent
+    return missing
 
-    if state["launcher_exists"] and state["launcher_matches_expected"]:
-        try:
-            version_result = run_command(
-                [str(config.layout.launcher_path), "--version"],
-                cwd=str(config.project_root),
-                capture_output=True,
-            )
-        except ClaudeWranglerError as exc:
-            record("launcher_version_runs", False, str(exc))
-        else:
-            version_text = (version_result.stdout or "").strip()
-            record(
-                "launcher_version_runs",
-                looks_like_claude_version_output(version_text),
-                "launcher did not report a Claude Code version",
+
+def _discard_lock_scaffolding(store: RuntimeStore, created: Optional[Path]) -> None:
+    """Remove a runtime root that only the uninstall's lock created.
+
+    Taking the lock creates the runtime root when it is absent (an npm-era
+    layout has none). When uninstall then stops, that empty scaffolding is
+    removed again so a refused uninstall leaves nothing behind.
+    """
+
+    if created is None:
+        return
+    try:
+        lock_file = store.root / LOCK_NAME
+        if os.path.lexists(str(lock_file)):
+            lock_file.unlink()
+        current = store.root
+        while True:
+            current.rmdir()
+            if current == created:
+                break
+            current = current.parent
+    except OSError:
+        return
+
+
+def _uninstall_preflight(
+    config: Config, services: Services, store: RuntimeStore
+) -> List[Path]:
+    """Prove ownership and that nothing runs; return the roots to remove."""
+
+    status = generated_file_status(config)
+    for item in planned_files(config):
+        if item.owned_by_runtime or not item.path.exists():
+            continue
+        if status[item.key]["fresh"]:
+            continue
+        content = item.path.read_bytes().decode("utf-8", "replace")
+        expected = item.data.decode("utf-8")
+        if normalize_newlines(content, "\n") == normalize_newlines(expected, "\n"):
+            continue
+        marked = any(marker in content for marker in item.markers)
+        if not (marked and config.force):
+            raise ClaudeWranglerError(
+                "Refusing to uninstall: {} does not match the expected generated "
+                "content. Use --force to override.".format(item.path)
             )
 
-        try:
-            help_result = run_command(
-                [str(config.layout.launcher_path), "--help"],
-                cwd=str(config.project_root),
-                capture_output=True,
-            )
-        except ClaudeWranglerError as exc:
-            record("launcher_help_runs", False, str(exc))
-        else:
-            help_text = (help_result.stdout or "") + (help_result.stderr or "")
-            record(
-                "launcher_help_runs",
-                "claude" in help_text.lower(),
-                "launcher --help did not return the expected usage text",
-            )
-    else:
-        record(
-            "launcher_commands_skipped",
-            False,
-            "launcher verification commands were skipped because the launcher "
-            "is not trustworthy",
+    legacy = config.legacy
+    active = read_pointer_quietly(store) if store.root.is_dir() else None
+    stop_binaries = slot_binaries(store, active) + [
+        binary for name in SLOT_NAMES for binary in slot_binaries(store, name)
+    ]
+    roots = [path for path in (store.root,) if path.is_dir()]
+    if legacy is not None and legacy.dir.is_dir():
+        roots.append(legacy.dir)
+    for root in roots:
+        require_idle(
+            config,
+            services,
+            root,
+            purpose="Refusing to uninstall",
+            stop_binaries=stop_binaries,
+            launcher_env=_launcher_env_factory(config, services),
         )
+    return roots
 
-    if resolved_commands["npm"]["found"]:
-        try:
-            audit_result = run_command(
-                [
-                    npm_name,
-                    "audit",
-                    "--prefix",
-                    str(config.layout.local_dir),
-                    "--json",
-                ],
-                cwd=str(config.project_root),
-                capture_output=True,
-                env=npm_local_environment(config),
-                timeout_seconds=config.npm_timeout_seconds,
-            )
-        except ClaudeWranglerError as exc:
-            record("npm_audit_clean", False, str(exc))
-        else:
-            try:
-                audit_payload = json.loads(audit_result.stdout or "")
-            except json.JSONDecodeError as exc:
-                record(
-                    "npm_audit_clean",
-                    False,
-                    "npm audit returned invalid JSON: {}".format(exc),
-                )
-            else:
-                vulnerabilities = audit_payload.get("metadata", {}).get(
-                    "vulnerabilities", {}
-                )
-                total_vulnerabilities = vulnerabilities.get("total")
-                record(
-                    "npm_audit_clean",
-                    total_vulnerabilities == 0,
-                    "npm audit reported {} total vulnerabilities".format(
-                        total_vulnerabilities
-                    ),
-                )
-    else:
-        record("npm_audit_clean", False, "npm command is not available in PATH")
 
-    failures = [result for result in results if not result.ok]
-    for result in results:
-        print(
-            "[{}] {} - {}".format(
-                "PASS" if result.ok else "FAIL",
-                result.name,
-                result.detail,
-            )
+def _uninstall_locked(config: Config, store: RuntimeStore) -> int:
+    """Remove the runtime, legacy tree, generated files, and session state.
+
+    Runs with the maintenance lock held, so everything goes except the lock
+    file and the directories that lead to it. If a binary cannot be deleted
+    the operation stops before session state (requirement 12).
+    """
+
+    layout = config.layout
+    legacy = config.legacy
+    try:
+        if store.root.is_dir() and not is_link_like(store.root):
+            for entry in sorted(store.root.iterdir()):
+                if entry.name == LOCK_NAME:
+                    continue
+                remove_runtime_tree(entry)
+        if legacy is not None and legacy.dir.is_dir():
+            remove_runtime_tree(legacy.dir)
+            eprint("[claude-wrangler] Removed legacy npm layout {}".format(legacy.dir))
+    except OSError as exc:
+        eprint(
+            "[claude-wrangler] ERROR: could not delete part of the runtime ({}). "
+            "Stopping before session state; the .gitignore block is kept. Close "
+            "any running Claude Code and rerun --uninstall.".format(exc)
         )
-
-    if failures:
-        print("")
-        print("Self-test failed.")
-        for result in failures:
-            print(" - {}: {}".format(result.name, result.detail))
         return 1
 
-    print("")
-    print("Self-test passed.")
+    try:
+        remove_generated_files(config)
+        if not config.shared_home:
+            remove_tree(
+                layout.claude_home_dir,
+                label="managed Claude home directory",
+                project_root=config.project_root,
+                dry_run=False,
+            )
+        remove_tree_except(
+            layout.config_dir,
+            store.root,
+            label="managed Claude config directory",
+            project_root=config.project_root,
+        )
+    except OSError as exc:
+        eprint(
+            "[claude-wrangler] ERROR: could not remove managed files ({}). The "
+            ".gitignore block is kept; rerun --uninstall once nothing uses "
+            "them.".format(exc)
+        )
+        return 1
     return 0
+
+
+def _uninstall_finish(config: Config, store: RuntimeStore) -> int:
+    """After the lock is released: delete the runtime root, then empty dirs."""
+
+    layout = config.layout
+    try:
+        if store.root.is_dir() and not is_link_like(store.root):
+            # Only the lock file and empty directories remain.
+            remove_runtime_tree(store.root)
+            eprint("[claude-wrangler] Removed runtime root {}".format(store.root))
+        remove_tree(
+            layout.config_dir,
+            label="managed Claude config directory",
+            project_root=config.project_root,
+            dry_run=False,
+        )
+        maybe_remove_empty_parent(
+            layout.config_dir, stop_at=config.project_root, dry_run=False
+        )
+        maybe_remove_empty_parent(
+            layout.launcher_path, stop_at=config.project_root, dry_run=False
+        )
+    except OSError as exc:
+        eprint(
+            "[claude-wrangler] ERROR: could not remove the emptied runtime root "
+            "({}). The .gitignore block is kept; rerun --uninstall.".format(exc)
+        )
+        return 1
+    residue = _managed_residue(config, config.legacy)
+    if residue:
+        eprint(
+            "[claude-wrangler] Keeping the .gitignore block because managed files "
+            "remain: {}".format(", ".join(residue))
+        )
+        return 1
+    remove_gitignore_block(layout.gitignore_path, dry_run=False)
+    print("Uninstall complete for {}.".format(config.project_root))
+    return 0
+
+
+def uninstall_operation(config: Config, services: Optional[Services] = None) -> int:
+    """Conservatively remove the managed installation (ab_runtime_slots.md 12).
+
+    The maintenance lock is taken first and held through the ownership and
+    in-use checks and every removal; the lock file itself goes last, after
+    release (requirement 4). Nothing is removed until no process runs from
+    the runtime root or the legacy tree (the background service is stopped
+    only with `--stop-background-sessions`). Then the runtime goes first,
+    generated files next, and session state last; if a binary cannot be
+    deleted the operation stops before session state and keeps the
+    `.gitignore` block.
+    """
+
+    services = services or default_services()
+    layout = config.layout
+    store = runtime_store(config)
+    if config.existing_metadata is None and config.legacy is None and not config.force:
+        raise ClaudeWranglerError(
+            "Managed metadata was not found at {}. Refusing to uninstall without "
+            "--force because ownership cannot be proven.".format(layout.metadata_path)
+        )
+
+    if config.dry_run:
+        roots = _uninstall_preflight(config, services, store)
+        for root in roots:
+            eprint("[claude-wrangler] Would remove {}".format(root))
+        remove_generated_files(config)
+        if not config.shared_home:
+            remove_tree(
+                layout.claude_home_dir,
+                label="managed Claude home directory",
+                project_root=config.project_root,
+                dry_run=True,
+            )
+        remove_tree(
+            layout.config_dir,
+            label="managed Claude config directory",
+            project_root=config.project_root,
+            dry_run=True,
+        )
+        remove_gitignore_block(layout.gitignore_path, dry_run=True)
+        print("Uninstall complete for {} (dry-run).".format(config.project_root))
+        return 0
+
+    created = _outermost_missing_dir(store.root, config.project_root)
+    lock = store.lock()
+    try:
+        lock.acquire()
+    except BaseException:
+        _discard_lock_scaffolding(store, created)
+        raise
+    try:
+        require_unchanged_state(config)
+        _uninstall_preflight(config, services, store)
+        code = _uninstall_locked(config, store)
+    except BaseException:
+        lock.release()
+        _discard_lock_scaffolding(store, created)
+        raise
+    lock.release()
+    if code != 0:
+        _discard_lock_scaffolding(store, created)
+        return code
+    return _uninstall_finish(config, store)
+
+
+def describe_in_use(config: Config, services: Services) -> Dict[str, object]:
+    """Report which processes run from the runtime root (for inspection)."""
+
+    root = config.layout.local_dir
+    if not root.is_dir():
+        return {"checked": False, "processes": []}
+    try:
+        running = processes_under(services, root)
+    except ClaudeWranglerError as exc:
+        return {"checked": False, "error": str(exc), "processes": []}
+    return {
+        "checked": True,
+        "processes": [{"pid": item.pid, "image": item.image} for item in running],
+    }

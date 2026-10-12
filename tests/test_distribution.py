@@ -1,69 +1,23 @@
-# ruff: noqa: E402
 """Offline tests for release channels, the version floor, and manifest bundles.
 
 Unit tests replace signature verification and manifest parsing with fakes
-so they do not depend on ``claude_wrangler.signing``. One integration test
-runs ``ReleaseSource`` against recorded real release metadata (served by an
-in-memory transport) when the signing module and fixtures are present.
+to isolate distribution's own logic. Integration tests run
+``ReleaseSource`` and offline re-verification against recorded real release
+metadata (served by an in-memory transport) with the real signing module,
+which is imported normally so that an import break fails loudly here too.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import importlib
+from dataclasses import dataclass
 import io
 from pathlib import Path
-import sys
-import types
 from typing import Dict, List, Optional, Tuple
 
 import pytest
 
-from claude_wrangler.models import ClaudeWranglerError
-
-
-def _ensure_signing_importable() -> bool:
-    """Return True when the real signing module imports; else install a stub.
-
-    The stub carries only the names ``distribution`` imports, so these unit
-    tests can run while ``signing.py`` is absent or broken.
-    """
-
-    try:
-        importlib.import_module("claude_wrangler.signing")
-        return True
-    except Exception:  # any import-time failure means "not usable yet"
-        stub = types.ModuleType("claude_wrangler.signing")
-
-        class SignatureError(ClaudeWranglerError):
-            """Stand-in for the real signing.SignatureError."""
-
-        @dataclass(frozen=True)
-        class VerifiedManifest:
-            """Stand-in for the real signing.VerifiedManifest."""
-
-            version: str
-            build_date: Optional[str] = None
-            commit: Optional[str] = None
-            manifest_sha256: str = ""
-            artifacts: Dict[str, object] = field(default_factory=dict)
-            schemes: Tuple[str, ...] = ()
-
-        def unavailable(*args, **kwargs):
-            raise SignatureError("signing module unavailable in this test run")
-
-        stub.SignatureError = SignatureError
-        stub.VerifiedManifest = VerifiedManifest
-        stub.verify_manifest_signatures = unavailable
-        stub.parse_verified_manifest = unavailable
-        stub.TEST_STUB = True
-        sys.modules["claude_wrangler.signing"] = stub
-        return False
-
-
-REAL_SIGNING = _ensure_signing_importable()
-
 from claude_wrangler import distribution
+from claude_wrangler.models import ClaudeWranglerError
 from claude_wrangler.distribution import (
     CHANNEL_POINTER_MAX_BYTES,
     DEFAULT_RELEASE_BASE_URL,
@@ -468,8 +422,8 @@ RECORDED_VERSIONS = _recorded_versions()
 
 
 @pytest.mark.skipif(
-    not REAL_SIGNING or not RECORDED_VERSIONS,
-    reason="needs claude_wrangler.signing and tests/fixtures/releases",
+    not RECORDED_VERSIONS,
+    reason="needs tests/fixtures/releases",
 )
 def test_release_source_verifies_recorded_releases_end_to_end():
     from claude_wrangler.platforms import PLATFORM_KEYS
@@ -509,8 +463,8 @@ def test_release_source_verifies_recorded_releases_end_to_end():
 
 
 @pytest.mark.skipif(
-    not REAL_SIGNING or not RECORDED_VERSIONS,
-    reason="needs claude_wrangler.signing and tests/fixtures/releases",
+    not RECORDED_VERSIONS,
+    reason="needs tests/fixtures/releases",
 )
 def test_load_manifest_bundle_verifies_recorded_evidence_offline():
     version = RECORDED_VERSIONS[0]

@@ -85,8 +85,10 @@ DEFAULT_SERVICE_STOP_TIMEOUT_SECONDS = 30.0
 _POINTER_MAX_BYTES = 16
 _RECORD_MAX_BYTES = 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
-_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
-_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+# ASCII digits with ``fullmatch``: ``\d`` would accept other Unicode digits
+# and ``$`` a trailing newline, both of which distribution.py refuses.
+_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 # Windows reparse-point facts. A reparse tag with the name-surrogate bit set
 # (symbolic links, junctions, and similar) makes the entry an alias for
@@ -390,7 +392,7 @@ def _string_list(payload: Mapping[str, Any], key: str) -> List[str]:
 def _sha256_field(value: Any, label: str) -> str:
     """Return a lowercase 64-hex-digit SHA-256 value."""
 
-    if not isinstance(value, str) or not _SHA256_PATTERN.match(value):
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
         raise CompletionRecordError(
             "{} must be a 64-hex-digit SHA-256 value".format(label)
         )
@@ -428,6 +430,11 @@ class CompletionRecord:
     verified_at: str
     promoted_by: str
     schema: int = COMPLETION_RECORD_SCHEMA
+    # Recorded subcommands that refused `--settings` at install time
+    # (cross_platform_launcher.md requirement 4). None means the slot was
+    # promoted before this probe existed: the launcher then omits
+    # `--settings` for every recorded subcommand.
+    settings_rejected: Optional[List[str]] = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "CompletionRecord":
@@ -448,7 +455,7 @@ class CompletionRecord:
         if slot not in SLOT_NAMES:
             raise CompletionRecordError("slot must be 'a' or 'b': {!r}".format(slot))
         version = _require_string(payload, "version")
-        if not _VERSION_PATTERN.match(version):
+        if not _VERSION_PATTERN.fullmatch(version):
             raise CompletionRecordError(
                 "version must look like MAJOR.MINOR.PATCH: {!r}".format(version)
             )
@@ -483,6 +490,11 @@ class CompletionRecord:
             verified_at=_require_string(payload, "verified_at"),
             promoted_by=_require_string(payload, "promoted_by"),
             schema=schema,
+            settings_rejected=(
+                None
+                if payload.get("settings_rejected") is None
+                else _string_list(payload, "settings_rejected")
+            ),
         )
 
     @classmethod
@@ -520,6 +532,11 @@ class CompletionRecord:
             "subcommands": list(self.subcommands),
             "verified_at": self.verified_at,
             "promoted_by": self.promoted_by,
+            "settings_rejected": (
+                list(self.settings_rejected)
+                if self.settings_rejected is not None
+                else None
+            ),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -932,13 +949,19 @@ class RuntimeStore:
         return "b" if self.active_slot() == "a" else "a"
 
     def new_staging_dir(self) -> Path:
-        """Create and return an empty, transaction-unique staging directory."""
+        """Create and return an empty, transaction-unique staging directory.
+
+        Staging names are short random identifiers rather than timestamped
+        transaction ids: the candidate binary runs from here for its smoke
+        test, and on Windows a program path over 260 characters may fail to
+        start, so every character saved helps deeply nested checkouts.
+        """
 
         self.validate()
         self.root.mkdir(parents=True, exist_ok=True)
         self.staging_dir.mkdir(exist_ok=True)
         self.validate()
-        path = self.staging_dir / _new_txid()
+        path = self.staging_dir / uuid.uuid4().hex[:12]
         path.mkdir()
         return path
 

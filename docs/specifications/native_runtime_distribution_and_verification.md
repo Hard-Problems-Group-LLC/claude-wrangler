@@ -76,8 +76,10 @@ The npm package is a wrapper around the same bytes and is not used.
      `publicKeySha256` must equal the pinned SPKI hash, and it must verify
      over the prefixed bytes.
 
-   Both must pass. Verification must check signature length equals the
-   modulus length, `s < n`, and compare the complete encoded block. It
+   Both must pass. The raw signature must be exactly the modulus length
+   `k`; the OpenPGP MPI must be minimally encoded, at most `k` octets, and
+   left-padded to `k`. Verification must check `s < n` and compare the
+   complete encoded block. It
    must use explicit `raise` statements, never `assert`, so `-O` cannot
    disable it.
 
@@ -102,9 +104,12 @@ The npm package is a wrapper around the same bytes and is not used.
      system C library is musl (the same file checks as Anthropic's
      `install.sh`), never inferred from `platform.libc_ver()` alone.
 
-   `--platform` may override detection for testing and for preparing a
-   checkout shared with WSL; an override must still be one of the
-   manifest's keys.
+   `--platform` may override detection (for example, to choose
+   `win32-x64` under emulation on ARM64); an override must be one of the
+   manifest's keys for the host operating system. Installing a foreign
+   operating system's build is refused: run claude-wrangler on that
+   system (for example, inside WSL) instead, so the structural
+   interpreter check and the smoke test always run.
 
 8. **Bounded, verified download**
 
@@ -115,7 +120,10 @@ The npm package is a wrapper around the same bytes and is not used.
    transfer must abort once received bytes exceed the manifest `size`, and
    the final byte count and SHA-256 must equal the manifest. Interrupted
    transfers may resume with an HTTP Range request against the same
-   staging file. Each request must have a connect/read timeout
+   staging file. Resume applies only within one transaction's bounded
+   retries: every transaction stages into a fresh `.staging/<txid>/`, so
+   a rerun after a failed install downloads from the first byte. Each
+   request must have a connect/read timeout
    (`--download-timeout-seconds`, default 60 s per read) and a small
    bounded retry count with backoff. Progress goes to stderr.
 
@@ -150,14 +158,29 @@ The npm package is a wrapper around the same bytes and is not used.
       manifest for each newer version, records the result (version,
       `buildDate`, checked-at time) in metadata, and never changes the
       installed binary.
-    - The launcher shows a one-line notice when the recorded catalog
-      names a newer version on the installed channel. The launcher may
-      refresh the catalog itself at most once per 24 hours, in the
+    - `update-check.json` keeps two values apart. `latest_version` holds
+      only a version whose signed manifest verified; only `--update`
+      writes it. `pointer_version` holds the most recent unsigned channel
+      pointer read. The launcher's own refresh writes `pointer_version`
+      and carries `latest_version` forward unchanged, so an unsigned
+      pointer can never pass for verified data (requirement 2).
+    - The launcher shows a one-line notice when the cache names a newer
+      version on the installed channel. A newer `latest_version` is
+      announced as available. Otherwise a newer `pointer_version` is
+      announced as unverified, and the notice says that `--upgrade`
+      verifies its signed manifest before installing it. The launcher may
+      refresh the cache itself at most once per 24 hours, in the
       background or with a 3-second total budget, and must never block
       or fail a launch because of the network.
     - `claude-local --check-updates` forces a refresh and prints the
-      result. Update checks can be disabled per project
-      (`--set-update-checks off`).
+      unsigned pointer, the verified version, and the installed version
+      separately; for a pointer-only newer release it names both
+      `--upgrade` (verify and install) and `--update` (verify without
+      installing). The launcher uses the release base URL recorded in
+      `launch.json`, and `update-check.json` records any refresh error
+      (`error`, null after a successful refresh) so `--inspect` can tell
+      a failed check from a successful one. Update checks can be disabled
+      per project (`--set-update-checks off`).
     - Notices must tell the operator to run
       `claude-wrangler --upgrade --channel <channel>`; nothing installs
       automatically.
@@ -167,7 +190,14 @@ The npm package is a wrapper around the same bytes and is not used.
     The downloader must honor `HTTPS_PROXY`/`NO_PROXY`, `SSL_CERT_FILE`,
     and an explicit `--ca-bundle`. TLS failures must name the presented
     issuer when available and, on macOS python.org builds, mention the
-    "Install Certificates" step.
+    "Install Certificates" step. `--ca-bundle` applies to the
+    claude-wrangler run that receives it and is not recorded: the
+    launcher's own update-check refresh uses Python's default TLS context
+    (the system trust store plus `SSL_CERT_FILE`) and `HTTPS_PROXY`/
+    `NO_PROXY`. Behind a TLS-inspecting proxy whose CA is only available
+    through `--ca-bundle`, the launcher's refresh fails, records the
+    error, and never blocks the launch; `--update` with `--ca-bundle`
+    still refreshes the verified catalog.
 
 14. **Network budget for the bootstrap path**
 
@@ -189,4 +219,5 @@ The npm package is a wrapper around the same bytes and is not used.
 - Smoke-test tests proving the scratch environment never contains the
   operator's real home or the project config dir.
 - Update-check tests for notice rendering, the 24-hour cache, offline
-  behavior, and the disable switch.
+  behavior, the disable switch, and a launcher refresh that never turns
+  an unsigned pointer into `latest_version`.

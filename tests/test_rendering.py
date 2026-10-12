@@ -1,388 +1,309 @@
-"""Tests for rendered managed content, including live launcher behavior."""
+"""Tests for rendered metadata, the .gitignore block, README, and summaries.
 
+Launcher behavior is exercised through the generated `launch.py` (the
+byte-for-byte copy of `launcher_core.py`) with exec/spawn doubles, replacing
+the npm-era bash launcher tests.
+"""
+
+from __future__ import annotations
+
+import io
+import json
 import os
-import subprocess
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import pytest
 
-from claude_wrangler import __version__
+from claude_wrangler import launcher_core
+from claude_wrangler.constants import GITIGNORE_BEGIN, GITIGNORE_END, SCHEMA_VERSION
+from claude_wrangler.operations import install_like_operation
 from claude_wrangler.rendering import (
     build_available_versions_table,
     build_gitignore_block,
     build_install_summary,
-    build_launcher_content,
     build_local_readme_content,
     build_metadata,
 )
 
-STUB_CLAUDE = (
-    "#!/usr/bin/env bash\n"
-    "set -euo pipefail\n"
-    'printf \'%s\\n\' "$@" > "$CAPTURED_ARGS"\n'
-    'printf \'HOME=%s\\n\' "${HOME:-}" > "$CAPTURED_ENV"\n'
-    'printf \'CLAUDE_CONFIG_DIR=%s\\n\' "${CLAUDE_CONFIG_DIR:-}" >> "$CAPTURED_ENV"\n'
-)
+from native_fakes import make_config, make_services, standard_source
 
 
-def write_launcher_fixture(config):
-    """Render the launcher plus stub node and claude binaries for execution."""
+@pytest.fixture
+def config(tmp_path: Path):
+    """Return a default install config for a fresh project."""
 
-    tools_dir = config.project_root / "tools"
-    local_bin_dir = config.layout.local_node_modules_dir / ".bin"
-    tools_dir.mkdir()
-    local_bin_dir.mkdir(parents=True)
-    config.layout.launcher_path.parent.mkdir(parents=True, exist_ok=True)
-    config.layout.launcher_path.write_text(
-        build_launcher_content(config),
-        encoding="utf-8",
-    )
-    config.layout.launcher_path.chmod(0o755)
-    (tools_dir / "node").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    (tools_dir / "node").chmod(0o755)
-    (local_bin_dir / "claude").write_text(STUB_CLAUDE, encoding="utf-8")
-    (local_bin_dir / "claude").chmod(0o755)
-    return tools_dir
+    project = tmp_path / "project"
+    project.mkdir()
+    return make_config(project)
 
 
-def launcher_environment(config, tools_dir):
-    env = os.environ.copy()
-    env["PATH"] = "{}{}{}".format(tools_dir, os.pathsep, env.get("PATH", ""))
-    env["CLAUDE_LOCAL_PREFLIGHT"] = "off"
-    env["CAPTURED_ARGS"] = str(config.project_root / "captured-args.txt")
-    env["CAPTURED_ENV"] = str(config.project_root / "captured-env.txt")
-    env.pop("CLAUDE_LOCAL_SHARED_HOME", None)
-    return env
-
-
-def run_launcher(config, caller_args, extra_env=None):
-    """Run one rendered launcher against the stub local Claude binary."""
-
-    tools_dir = write_launcher_fixture(config)
-    env = launcher_environment(config, tools_dir)
-    if extra_env:
-        env.update(extra_env)
-
-    subprocess.run(
-        [str(config.layout.launcher_path), *caller_args],
-        cwd=str(config.project_root),
-        env=env,
-        check=True,
-    )
-    captured_args = (
-        (config.project_root / "captured-args.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
-    captured_env = dict(
-        line.split("=", 1)
-        for line in (config.project_root / "captured-env.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
-    return captured_args, captured_env
-
-
-def test_build_gitignore_block_covers_managed_artifacts(tmp_path, config_factory):
-    config = config_factory(tmp_path)
+def test_gitignore_block_covers_both_launchers_and_not_dot_claude(config):
     block = build_gitignore_block(config.layout)
     lines = block.splitlines()
+    assert lines[0] == GITIGNORE_BEGIN and lines[-1] == GITIGNORE_END
     assert ".local/" in lines
     assert "bin/claude-local" in lines
+    assert "bin/claude-local.cmd" in lines
     assert "README-LOCAL-Start-Claude.md" in lines
-    # Claude Code keeps trackable project settings in .claude/; the managed
-    # block must never ignore it.
-    assert ".claude" not in lines
-    assert ".claude/" not in lines
+    assert ".claude/" not in lines and ".claude" not in lines
 
 
-def test_build_gitignore_block_adds_relocated_directories(tmp_path, config_factory):
-    config = config_factory(
-        tmp_path,
-        local_dir_raw="vendor/claude-npm",
+def test_gitignore_block_adds_relocated_directories(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    config = make_config(
+        project, "--local-dir", "tools/claude-rt", "--launcher", "scripts/cl"
     )
-    block = build_gitignore_block(config.layout)
-    lines = block.splitlines()
-    assert ".local/" in lines
-    assert "vendor/claude-npm/" in lines
+    lines = build_gitignore_block(config.layout).splitlines()
+    assert "tools/claude-rt/" in lines
+    assert "scripts/cl" in lines and "scripts/cl.cmd" in lines
 
 
-def test_build_local_readme_references_console_command(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-    readme = build_local_readme_content(config)
-    assert "claude-wrangler --inspect ." in readme
-    assert "claude-wrangler --selftest ." in readme
-    assert "Reasonable permissions default: `disabled`" in readme
-    assert "claude-wrangler --set-reasonable-permissions ." in readme
-    assert "~/bin" not in readme
+def test_metadata_is_schema_two_with_native_fields(config):
+    meta = build_metadata(config, generated_at="2026-10-12T00:00:00Z")
+    assert meta["schema_version"] == SCHEMA_VERSION == 2
+    for key in (
+        "claude_selector",
+        "claude_channel",
+        "claude_version",
+        "shared_home",
+        "reasonable_permissions_enabled",
+        "update_checks",
+        "windows_sandbox_warning",
+        "release_base_url",
+        "platform",
+        "launcher_python",
+        "config_dir_spelling",
+        "generated_at",
+        "legacy_migrated_from",
+        "legacy_migrated_at",
+        "last_update_check",
+        "available_versions",
+        "available_version_details",
+        "paths",
+    ):
+        assert key in meta, key
+    assert meta["available_versions"] == {"stable": None, "latest": None}
+    assert meta["paths"]["launcher_cmd"] == "bin/claude-local.cmd"
+    assert meta["generated_at"] == "2026-10-12T00:00:00Z"
 
 
-def test_build_local_readme_documents_security_rings(tmp_path, config_factory):
-    config = config_factory(tmp_path)
-    readme = build_local_readme_content(config)
-    assert "## Security Rings" in readme
-    assert "Ring 3" in readme
-    assert "Ring 0" in readme
-    assert "CLAUDE_LOCAL_SHARED_HOME=1" in readme
-    assert "never forks Claude auth or session history" in readme
+def test_readme_documents_the_native_runtime(config):
+    text = build_local_readme_content(config)
+    assert text.startswith("<!-- managed by claude-wrangler -->")
+    for snippet in (
+        "Node.js and npm are not used",
+        "./bin/claude-local",
+        ".\\bin\\claude-local",
+        "Ring 1: unsandboxed",
+        "USERPROFILE, HOMEDRIVE/HOMEPATH, APPDATA",
+        "Claude Code has no sandbox there",
+        "--set-windows-sandbox-warning",
+        "--rollback",
+        "--repair-install",
+        "--update",
+        "--check-updates",
+        "contact your administrator",
+        "use an npm-era",
+        "--uninstall",
+        "--stop-background-sessions",
+        "CLAUDE_LOCAL_PREFLIGHT=strict",
+        "--permission-mode acceptEdits",
+    ):
+        assert snippet in text, snippet
+    assert "npm audit" not in text
+    assert "NPM_CONFIG_CACHE" not in text
+    assert "next" not in text.split("## Installed Version")[1].split("##")[0]
 
 
-def test_build_local_readme_describes_accept_edits_reasonable_permissions(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path, reasonable_permissions_enabled=True)
-
-    readme = build_local_readme_content(config)
-
-    assert "Reasonable permissions default: `enabled`" in readme
-    assert "`--permission-mode acceptEdits`" in readme
-    assert "commit and push" in readme
-    assert "never injects" in readme
+def test_readme_flags_a_pending_migration(config):
+    assert "Migration pending" in build_local_readme_content(
+        config, legacy_pending=True
+    )
+    assert "Migration pending" not in build_local_readme_content(config)
 
 
-def test_build_metadata_uses_single_source_script_version(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-    metadata = build_metadata(config)
-    assert metadata["script_version"] == __version__
-    assert metadata["reasonable_permissions_enabled"] is False
-    assert metadata["paths"]["claude_config_dir"] == ".local/claude"
+def test_install_summary_and_versions_table(config):
+    summary = build_install_summary(config, "installed Claude Code 2.1.287 for x")
+    assert "Runtime: installed Claude Code 2.1.287 for x" in summary
+    assert "claude-local.cmd" in summary
+    table = build_available_versions_table(
+        {"stable": "2.1.287", "latest": None},
+        {"stable": {"build_date": "2026-10-01T00:00:00Z"}},
+    )
+    lines = table.splitlines()
+    assert lines[0].split() == ["Channel", "Known", "version", "Build", "date"]
+    assert lines[2].split() == ["stable", "2.1.287", "2026-10-01T00:00:00Z"]
+    assert lines[3].split() == ["latest", "unavailable", "-"]
 
 
-def test_build_install_summary_distinguishes_completed_and_dry_run_install(
-    tmp_path,
-    config_factory,
-):
-    completed = build_install_summary(config_factory(tmp_path))
-    dry_run = build_install_summary(config_factory(tmp_path, dry_run=True))
-    repaired = build_install_summary(config_factory(tmp_path, repair_install=True))
-
-    assert "Package install: npm install completed" in completed
-    assert "Package install: npm install required" in dry_run
-    assert "Package install: repair cleanup plus npm install completed" in repaired
+# ---------------------------------------------------------------------------
+# The generated launcher (launch.py) for permission and ring behavior
+# ---------------------------------------------------------------------------
 
 
-def test_build_launcher_content_includes_runtime_preflight(tmp_path, config_factory):
-    config = config_factory(tmp_path)
+class Captured:
+    """Captures what the launcher would run."""
 
-    launcher = build_launcher_content(config)
+    def __init__(self) -> None:
+        """Start with no calls."""
 
-    assert "CLAUDE_LOCAL_PREFLIGHT:-warn" in launcher
-    assert "command -v node" in launcher
-    assert ".nvmrc" in launcher
-    assert "handle_preflight_mismatch" in launcher
-    assert "emit_update_notice" in launcher
-    assert "available update on ${channel}" in launcher
-    assert 'reasonable_permissions_enabled="0"' in launcher
-    assert 'local_claude_bin="$local_prefix/node_modules/.bin/claude"' in launcher
+        self.calls: List[Tuple[List[str], Dict[str, str]]] = []
+
+    def exec_fn(self, binary: str, argv: List[str], env: Dict[str, str]) -> int:
+        """Record a POSIX exec."""
+
+        self.calls.append((list(argv), dict(env)))
+        return 0
+
+    def spawn_fn(self, argv: List[str], env: Dict[str, str]) -> int:
+        """Record a Windows spawn."""
+
+        self.calls.append((list(argv), dict(env)))
+        return 0
+
+
+def launch(
+    project: Path, args: List[str], env: Dict[str, str] = None
+) -> Tuple[List[str], Dict[str, str]]:
+    """Run the generated launch.py in-process with exec/spawn doubles."""
+
+    captured = Captured()
+    code = launcher_core.main(
+        args,
+        environ=dict(env or {"PATH": ""}),
+        os_name=os.name,
+        platform_is_wsl=False,
+        core_path=str(project / ".local" / "claude" / "wrangler" / "launch.py"),
+        exec_fn=captured.exec_fn,
+        spawn_fn=captured.spawn_fn,
+        stderr=io.StringIO(),
+        stdout=io.StringIO(),
+        node_probe=lambda env, os_name: (None, None),
+    )
+    assert code == 0
+    return captured.calls[0]
+
+
+@pytest.fixture
+def installed(tmp_path: Path) -> Path:
+    """Return a project with a fake release installed."""
+
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    config = make_config(
+        project, "--set-update-checks", "off", "--set-windows-sandbox-warning", "off"
+    )
+    assert install_like_operation(config, make_services(standard_source())) == 0
+    return project
+
+
+def reconfigure(project: Path, *flags: str) -> None:
+    """Toggle a setting through the CLI configuration."""
+
     assert (
-        'exec "$local_claude_bin" "${default_claude_args[@]}" "${launcher_args[@]}"'
-        in launcher
-    )
-    assert "exec npx" not in launcher
-
-
-def test_build_launcher_content_pins_config_dir_and_ring_selection(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-
-    launcher = build_launcher_content(config)
-
-    assert 'export CLAUDE_CONFIG_DIR="$repo_root/.local/claude"' in launcher
-    assert 'shared_home="${CLAUDE_LOCAL_SHARED_HOME:-0}"' in launcher
-    assert "--shared-home)" in launcher
-    assert "--isolated-home)" in launcher
-    assert 'export HOME="$repo_root/.local/claude/HOME"' in launcher
-
-
-def test_build_launcher_content_disables_claude_self_update(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-
-    launcher = build_launcher_content(config)
-
-    assert 'export DISABLE_UPDATES="1"' in launcher
-    assert 'export DISABLE_AUTOUPDATER="1"' in launcher
-    assert 'export DISABLE_INSTALLATION_CHECKS="1"' in launcher
-    # The exports must precede the exec so every session inherits them.
-    assert launcher.index('export DISABLE_UPDATES="1"') < launcher.index(
-        'exec "$local_claude_bin"'
+        install_like_operation(
+            make_config(project, *flags), make_services(standard_source())
+        )
+        == 0
     )
 
 
-def test_build_launcher_content_includes_reasonable_permissions_override_scan(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path, reasonable_permissions_enabled=True)
-
-    launcher = build_launcher_content(config)
-
-    assert 'reasonable_permissions_enabled="1"' in launcher
-    assert "--permission-mode|--dangerously-skip-permissions" in launcher
-    assert "--permission-mode=*" in launcher
-    assert "--dangerously-skip-permissions" in launcher
-
-
-def test_enabled_launcher_injects_reasonable_permissions_defaults(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path, reasonable_permissions_enabled=True)
-
-    captured_args, _ = run_launcher(config, ["--resume"])
-
-    assert captured_args == [
-        "--permission-mode",
-        "acceptEdits",
-        "--resume",
-    ]
+def test_enabled_launcher_injects_reasonable_permissions_default(installed):
+    reconfigure(installed, "--set-reasonable-permissions")
+    argv, _env = launch(installed, ["-p", "hi"])
+    assert argv[3:] == ["--permission-mode", "acceptEdits", "-p", "hi"]
 
 
 @pytest.mark.parametrize(
     "caller_args",
     [
         ["--permission-mode", "plan"],
-        ["--permission-mode=plan"],
+        ["--permission-mode=default"],
         ["--dangerously-skip-permissions"],
     ],
 )
-def test_enabled_launcher_preserves_explicit_permission_choices(
-    tmp_path,
-    config_factory,
-    caller_args,
-):
-    config = config_factory(tmp_path, reasonable_permissions_enabled=True)
-
-    captured_args, _ = run_launcher(config, caller_args)
-
-    assert captured_args == caller_args
+def test_enabled_launcher_preserves_explicit_permission_choices(installed, caller_args):
+    reconfigure(installed, "--set-reasonable-permissions")
+    argv, _env = launch(installed, caller_args)
+    assert argv[3:] == caller_args
+    assert "acceptEdits" not in argv
 
 
-def test_disabled_launcher_does_not_inject_reasonable_permissions_defaults(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path, reasonable_permissions_enabled=False)
-
-    captured_args, _ = run_launcher(config, ["--resume"])
-
-    assert captured_args == ["--resume"]
-
-
-def test_launcher_redirects_home_and_pins_config_dir_by_default(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-
-    _, captured_env = run_launcher(config, ["--version"])
-
-    assert captured_env["HOME"] == str(tmp_path / ".local" / "claude" / "HOME")
-    assert captured_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".local" / "claude")
-
-
-def test_launcher_shared_home_flag_keeps_real_home_and_config_pin(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-
-    captured_args, captured_env = run_launcher(config, ["--shared-home", "--version"])
-
-    assert captured_args == ["--version"]
-    assert captured_env["HOME"] == os.environ.get("HOME", "")
-    assert captured_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".local" / "claude")
-
-
-def test_launcher_shared_home_environment_variable_reaches_ring_zero(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path)
-
-    _, captured_env = run_launcher(
-        config,
-        ["--version"],
-        extra_env={"CLAUDE_LOCAL_SHARED_HOME": "1"},
+def test_clear_regenerates_a_launcher_without_the_default(installed):
+    reconfigure(installed, "--set-reasonable-permissions")
+    reconfigure(installed, "--clear-reasonable-permissions")
+    argv, _env = launch(installed, ["-p", "hi"])
+    assert "--permission-mode" not in argv
+    launch_json = json.loads(
+        (installed / ".local" / "claude" / "wrangler" / "launch.json").read_text(
+            "utf-8"
+        )
     )
-
-    assert captured_env["HOME"] == os.environ.get("HOME", "")
-    assert captured_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".local" / "claude")
+    assert launch_json["reasonable_permissions"] is False
 
 
-def test_launcher_isolated_home_flag_overrides_shared_default(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(tmp_path, shared_home=True)
+def test_launcher_redirects_home_and_pins_config_dir_by_default(installed):
+    _argv, env = launch(installed, [])
+    config_dir = str(installed / ".local" / "claude")
+    assert env["CLAUDE_CONFIG_DIR"] == config_dir
+    assert env["HOME"] == os.path.join(config_dir, "HOME")
+    assert env["XDG_CONFIG_HOME"] == os.path.join(config_dir, "HOME", ".config")
+    assert env["DISABLE_UPDATES"] == "1"
+    assert env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["DISABLE_INSTALLATION_CHECKS"] == "1"
 
-    captured_args, captured_env = run_launcher(
-        config,
-        ["--isolated-home", "--version"],
+
+def test_launcher_shared_home_flag_keeps_real_home_and_config_pin(installed):
+    _argv, env = launch(
+        installed, ["--shared-home"], {"PATH": "", "HOME": "/real/home"}
     )
+    assert env["HOME"] == "/real/home"
+    assert env["CLAUDE_CONFIG_DIR"] == str(installed / ".local" / "claude")
 
-    assert captured_args == ["--version"]
-    assert captured_env["HOME"] == str(tmp_path / ".local" / "claude" / "HOME")
 
-
-def test_launcher_refuses_missing_local_claude_binary(tmp_path, config_factory):
-    config = config_factory(tmp_path)
-    tools_dir = config.project_root / "tools"
-    tools_dir.mkdir()
-    config.layout.launcher_path.parent.mkdir(parents=True, exist_ok=True)
-    config.layout.launcher_path.write_text(
-        build_launcher_content(config),
-        encoding="utf-8",
+def test_launcher_shared_home_environment_variable_reaches_ring_zero(installed):
+    _argv, env = launch(
+        installed,
+        [],
+        {"PATH": "", "HOME": "/real/home", "CLAUDE_LOCAL_SHARED_HOME": "1"},
     )
-    config.layout.launcher_path.chmod(0o755)
-    (tools_dir / "node").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    (tools_dir / "node").chmod(0o755)
-    (tools_dir / "npx").write_text(
-        "#!/usr/bin/env bash\necho should-not-run >&2\nexit 99\n",
-        encoding="utf-8",
+    assert env["HOME"] == "/real/home"
+
+
+def test_launcher_isolated_home_flag_overrides_shared_default(installed):
+    reconfigure(installed, "--shared-home")
+    _argv, env = launch(
+        installed, ["--isolated-home"], {"PATH": "", "HOME": "/real/home"}
     )
-    (tools_dir / "npx").chmod(0o755)
+    assert env["HOME"] == os.path.join(str(installed / ".local" / "claude"), "HOME")
 
-    env = os.environ.copy()
-    env["PATH"] = "{}{}{}".format(tools_dir, os.pathsep, env.get("PATH", ""))
-    env["CLAUDE_LOCAL_PREFLIGHT"] = "off"
-    completed = subprocess.run(
-        [str(config.layout.launcher_path), "--version"],
-        cwd=str(config.project_root),
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
+
+def test_launcher_refuses_when_no_runtime_slot_is_usable(installed):
+    record = (
+        installed / ".local" / "claude" / "wrangler" / "slots" / "a" / ".complete.json"
     )
-
-    assert completed.returncode == 1
-    assert (
-        "Local Claude Code executable is missing or not executable" in completed.stderr
+    record.unlink()
+    stderr = io.StringIO()
+    code = launcher_core.main(
+        [],
+        environ={"PATH": ""},
+        os_name=os.name,
+        platform_is_wsl=False,
+        core_path=str(installed / ".local" / "claude" / "wrangler" / "launch.py"),
+        exec_fn=lambda *a: pytest.fail("must not exec"),
+        spawn_fn=lambda *a: pytest.fail("must not spawn"),
+        stderr=stderr,
+        node_probe=lambda env, os_name: (None, None),
     )
-    assert "should-not-run" not in completed.stderr
+    assert code == 1
+    assert "--repair-install" in stderr.getvalue()
+    assert "never falls back to a global claude" in stderr.getvalue()
 
 
-def test_build_available_versions_table_lists_supported_channels():
-    table = build_available_versions_table(
-        {
-            "stable": "2.1.153",
-            "latest": "2.1.172",
-            "next": None,
-        }
-    )
-
-    assert "Channel" in table
-    assert "stable" in table
-    assert "latest" in table
-    assert "next" in table
-    assert "unavailable" in table
+def test_launcher_metadata_is_stable_across_regeneration(installed):
+    rt = installed / ".local" / "claude" / "wrangler"
+    before = (rt / "launch.json").read_bytes()
+    reconfigure(installed, "--set-update-checks", "off")
+    assert (rt / "launch.json").read_bytes() == before

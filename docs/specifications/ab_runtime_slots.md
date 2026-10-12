@@ -65,9 +65,13 @@ Code's housekeeping prunes those), or the config dir's `local/`,
 
    `.complete.json` records schema version, slot name, version, channel,
    platform keys with binary relative path, SHA-256, and size, manifest
-   SHA-256, `buildDate`, `commit`, signature schemes verified, verified-at
-   time, and the claude-wrangler version that promoted it. It is written
-   atomically only after every validation step passes.
+   SHA-256, `build_date`, `commit`, the binary's subcommand names (read
+   from `--help` run in scratch), `settings_rejected` (the subcommands
+   that refused a leading `--settings` in the install-time probe of
+   `cross_platform_launcher.md` requirement 4), signature schemes
+   verified, verified-at time, and the claude-wrangler version that
+   promoted it. It is written atomically only after every validation step
+   passes.
 
 4. **Maintenance lock**
 
@@ -75,8 +79,34 @@ Code's housekeeping prunes those), or the config dir's `local/`,
    migration, and uninstall hold `.lock` from state selection through
    publication of generated files. The lock uses an OS file lock
    (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere) on a file that
-   is never deleted. A second maintainer must fail fast with a clear
-   message and change nothing.
+   is never deleted, except as the last step of uninstall, after the
+   lock has been released. A second maintainer must fail fast with a
+   clear message and change nothing.
+
+   Command-line configuration is derived from the native and npm-era
+   metadata before the lock is taken, so the configuration records a
+   digest of the metadata files it read. Once the lock is held, every
+   maintenance operation recomputes that digest before changing
+   anything and stops with `ManagedStateChangedError` when another
+   maintainer has published since. The CLI then re-reads the state and
+   reruns the command, up to three attempts in all, and otherwise asks
+   the operator to rerun once the other run has finished. A stale read
+   therefore never reverts another maintainer's publish.
+
+   Maintenance operations write the managed `.gitignore` block only
+   while holding the lock, so a refused second maintainer leaves it
+   untouched. Inspect and selftest take no lock and still enforce the
+   block (`managed_gitignore_enforcement.md` requirement 1), as do the
+   `--dry-run` forms of install, upgrade, repair, and update, which take
+   no lock.
+
+   Uninstall takes the lock before its ownership and in-use checks and
+   holds it through runtime, generated-file, and session-state removal;
+   only the lock file and the directories leading to it remain until
+   the lock is released. If uninstall stops early, it removes any
+   runtime-root directories that only its lock created. A runtime root
+   that is a link or junction makes uninstall fail with the lock error
+   before anything is removed.
 
 5. **Inactive-only preparation**
 
@@ -94,12 +124,17 @@ Code's housekeeping prunes those), or the config dir's `local/`,
    - Linux: resolve `/proc/<pid>/exe`.
    - macOS: use `ps -axo pid=,comm=` or `lsof`, whichever is available.
 
-   It must first ask the project's Claude Code background service to stop
-   (`<active binary> daemon stop` run with the project's launcher
-   environment) because that service otherwise outlives sessions and
-   falls back to the operator's global binary when its executable path
-   disappears. If any process still runs from the slot to be displaced,
-   the operation must stop without changes and name the process IDs.
+   If any process runs from the slot to be displaced, the operation must
+   stop without changes and name the process IDs. It must never stop
+   Claude Code's background service on its own, because
+   `daemon stop --any` also terminates the operator's background
+   sessions. With the explicit `--stop-background-sessions` flag it runs
+   `<binary> daemon stop --any` with the project's launcher environment
+   and then repeats the check. Because a slot is never displaced while
+   in use, the background service can never lose its executable path,
+   which would otherwise make it fall back to the operator's global
+   binary. Inspect and selftest must not read `.lock`, because on
+   Windows a held byte-range lock makes reads fail.
 
 7. **Promotion**
 
@@ -136,23 +171,45 @@ Code's housekeeping prunes those), or the config dir's `local/`,
 10. **Repair**
 
     `--repair-install` clears `.staging/`, deletes `.retired/` entries no
-    longer in use, re-verifies both slots offline against their retained
-    evidence, re-downloads the pinned version into the inactive slot when
-    the active slot is missing or corrupt, and repairs an invalid
-    pointer by choosing the complete slot whose version matches metadata.
-    It never touches anything outside the runtime root except generated
-    files.
+    longer in use, and re-verifies both slots offline against their
+    retained evidence (signatures and binary SHA-256). It then chooses
+    the slot that should be active:
+    - when the pointer names a slot that verifies, that slot stays
+      active;
+    - otherwise the pointer moves, before any download, to a verified
+      slot, preferring the one whose version matches the metadata pin.
+      When that slot is older or newer than the pin, repair warns that
+      the project runs it until the pinned version is re-downloaded,
+      and that it keeps running it if the download fails;
+    - when the active slot does not hold the pinned version for this
+      host's platform, the pinned version is downloaded, validated, and
+      promoted into the slot the pointer does not name. After a pointer
+      move that is the corrupt slot; with no verified slot at all it is
+      the slot other than the one the invalid pointer names (slot `a`
+      when there is no pointer).
+
+    Repair clears `fallback.json` once it succeeds and regenerates
+    generated files. Outside the runtime root it touches only generated
+    files, the config dir's `settings.json` merge
+    (`cross_platform_launcher.md` requirement 4), and a deferred npm-era
+    cleanup retry with its schema-1 projection
+    (`legacy_npm_layout_migration.md` requirement 5). Install and upgrade
+    perform the same three.
 
 11. **Retention**
 
     At most two releases are installed per project: the active slot and
     the rollback slot. Platform keys for the same release may share a
-    slot.
+    slot. When a release is installed again into a new candidate, other
+    platforms' binaries for that release are carried over from the
+    active slot and from the slot being replaced, but only when each
+    one's SHA-256 still matches the signed manifest.
 
 12. **Uninstall ordering**
 
-    Uninstall must stop the background service, prove no process runs
-    from the runtime root, and only then remove the runtime, generated
+    Uninstall must prove no process runs from the runtime root (stopping
+    the background service only with `--stop-background-sessions`, as in
+    requirement 6), and only then remove the runtime, generated
     files, and (per existing conservative rules) session state. If a
     binary cannot be deleted, uninstall must stop before touching
     session state and must keep the `.gitignore` block.
@@ -164,6 +221,13 @@ Code's housekeeping prunes those), or the config dir's `local/`,
     and deletes inside the runtime root must retry `PermissionError`
     (WinError 5 and 32) with backoff for up to 60 seconds before failing.
 
+    Windows programs without long-path support fail to start from a path
+    of 260 characters or more: a real `claude.exe` failed with
+    WinError 206 from a 272-character staging path. Staging directories
+    therefore use 12-hex-digit transaction names, and claude-wrangler
+    warns, before the smoke test, when a staged Windows binary path is
+    240 characters or longer, suggesting a shorter checkout path.
+
 14. **Line endings and atomic writes**
 
     Every generated file is written through a same-directory temporary
@@ -174,7 +238,11 @@ Code's housekeeping prunes those), or the config dir's `local/`,
 
 - Promotion `a`→`b` and `b`→`a`, with injected failures before and after
   the commit point.
-- Concurrent maintainers: the second fails fast and changes nothing.
+- Concurrent maintainers: the second fails fast and changes nothing,
+  including the `.gitignore` block, for every maintenance operation.
+- Stale state: a maintainer whose metadata changed after it was read
+  stops before changing anything, and the CLI reruns it, giving up after
+  three attempts.
 - In-use refusal for the slot to be displaced, using a fake process
   table.
 - Launch fallback when the active binary is missing, truncated, or its

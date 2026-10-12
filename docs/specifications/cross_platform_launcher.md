@@ -30,6 +30,16 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
   that interpreter is gone it falls back to `py -3`, then `python3`, then
   `python`, accepting only Python 3.9+ by exit-code probe, never by
   parsing interpreter output.
+- **Git Bash and MSYS:** when `uname -s` reports MINGW, MSYS, or
+  CYGWIN, the `sh` shim accepts only a native Windows Python and hands
+  the core Windows-form paths from `cygpath -w`. It also exports
+  `MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL='*'`, because Git Bash
+  otherwise rewrites arguments such as the prompt `/review` into
+  `C:/Program Files/Git/review` before Python sees them. When the
+  caller had set neither variable, the shim also sets the marker
+  `CLAUDE_LOCAL_MSYS_ARGS=1`, and the core then removes all three from
+  Claude Code's environment, so the conversion override does not leak
+  into the commands Claude Code runs. Values the caller set are kept.
 
 ## Required Behavior
 
@@ -69,16 +79,36 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
      three keys and `"disableDeepLinkRegistration": "disable"`, because
      command-line settings outrank project and local settings, and a
      cloned repository's `.claude/settings.json` can otherwise switch
-     updates back on before the trust prompt. If a subcommand rejects
-     `--settings`, the core omits it for that subcommand only.
+     updates back on before the trust prompt. The core puts `--settings`
+     first and omits it only when the first caller argument is a
+     subcommand that refused it during an install-time probe:
+     - for each subcommand recorded from the candidate's `--help`, except
+       `update`, `upgrade`, and `install` (which the core intercepts),
+       claude-wrangler runs `<candidate> --settings <json> <subcommand>
+       --help` in transaction scratch within a 120-second total budget;
+     - a subcommand accepts the flag only when the probe exits 0 and
+       prints that subcommand's own usage line; an option error, the
+       root command's help, a timeout, or an exhausted budget counts as
+       a refusal;
+     - the refusals are stored as `settings_rejected` in the slot's
+       completion record and shown by `--inspect`. A slot promoted
+       before the probe existed has no such field, and the core then
+       omits `--settings` for every recorded subcommand.
+
+     Claude Code 2.1.296 does not report an error for `attach`, `logs`,
+     `respawn`, `rm`, `stop`, or `kill` behind a leading `--settings`;
+     it routes the invocation to the root command instead, so the probe
+     records those six as refusals. For refused subcommands only the
+     environment and config-dir layers apply.
    - Config dir: claude-wrangler merges the same keys into
      `<config dir>/settings.json` at install and upgrade, preserving
      every other key, so detached processes that bypass the launcher
      inherit them.
 
-   If the caller passes its own `--settings`, the core refuses with a
-   hint to put settings in `<config dir>/settings.json`, unless
-   experiments show multiple `--settings` flags merge safely.
+   If the caller passes its own `--settings` (or `--settings=...`), the
+   core exits 2 with a hint to put settings in
+   `<config dir>/settings.json`. Whether several `--settings` flags
+   merge safely has not been established, so they are never combined.
 
 5. **Settings scan**
 
@@ -100,7 +130,14 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
 
    The core reads `active-slot`, validates the slot cheaply, and falls
    back to the other slot as `ab_runtime_slots.md` requirement 8
-   describes. It never executes a binary outside the runtime root.
+   describes. It never executes a binary outside the runtime root, with
+   one exception: while a migration is pending
+   (`legacy_npm_layout_migration.md` requirement 6), `launch.json`
+   carries a `legacy` block and the core runs the npm-era platform
+   binary it names. That binary must be a regular file inside the
+   repository, and claude-wrangler structurally checks it before
+   rendering such a launcher. It is not checked against a signed
+   manifest, and there is no slot to fall back to.
 
 8. **Nested `claude` calls**
 
@@ -115,7 +152,11 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
    The core prints at most one line to stderr when the cached update
    check names a newer release on the installed channel, following
    `native_runtime_distribution_and_verification.md` requirement 12.
-   `--check-updates` is consumed by the core and never forwarded.
+   The core's own refresh records the unsigned channel pointer in
+   `pointer_version` only and never writes `latest_version`, which holds
+   manifest-verified data from `claude-wrangler --update`. A release that
+   only the pointer names is announced as unverified. `--check-updates`
+   is consumed by the core and never forwarded.
 
 10. **Native-Windows sandbox warning**
 
@@ -128,7 +169,9 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
 11. **Reasonable permissions**
 
     The existing `--permission-mode acceptEdits` default and its
-    caller-override detection carry over unchanged.
+    caller-override detection carry over unchanged. The managed state is
+    the JSON boolean `reasonable_permissions` in `launch.json`, read by
+    the core, instead of a shell variable in the launcher.
 
 12. **Node.js parity check**
 
@@ -156,6 +199,8 @@ PATH shim, the native-Windows sandbox warning, and process semantics.
   injected `os.name` and environment.
 - Settings layering: the emitted `--settings` JSON, the config-dir merge
   preserving unrelated keys, and the settings-scan warnings.
+- The install-time `--settings` probe and the launcher's per-subcommand
+  omission, including records without `settings_rejected`.
 - Interception of `update`, `upgrade`, and `install`.
 - Slot fallback and refusal.
 - Shim tests on Windows through cmd, PowerShell 5.1, PowerShell 7, and

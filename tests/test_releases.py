@@ -1,156 +1,164 @@
-"""Tests for release-channel resolution against Claude Code dist-tags."""
+"""Tests for the native release catalog and notify-only update checks."""
 
-import pytest
+from __future__ import annotations
 
-from claude_wrangler.models import ClaudeWranglerError
+from pathlib import Path
+
 from claude_wrangler.releases import (
-    fetch_available_claude_versions,
-    infer_claude_channel,
-    is_exact_version,
-    parse_dist_tags,
-    resolve_install_version,
-    resolve_upgrade_version,
-    selector_for_channel,
+    ChannelCheck,
+    apply_catalog,
+    check_channel,
+    newer_release_note,
+    refresh_catalog,
+    update_check_cache,
 )
 
-
-def test_infer_claude_channel_only_recognizes_channel_words():
-    assert infer_claude_channel("stable") == "stable"
-    assert infer_claude_channel("next") == "next"
-    # `latest` is the generic selector word, not a channel claim, and exact
-    # Claude versions carry no channel marker.
-    assert infer_claude_channel("latest") is None
-    assert infer_claude_channel("2.1.153") is None
-    assert infer_claude_channel(None) is None
+from native_fakes import make_config, standard_source
 
 
-def test_selector_for_channel_maps_channels_to_dist_tags():
-    assert selector_for_channel("stable") == "stable"
-    assert selector_for_channel("latest") == "latest"
-    assert selector_for_channel("next") == "next"
-    with pytest.raises(ClaudeWranglerError):
-        selector_for_channel("beta")
+def config_for(tmp_path: Path, **overrides):
+    """Return an install config with overrides applied."""
+
+    from dataclasses import replace
+
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    return replace(make_config(project), **overrides)
 
 
-def test_is_exact_version_accepts_semver_and_prerelease_strings():
-    assert is_exact_version("2.1.153") is True
-    assert is_exact_version("2.2.0-beta.3") is True
-    assert is_exact_version("latest") is False
+def test_check_channel_verifies_the_signed_manifest():
+    source = standard_source()
+    result = check_channel(source, "latest")
+    assert result.ok
+    assert result.version == "2.1.296"
+    assert result.build_date == "2026-10-09T14:46:35Z"
+    assert source.manifest_requests == ["2.1.296"]
 
 
-def test_parse_dist_tags_rejects_non_object_payload():
-    with pytest.raises(ClaudeWranglerError):
-        parse_dist_tags('["latest"]')
+def test_check_channel_records_errors_instead_of_raising():
+    source = standard_source()
+    source.unavailable_channels["stable"] = "timed out"
+    result = check_channel(source, "stable")
+    assert not result.ok
+    assert "timed out" in result.error
 
 
-def test_fetch_available_claude_versions_maps_dist_tags(
-    monkeypatch,
-    tmp_path,
-):
-    monkeypatch.setattr(
-        "claude_wrangler.releases.fetch_claude_dist_tags",
-        lambda npm_name, project_root, env=None, timeout_seconds=None: {
-            "stable": "2.1.153",
-            "latest": "2.1.172",
-            "next": "2.1.173",
-        },
+def test_check_channel_refuses_a_pointer_below_the_floor():
+    source = standard_source()
+    source.channels["stable"] = "2.1.100"
+    result = check_channel(source, "stable")
+    assert not result.ok
+    assert "2.1.207" in result.error
+
+
+def test_refresh_catalog_checks_both_channels():
+    results = refresh_catalog(standard_source())
+    assert sorted(results) == ["latest", "stable"]
+    assert results["stable"].version == "2.1.287"
+
+
+def test_apply_catalog_keeps_previous_answers_for_failed_channels(tmp_path):
+    config = config_for(
+        tmp_path,
+        available_versions={"stable": "2.1.250", "latest": "2.1.260"},
     )
-
-    versions = fetch_available_claude_versions("npm", tmp_path)
-
-    assert versions == {
-        "stable": "2.1.153",
-        "latest": "2.1.172",
-        "next": "2.1.173",
+    results = {
+        "stable": ChannelCheck("stable", None, None, None, "offline"),
+        "latest": ChannelCheck("latest", "2.1.296", "2026-10-09T00:00:00Z", "c", None),
     }
-
-
-def test_resolve_install_version_uses_selected_channel(
-    monkeypatch,
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(
-        tmp_path,
-        claude_selector="latest",
-        claude_channel="next",
-        claude_version="latest",
-        version_source="explicit --channel next request",
+    updated = apply_catalog(config, results, "2026-10-12T00:00:00Z")
+    assert updated.available_versions == {"stable": "2.1.250", "latest": "2.1.296"}
+    assert updated.available_version_details["latest"]["build_date"] == (
+        "2026-10-09T00:00:00Z"
     )
-    monkeypatch.setattr(
-        "claude_wrangler.releases.fetch_available_claude_versions",
-        lambda npm_name, project_root, env=None, timeout_seconds=None: {
-            "stable": "2.1.153",
-            "latest": "2.1.172",
-            "next": "2.1.173",
-        },
+    assert updated.last_update_check["ok"] is False
+    assert updated.last_update_check["errors"] == {"stable": "offline"}
+    assert updated.available_versions_updated_at == "2026-10-12T00:00:00Z"
+
+
+def test_update_check_cache_matches_the_launcher_format(tmp_path):
+    config = config_for(tmp_path, claude_channel="stable", claude_version="2.1.287")
+    results = {"stable": ChannelCheck("stable", "2.1.300", None, None, None)}
+    cache = update_check_cache(config, results, "2026-10-12T00:00:00Z")
+    assert cache == {
+        "checked_at": "2026-10-12T00:00:00Z",
+        "channel": "stable",
+        "latest_version": "2.1.300",
+        "pointer_version": "2.1.300",
+        "installed_version": "2.1.287",
+        "error": None,
+    }
+    from claude_wrangler import launcher_core
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 10, 12, 1, tzinfo=timezone.utc)
+    assert launcher_core.update_cache_is_fresh(cache, "stable", now)
+    notice = launcher_core.update_notice(cache, "stable", "2.1.287", "claude-wrangler")
+    assert "claude-wrangler --upgrade --channel stable" in notice
+
+
+def test_update_check_cache_records_a_failure_and_keeps_the_last_answer(tmp_path):
+    config = config_for(tmp_path, claude_channel="stable", claude_version="2.1.287")
+    results = {"stable": ChannelCheck("stable", None, None, None, "offline")}
+    previous = {
+        "channel": "stable",
+        "latest_version": "2.1.290",
+        "pointer_version": "2.1.291",
+    }
+    cache = update_check_cache(config, results, "2026-10-12T00:00:00Z", previous)
+    assert cache["error"] == "offline"
+    assert cache["latest_version"] == "2.1.290"
+    assert cache["pointer_version"] == "2.1.291"
+    other = update_check_cache(
+        config, results, "2026-10-12T00:00:00Z", dict(previous, channel="latest")
     )
-
-    resolved = resolve_install_version(config, "npm")
-
-    assert resolved.claude_channel == "next"
-    assert resolved.claude_version == "2.1.173"
-    assert resolved.available_versions["stable"] == "2.1.153"
+    assert other["latest_version"] is None
+    assert other["pointer_version"] is None
 
 
-def test_resolve_upgrade_version_uses_known_latest_for_selected_channel(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(
-        tmp_path,
-        operation="upgrade",
-        claude_selector="latest",
-        claude_channel="next",
-        claude_version="latest",
-        available_versions={
-            "stable": "2.1.153",
-            "latest": "2.1.172",
-            "next": "2.1.173",
-        },
+def test_launcher_refresh_never_turns_a_pointer_into_verified_data(tmp_path):
+    from datetime import datetime, timezone
+
+    from claude_wrangler import launcher_core
+
+    config = config_for(tmp_path, claude_channel="stable", claude_version="2.1.287")
+    results = {"stable": ChannelCheck("stable", "2.1.290", None, None, None)}
+    verified = update_check_cache(config, results, "2026-10-10T00:00:00Z")
+    runtime_root = tmp_path / "rt"
+    runtime_root.mkdir()
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    cache, error = launcher_core.refresh_update_cache(
+        str(runtime_root),
+        "stable",
+        "2.1.287",
+        lambda url, timeout: b"2.1.300\n",
+        now,
+        1.0,
+        verified,
     )
+    assert error is None
+    assert cache["latest_version"] == "2.1.290"
+    assert cache["pointer_version"] == "2.1.300"
+    # A later --update that fails keeps the verified value, not the pointer.
+    failed = {"stable": ChannelCheck("stable", None, None, None, "offline")}
+    after = update_check_cache(config, failed, "2026-10-12T01:00:00Z", cache)
+    assert after["latest_version"] == "2.1.290"
+    notice = launcher_core.update_notice(after, "stable", "2.1.287", "claude-wrangler")
+    assert notice.startswith("Claude Code 2.1.290 is available")
 
-    resolved = resolve_upgrade_version(config)
 
-    assert resolved.claude_version == "2.1.173"
-    assert resolved.version_source == "known next channel from local metadata"
-
-
-def test_resolve_upgrade_version_accepts_exact_version_for_selected_channel(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(
+def test_newer_release_note(tmp_path):
+    config = config_for(
         tmp_path,
-        operation="upgrade",
-        claude_selector="2.1.150",
         claude_channel="stable",
-        claude_version="2.1.150",
-        available_versions={
-            "stable": "2.1.153",
-            "latest": "2.1.172",
-            "next": "2.1.173",
-        },
+        claude_version="2.1.287",
+        available_versions={"stable": "2.1.300"},
     )
-
-    resolved = resolve_upgrade_version(config)
-
-    assert resolved.claude_version == "2.1.150"
-    assert resolved.version_source == "explicit --version for stable channel"
-
-
-def test_resolve_upgrade_version_requires_known_catalog_entry(
-    tmp_path,
-    config_factory,
-):
-    config = config_factory(
+    assert "--upgrade --channel stable" in newer_release_note(config)
+    current = config_for(
         tmp_path,
-        operation="upgrade",
-        claude_selector="latest",
-        claude_channel="next",
-        claude_version="latest",
-        available_versions={},
+        claude_channel="stable",
+        claude_version="2.1.300",
+        available_versions={"stable": "2.1.300"},
     )
-
-    with pytest.raises(ClaudeWranglerError, match="--update"):
-        resolve_upgrade_version(config)
+    assert newer_release_note(current) is None

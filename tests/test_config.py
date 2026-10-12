@@ -7,6 +7,8 @@ import os
 import pytest
 
 from claude_wrangler.config import (
+    MISSING_DASH_FLAG_HINTS,
+    build_parser,
     config_from_args,
     determine_shared_home,
     determine_target_selection,
@@ -15,331 +17,409 @@ from claude_wrangler.config import (
     parse_positive_int,
 )
 from claude_wrangler.constants import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     DEFAULT_INSTALL_CLAUDE_CHANNEL,
     DEFAULT_INSTALL_CLAUDE_SELECTOR,
     DEFAULT_LOCAL_DIR,
-    DEFAULT_NPM_INSTALL_LOGLEVEL,
-    DEFAULT_NPM_TIMEOUT_SECONDS,
+    LEGACY_LOCAL_DIR,
+    METADATA_FILENAME,
 )
+from claude_wrangler.distribution import DEFAULT_RELEASE_BASE_URL
 from claude_wrangler.layout import resolve_relative_within_root
 from claude_wrangler.models import ClaudeWranglerError, ExistingState
-from claude_wrangler.rendering import build_local_package_json
 
 
-class DummyArgs:
-    inspect = False
-    selftest = False
-    uninstall = False
-    update = False
-    upgrade = False
-    requested_version = None
-    channel = None
-    shared_home = None
-    set_reasonable_permissions = False
-    clear_reasonable_permissions = False
+def write_native_metadata(project, **fields):
+    """Write schema-2 metadata at the default runtime root."""
+
+    payload = {
+        "schema_version": 2,
+        "claude_selector": "latest",
+        "claude_channel": "stable",
+        "claude_version": "2.1.287",
+        "shared_home": False,
+        "reasonable_permissions_enabled": False,
+        "generated_at": "2026-10-01T00:00:00Z",
+    }
+    payload.update(fields)
+    path = project / DEFAULT_LOCAL_DIR / METADATA_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
-def make_local_dir(tmp_path):
-    local_dir = tmp_path / DEFAULT_LOCAL_DIR
-    local_dir.mkdir(parents=True)
-    return local_dir
+def parsed(*argv):
+    """Parse argv with a default project root."""
+
+    return parse_args(list(argv))
 
 
 def test_normalize_requested_version_accepts_case_insensitive_latest():
     assert normalize_requested_version("LATEST") == "latest"
     assert normalize_requested_version("  latest  ") == "latest"
-    assert normalize_requested_version("2.1.153") == "2.1.153"
+    assert normalize_requested_version("2.1.287") == "2.1.287"
+    assert normalize_requested_version("  ") is None
 
 
 def test_parse_positive_int_rejects_non_positive_values():
     with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
         parse_positive_int("0")
+    with pytest.raises(argparse.ArgumentTypeError, match="positive integer"):
+        parse_positive_int("x")
 
 
-def test_determine_target_selection_defaults_to_latest_stable_for_install():
-    selector, channel, version, source = determine_target_selection(
-        DummyArgs(),
-        ExistingState(),
-        "install",
-    )
-    assert selector == DEFAULT_INSTALL_CLAUDE_SELECTOR
-    assert channel == DEFAULT_INSTALL_CLAUDE_CHANNEL
-    assert version == "latest"
-    assert source == "default stable channel request"
+def test_default_local_dir_is_the_native_runtime_root():
+    assert DEFAULT_LOCAL_DIR == ".local/claude/wrangler"
+    assert LEGACY_LOCAL_DIR == ".local/claude/npm"
 
 
-def test_determine_target_selection_uses_existing_state_for_update():
-    existing = ExistingState(
-        metadata={"version_source": "previous install"},
-        requested_claude_selector="latest",
-        claude_channel="next",
-        pinned_claude_version="2.1.173",
-    )
-    selector, channel, version, source = determine_target_selection(
-        DummyArgs(),
-        existing,
-        "update",
-    )
-    assert selector == "latest"
-    assert channel == "next"
-    assert version == "2.1.173"
-    assert source == "previous install"
+def test_channel_next_is_a_deprecated_alias_of_latest(capsys):
+    args = parsed("--upgrade", "--channel", "next")
+    assert args.channel == "latest"
+    assert args.channel_deprecated is True
+    assert "deprecated" in capsys.readouterr().err
 
 
-def test_determine_target_selection_requires_upgrade_channel():
-    with pytest.raises(ClaudeWranglerError):
-        determine_target_selection(DummyArgs(), ExistingState(), "upgrade")
+@pytest.mark.parametrize("bad", ["2.1", "2.1.x", "v2.1.300", "stable", "2.1.300-beta"])
+def test_version_must_be_exact_or_latest(bad):
+    with pytest.raises(SystemExit):
+        parsed("--version", bad)
 
 
-def test_determine_shared_home_preserves_existing_choice():
-    args = DummyArgs()
-    existing = ExistingState(shared_home=True)
-    assert determine_shared_home(args, existing) is True
-
-
-def test_determine_shared_home_honors_explicit_flag():
-    args = DummyArgs()
-    args.shared_home = False
-    existing = ExistingState(shared_home=True)
-    assert determine_shared_home(args, existing) is False
-
-
-def test_resolve_relative_within_root_rejects_escape(tmp_path):
-    with pytest.raises(ClaudeWranglerError):
-        resolve_relative_within_root(tmp_path, "../escape", "test")
-
-
-def test_resolve_relative_within_root_rejects_absolute_path(tmp_path):
-    with pytest.raises(ClaudeWranglerError, match="must be relative"):
-        resolve_relative_within_root(tmp_path, str(tmp_path / "inside"), "test")
-
-
-def test_resolve_relative_within_root_returns_posix_spelling(tmp_path):
-    relative, resolved = resolve_relative_within_root(
-        tmp_path, "bin/../bin/./custom-claude", "test"
-    )
-
-    assert relative == "bin/custom-claude"
-    assert resolved == (tmp_path / "bin" / "custom-claude").resolve()
-
-
-@pytest.mark.skipif(
-    os.name != "nt", reason="backslash is a path separator only on Windows"
-)
-def test_resolve_relative_within_root_normalizes_windows_separators(tmp_path):
-    relative, _ = resolve_relative_within_root(tmp_path, "bin\\custom-claude", "test")
-
-    assert relative == "bin/custom-claude"
-
-
-@pytest.mark.skipif(
-    os.name != "nt", reason="rooted and drive-relative paths exist only on Windows"
-)
-@pytest.mark.parametrize("raw", ["\\escape", "C:escape", "/escape"])
-def test_resolve_relative_within_root_rejects_windows_anchored_paths(tmp_path, raw):
-    with pytest.raises(ClaudeWranglerError, match="must be relative"):
-        resolve_relative_within_root(tmp_path, raw, "test")
+def test_version_below_the_floor_is_refused_at_parse_time(capsys):
+    with pytest.raises(SystemExit):
+        parsed("--upgrade", "--channel", "stable", "--version", "2.1.206")
+    assert "2.1.207" in capsys.readouterr().err
+    assert parsed("--version", "2.1.207").requested_version == "2.1.207"
 
 
 def test_parse_args_requires_upgrade_channel():
     with pytest.raises(SystemExit):
-        parse_args(["--upgrade"])
+        parsed("--upgrade")
 
 
-def test_parse_args_rejects_update_version_request():
+def test_parse_args_rejects_update_version_and_channel_requests():
     with pytest.raises(SystemExit):
-        parse_args(["--update", "--version", "latest"])
+        parsed("--update", "--version", "2.1.287")
+    with pytest.raises(SystemExit):
+        parsed("--update", "--channel", "stable")
 
 
 def test_parse_args_keeps_bare_update_as_project_root():
-    args = parse_args(["update"])
-
-    assert args.update is False
+    args = parsed("update")
     assert args.project_root == "update"
+    assert args.update is False
 
 
 def test_config_from_args_suggests_missing_dashes_for_bare_update():
     with pytest.raises(ClaudeWranglerError, match="Did you perhaps mean '--update'"):
-        config_from_args(parse_args(["update"]))
+        config_from_args(parsed("update"))
 
 
-def test_config_from_args_suggests_missing_dashes_for_other_known_flags():
-    with pytest.raises(ClaudeWranglerError, match="Did you perhaps mean '--force'"):
-        config_from_args(parse_args(["force"]))
+@pytest.mark.parametrize("flag", ["rollback", "stop-background-sessions", "platform"])
+def test_config_from_args_suggests_missing_dashes_for_new_flags(flag):
+    with pytest.raises(ClaudeWranglerError, match="--{}".format(flag)):
+        config_from_args(parsed(flag))
+
+
+def test_missing_dash_hints_cover_every_long_flag():
+    parser = build_parser()
+    long_flags = {
+        option[2:]
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--") and option != "--help"
+    }
+    assert long_flags <= set(MISSING_DASH_FLAG_HINTS)
 
 
 def test_config_from_args_allows_existing_project_named_update(tmp_path, monkeypatch):
     project = tmp_path / "update"
     project.mkdir()
     monkeypatch.chdir(tmp_path)
-
-    config = config_from_args(parse_args(["update"]))
-
-    assert config.operation == "install"
+    config = config_from_args(parsed("update"))
     assert config.project_root == project.resolve()
-
-
-def test_parse_args_rejects_set_reasonable_permissions_with_inspect():
-    with pytest.raises(SystemExit):
-        parse_args(["--inspect", "--set-reasonable-permissions"])
-
-
-def test_parse_args_rejects_mismatched_upgrade_channel_and_version():
-    with pytest.raises(SystemExit):
-        parse_args(["--upgrade", "--channel", "stable", "--version", "next"])
-
-
-def test_parse_args_rejects_mismatched_install_channel_and_version():
-    with pytest.raises(SystemExit):
-        parse_args(["--channel", "latest", "--version", "stable"])
-
-
-def test_parse_args_accepts_exact_version_for_any_channel():
-    # Claude versions carry no channel marker, so an exact version may be
-    # paired with any explicit channel.
-    args = parse_args(["--channel", "next", "--version", "2.1.173"])
-
-    assert args.channel == "next"
-    assert args.requested_version == "2.1.173"
-
-
-def test_parse_args_rejects_invalid_npm_timeout():
-    with pytest.raises(SystemExit):
-        parse_args(["--npm-timeout-seconds", "0"])
-
-
-def test_config_from_args_builds_expected_configuration(tmp_path):
-    args = parse_args(
-        [
-            "--shared-home",
-            "--channel",
-            "next",
-            "--version",
-            "latest",
-            "--launcher",
-            "bin/custom-claude",
-            "--readme-local",
-            "LOCAL-README.md",
-            str(tmp_path),
-        ]
-    )
-    config = config_from_args(args)
-
     assert config.operation == "install"
-    assert config.claude_selector == "latest"
-    assert config.claude_channel == "next"
-    assert config.shared_home is True
-    assert config.npm_timeout_seconds == DEFAULT_NPM_TIMEOUT_SECONDS
-    assert config.npm_install_loglevel == DEFAULT_NPM_INSTALL_LOGLEVEL
-    assert config.layout.launcher_relative == "bin/custom-claude"
-    assert config.layout.readme_relative == "LOCAL-README.md"
 
 
-def test_config_from_args_honors_npm_timeout_override(tmp_path):
-    config = config_from_args(
-        parse_args(["--npm-timeout-seconds", "42", str(tmp_path)])
-    )
-
-    assert config.npm_timeout_seconds == 42
-
-
-def test_config_from_args_honors_npm_install_loglevel_override(tmp_path):
-    config = config_from_args(
-        parse_args(["--npm-install-loglevel", "notice", str(tmp_path)])
-    )
-
-    assert config.npm_install_loglevel == "notice"
+def test_rollback_is_an_operation_and_rejects_install_flags():
+    assert parsed("--rollback").rollback is True
+    for extra in (
+        ["--channel", "stable"],
+        ["--version", "2.1.287"],
+        ["--skip-install"],
+    ):
+        with pytest.raises(SystemExit):
+            parsed("--rollback", *extra)
+    with pytest.raises(SystemExit):
+        parsed("--rollback", "--platform", "linux-x64")
 
 
-def test_config_from_args_update_falls_back_to_existing_managed_files(tmp_path):
-    local_dir = make_local_dir(tmp_path)
-    (local_dir / "package.json").write_text(
-        build_local_package_json("2.1.150"),
-        encoding="utf-8",
-    )
-    (local_dir / "package-lock.json").write_text(
-        '{"packages": {"node_modules/@anthropic-ai/claude-code":'
-        ' {"version": "2.1.150"}}}',
-        encoding="utf-8",
-    )
-
-    config = config_from_args(parse_args(["--update", str(tmp_path)]))
-
-    assert config.operation == "update"
-    assert config.claude_selector == "2.1.150"
-    # Exact Claude versions never imply a channel.
-    assert config.claude_channel is None
-    assert config.claude_version == "2.1.150"
-    assert config.version_source == "existing managed files"
+@pytest.mark.parametrize(
+    "operation",
+    ["--inspect", "--selftest", "--uninstall", "--update", "--rollback"],
+)
+@pytest.mark.parametrize(
+    "setting",
+    [
+        ["--set-reasonable-permissions"],
+        ["--clear-reasonable-permissions"],
+        ["--set-update-checks", "off"],
+        ["--set-windows-sandbox-warning", "on"],
+    ],
+)
+def test_settings_flags_are_only_valid_for_install_like_operations(operation, setting):
+    with pytest.raises(SystemExit):
+        parsed(operation, *setting)
 
 
-def test_config_from_args_inspect_tolerates_corrupt_managed_json(tmp_path):
-    local_dir = make_local_dir(tmp_path)
-    (local_dir / ".claude-wrangler.json").write_text("{not json\n", encoding="utf-8")
-    (local_dir / "package.json").write_text(
-        build_local_package_json("2.1.150"),
-        encoding="utf-8",
-    )
-    (local_dir / "package-lock.json").write_text("{not json\n", encoding="utf-8")
-
-    config = config_from_args(parse_args(["--inspect", str(tmp_path)]))
-
-    assert config.operation == "inspect"
-    assert config.claude_selector == "2.1.150"
-    assert config.claude_version == "2.1.150"
+def test_network_flags_are_refused_for_offline_operations(tmp_path):
+    for operation in ("--inspect", "--selftest", "--uninstall", "--rollback"):
+        with pytest.raises(SystemExit):
+            parsed(operation, "--download-timeout-seconds", "5")
 
 
-def test_config_from_args_inspect_tolerates_fully_corrupt_managed_state(tmp_path):
-    local_dir = make_local_dir(tmp_path)
-    (local_dir / ".claude-wrangler.json").write_text("{not json\n", encoding="utf-8")
-    (local_dir / "package.json").write_text("{not json\n", encoding="utf-8")
-    (local_dir / "package-lock.json").write_text("{not json\n", encoding="utf-8")
+def test_release_base_url_must_be_https(capsys):
+    with pytest.raises(SystemExit):
+        parsed("--release-base-url", "http://mirror.example.com/x")
+    args = parsed("--release-base-url", "https://mirror.example.com/x/")
+    assert args.release_base_url == "https://mirror.example.com/x"
 
-    config = config_from_args(parse_args(["--inspect", str(tmp_path)]))
 
-    assert config.operation == "inspect"
+def test_ca_bundle_must_exist(tmp_path):
+    with pytest.raises(SystemExit):
+        parsed("--ca-bundle", str(tmp_path / "missing.pem"))
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("x", encoding="utf-8")
+    assert parsed("--ca-bundle", str(bundle)).ca_bundle == os.path.abspath(str(bundle))
+
+
+def test_platform_choices_are_release_keys():
+    assert parsed("--platform", "win32-x64").platform == "win32-x64"
+    with pytest.raises(SystemExit):
+        parsed("--platform", "win32-x86")
+
+
+def test_stop_background_sessions_only_for_mutating_operations():
+    assert parsed("--uninstall", "--stop-background-sessions").stop_background_sessions
+    for operation in ("--inspect", "--selftest", "--update"):
+        with pytest.raises(SystemExit):
+            parsed(operation, "--stop-background-sessions")
+
+
+def test_retired_npm_flags_are_accepted_with_a_warning(capsys):
+    args = parsed("--npm-timeout-seconds", "30", "--npm-install-loglevel", "silly")
+    err = capsys.readouterr().err
+    assert "--npm-timeout-seconds is ignored" in err
+    assert "--npm-install-loglevel is ignored" in err
+    assert args.npm_timeout_seconds == 30
+
+
+def test_help_documents_native_flags(capsys):
+    with pytest.raises(SystemExit):
+        parsed("--help")
+    out = capsys.readouterr().out
+    for flag in (
+        "--rollback",
+        "--platform",
+        "--release-base-url",
+        "--ca-bundle",
+        "--download-timeout-seconds",
+        "--stop-background-sessions",
+        "--set-update-checks",
+        "--set-windows-sandbox-warning",
+        "--channel {stable,latest,next}",
+    ):
+        assert flag in out
+    assert "--npm-timeout-seconds" not in out
+    assert "Node.js and npm are not required" in " ".join(out.split())
+
+
+def test_resolve_relative_within_root_rejects_escape(tmp_path):
+    with pytest.raises(ClaudeWranglerError, match="escapes the project root"):
+        resolve_relative_within_root(tmp_path, "../outside", "--local-dir")
+
+
+def test_resolve_relative_within_root_returns_posix_spelling(tmp_path):
+    relative, resolved = resolve_relative_within_root(tmp_path, "a/b/c", "--launcher")
+    assert relative == "a/b/c"
+    assert resolved == (tmp_path / "a" / "b" / "c").resolve()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path syntax")
+@pytest.mark.parametrize("raw", ["\\escape", "C:escape", "/escape"])
+def test_resolve_relative_within_root_rejects_windows_anchored_paths(tmp_path, raw):
+    with pytest.raises(ClaudeWranglerError):
+        resolve_relative_within_root(tmp_path, raw, "--local-dir")
+
+
+def test_new_install_defaults(tmp_path):
+    config = config_from_args(parsed(str(tmp_path)))
+    assert config.operation == "install"
     assert config.claude_selector == DEFAULT_INSTALL_CLAUDE_SELECTOR
-    # With fully corrupt managed state nothing can prove a channel, and the
-    # generic `latest` selector deliberately implies none.
-    assert config.claude_channel is None
-    assert config.claude_version == DEFAULT_INSTALL_CLAUDE_SELECTOR
+    assert config.claude_channel == DEFAULT_INSTALL_CLAUDE_CHANNEL
+    assert config.claude_version is None
+    assert config.layout.local_dir_relative == DEFAULT_LOCAL_DIR
+    assert config.layout.launcher_cmd_relative == "bin/claude-local.cmd"
+    assert config.release_base_url == DEFAULT_RELEASE_BASE_URL
+    assert config.download_timeout_seconds == DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+    assert config.update_checks is True
+    assert config.windows_sandbox_warning is True
+    assert config.shared_home is False
+    assert config.legacy is None
 
 
-def test_config_from_args_toggle_only_preserves_existing_selection(tmp_path):
-    local_dir = make_local_dir(tmp_path)
-    (local_dir / "package.json").write_text(
-        build_local_package_json("2.1.150"),
+def test_plain_install_keeps_the_recorded_pin(tmp_path):
+    write_native_metadata(tmp_path, claude_version="2.1.287", claude_channel="latest")
+    config = config_from_args(parsed(str(tmp_path)))
+    assert config.claude_version == "2.1.287"
+    assert config.claude_channel == "latest"
+
+
+def test_explicit_channel_resolves_live(tmp_path):
+    write_native_metadata(tmp_path)
+    config = config_from_args(parsed("--channel", "latest", str(tmp_path)))
+    assert config.claude_selector == "latest"
+    assert config.claude_version is None
+    assert config.claude_channel == "latest"
+    assert config.channel_explicit is True
+
+
+def test_upgrade_with_exact_version(tmp_path):
+    write_native_metadata(tmp_path)
+    config = config_from_args(
+        parsed(
+            "--upgrade", "--channel", "stable", "--version", "2.1.296", str(tmp_path)
+        )
+    )
+    assert config.claude_selector == "2.1.296"
+    assert config.claude_version == "2.1.296"
+
+
+def test_toggle_only_preserves_existing_selection(tmp_path):
+    write_native_metadata(tmp_path, claude_version="2.1.287")
+    config = config_from_args(parsed("--set-reasonable-permissions", str(tmp_path)))
+    assert config.reconfigure_only is True
+    assert config.reasonable_permissions_enabled is True
+    assert config.claude_version == "2.1.287"
+    config = config_from_args(parsed("--set-update-checks", "off", str(tmp_path)))
+    assert config.reconfigure_only is True
+    assert config.update_checks is False
+
+
+def test_recorded_settings_and_paths_are_honored(tmp_path):
+    write_native_metadata(
+        tmp_path,
+        update_checks=False,
+        windows_sandbox_warning=False,
+        release_base_url="https://mirror.example.com/r",
+        shared_home=True,
+        paths={"claude_home_dir": "state/home", "launcher": "tools/claude-local"},
+    )
+    config = config_from_args(parsed(str(tmp_path)))
+    assert config.update_checks is False
+    assert config.windows_sandbox_warning is False
+    assert config.release_base_url == "https://mirror.example.com/r"
+    assert config.shared_home is True
+    assert config.layout.claude_home_relative == "state/home"
+    assert config.layout.launcher_relative == "tools/claude-local"
+    explicit = config_from_args(parsed("--launcher", "x/y", str(tmp_path)))
+    assert explicit.layout.launcher_relative == "x/y"
+
+
+def test_foreign_schema_metadata_is_not_native_state(tmp_path):
+    write_native_metadata(tmp_path, schema_version=1)
+    config = config_from_args(parsed("--inspect", str(tmp_path)))
+    assert config.existing_metadata is None
+    assert "schema_version 1" in config.existing_metadata_error
+
+
+def test_inspect_tolerates_corrupt_metadata(tmp_path):
+    path = tmp_path / DEFAULT_LOCAL_DIR / METADATA_FILENAME
+    path.parent.mkdir(parents=True)
+    path.write_text("{bad", encoding="utf-8")
+    config = config_from_args(parsed("--inspect", str(tmp_path)))
+    assert config.existing_metadata is None
+    assert "Failed to parse JSON" in config.existing_metadata_error
+
+
+def test_inspect_uses_the_recorded_launcher_python(tmp_path):
+    write_native_metadata(tmp_path, launcher_python="/recorded/python3")
+    assert config_from_args(parsed("--inspect", str(tmp_path))).launcher_python == (
+        "/recorded/python3"
+    )
+    assert (
+        config_from_args(parsed(str(tmp_path))).launcher_python != "/recorded/python3"
+    )
+
+
+def test_determine_shared_home_preference_order():
+    args = argparse.Namespace(shared_home=None)
+    assert determine_shared_home(args, ExistingState(shared_home=True)) is True
+    args = argparse.Namespace(shared_home=False)
+    assert determine_shared_home(args, ExistingState(shared_home=True)) is False
+
+
+def test_determine_target_selection_for_reports_uses_existing_state():
+    existing = ExistingState(
+        metadata={"x": 1},
+        requested_claude_selector="2.1.287",
+        claude_channel="stable",
+        pinned_claude_version="2.1.287",
+    )
+    args = argparse.Namespace(
+        requested_version=None,
+        channel=None,
+        set_reasonable_permissions=False,
+        clear_reasonable_permissions=False,
+        set_update_checks=None,
+        set_windows_sandbox_warning=None,
+        repair_install=False,
+    )
+    assert determine_target_selection(args, existing, "inspect")[:3] == (
+        "2.1.287",
+        "stable",
+        "2.1.287",
+    )
+
+
+def test_legacy_local_dir_is_discovered_automatically(tmp_path):
+    legacy = tmp_path / LEGACY_LOCAL_DIR
+    legacy.mkdir(parents=True)
+    (legacy / "package.json").write_text(
+        json.dumps({"devDependencies": {"@anthropic-ai/claude-code": "2.1.287"}}),
         encoding="utf-8",
     )
-    (local_dir / "package-lock.json").write_text(
-        '{"packages": {"node_modules/@anthropic-ai/claude-code":'
-        ' {"version": "2.1.150"}}}',
-        encoding="utf-8",
-    )
-    # json.dumps escapes Windows backslashes; %-formatting the path into a
-    # JSON literal produced invalid escapes such as `\U` on Windows.
-    (local_dir / ".claude-wrangler.json").write_text(
+    (legacy / METADATA_FILENAME).write_text(
         json.dumps(
             {
-                "project_root": str(tmp_path),
-                "claude_selector": "latest",
+                "schema_version": 1,
                 "claude_channel": "stable",
-                "claude_version": "2.1.150",
-                "version_source": "existing metadata",
-                "reasonable_permissions_enabled": False,
+                "claude_version": "2.1.287",
+                "shared_home": True,
+                "paths": {"claude_config_dir": ".local/claude"},
             }
         ),
         encoding="utf-8",
     )
+    config = config_from_args(parsed(str(tmp_path)))
+    assert config.legacy is not None
+    assert config.legacy.dir_relative == LEGACY_LOCAL_DIR
+    assert config.claude_version == "2.1.287"
+    assert config.shared_home is True
+    assert config.layout.local_dir_relative == DEFAULT_LOCAL_DIR
 
-    config = config_from_args(
-        parse_args(["--set-reasonable-permissions", str(tmp_path)])
-    )
 
-    assert config.operation == "install"
-    assert config.claude_selector == "latest"
-    assert config.claude_channel == "stable"
-    assert config.claude_version == "2.1.150"
-    assert config.version_source == "existing metadata"
-    assert config.reasonable_permissions_enabled is True
-    assert config.reconfigure_only is True
+def test_explicit_legacy_local_dir_is_treated_as_the_legacy_layout(tmp_path):
+    legacy = tmp_path / "tools" / "npm-claude"
+    (legacy / "node_modules").mkdir(parents=True)
+    config = config_from_args(parsed("--local-dir", "tools/npm-claude", str(tmp_path)))
+    assert config.legacy is not None
+    assert config.legacy.dir_relative == "tools/npm-claude"
+    assert config.layout.local_dir_relative == DEFAULT_LOCAL_DIR
+
+
+def test_custom_native_local_dir(tmp_path):
+    config = config_from_args(parsed("--local-dir", "rt/claude", str(tmp_path)))
+    assert config.layout.local_dir_relative == "rt/claude"
+    assert config.legacy is None

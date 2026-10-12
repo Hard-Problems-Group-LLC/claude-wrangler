@@ -4,4 +4,112 @@ Use this backlog to track pending tasks in priority order. The top item should
 be handled next. Mark each task with an asterisk followed by a blank line.
 Include concise context, blockers, owner/requestor, and ISO 8601 timestamps.
 
+The entries below are follow-ups from the Windows support and native
+Claude Code runtime work (`feature/windows-platform-support`; approved
+proposal `proposals/approved/windows-support-and-native-claude-runtime.md`).
+All were added 2026-10-12T03:37:00-07:00. Requestor: operator. Owner: AI
+(Claude) unless noted.
+
 *
+
+GitHub release-archive transport. Add Anthropic's GitHub release
+archives as an alternative transport for networks that block
+`downloads.claude.ai`, chosen explicitly and never as a silent fallback.
+The manifest and both signatures must still verify against the pinned
+keys, the GitHub hosts join the allowlist only when chosen, and the
+fetch and extraction code must stay Python 3.9 and standard-library-only
+(no `tarfile` extraction filters, no zstd). Blockers: none.
+
+*
+
+Offline and mirror import. Add an import mode for mirror-only or
+air-gapped networks that takes the manifest, both signatures, and the
+binary from a local directory and verifies them exactly as a download
+(pinned keys, version floor, size, SHA-256, structure check, smoke
+test). Complements `--release-base-url`. Blockers: none.
+
+*
+
+Anti-rollback high-water mark. Record the highest verified version and
+signed `buildDate` per project outside the repository (operator-owned
+state), refuse older signed releases from a mirror or tampered metadata
+unless the operator passes an explicit `--allow-downgrade`, and keep
+`--rollback` between the two retained slots working. Decide where the
+mark lives at each ring. Blockers: none.
+
+*
+
+Second trust anchor: Authenticode and codesign. After signature and
+hash checks, also require the expected publisher on the binary: Windows
+Authenticode (publisher plus issuer, with online revocation checking at
+install time) and macOS `codesign -R` with Anthropic's Apple team ID.
+Keep both anchors compiled into the package. Blockers: none.
+
+*
+
+Advisory check in selftest. Have `--selftest` (and `--update`) report
+published security advisories that affect the pinned version, using a
+signed or otherwise verifiable source, and warn rather than fail when
+the source is unreachable. Advisories trail fixes by weeks, so this is
+advisory only. Blockers: choosing a trustworthy advisory feed.
+
+*
+
+Sandbox deny rules for runtime and launcher paths. Generate user-scope
+`permissions.deny` and `sandbox.filesystem.denyWrite` rules for
+`bin/claude-local*`, `.local/claude/wrangler/**`, and
+`.local/claude/HOME/.local/**`, so an agent session cannot rewrite the
+launcher or runtime that the next unsandboxed ring-1 launch trusts.
+Native Windows has no sandbox, so document the remaining gap there.
+Blockers: none.
+
+*
+
+Pin-age and withdrawn-upstream warnings. Warn when the pinned release's
+signed `buildDate` is older than a threshold (for example 21 days), and
+consider requiring an explicit override at rings 1 and 0 past a longer
+one (for example 60 days). Warn when the pinned version's manifest is
+gone upstream while the channel pointer still works. Blockers: none.
+
+*
+
+Windows-native `install.sh` guard through FieldManual. `./install.sh`
+under Git Bash still reaches stage 2 without the Windows policy checks
+that `install.cmd` applies. `install.sh` and stage 2 are
+TheKnowledge-managed, and no new TheKnowledge ECRs are planned, so carry
+the guard to TheKnowledge's successor, FieldManual, together with the
+other upstream items: adopting `install.cmd` and the Windows policy
+helper as starter files, the pyenv-win interpreter path fix in
+`python_environment_bootstrap.py`, stage 2 `allow_abbrev=False`, and a
+`*.cmd` CRLF attribute. Blockers: FieldManual availability.
+
+*
+
+macOS port validation. Run the native runtime on real macOS, both
+Apple silicon and Intel: Rosetta 2 platform detection, Mach-O structure
+checks, `ps`-based in-use detection, the python.org certificate hint,
+codesign behavior when a slot is renamed, and the `sh` launcher and
+PATH shim. Record any ring requirements that macOS adds. Blockers: a
+macOS host or CI runner.
+
+*
+
+Linux, macOS, and Python 3.9 CI. Implement the GitHub Actions workflow
+in `proposals/under-review/github-actions-cross-platform-ci.md`: the
+test matrix on Windows, Linux (glibc, plus an Alpine/musl job), and
+macOS; a Python 3.9 floor job for the bootstrap, launcher core, and
+verifier; and the `install.cmd` entry job with redirected home
+variables. The POSIX code paths (`fcntl` locking, `/proc` and `ps`
+process listing, execute bits, directory fsync) have not yet run.
+Blockers: operator approval of the CI proposal.
+
+*
+
+Windows Sandbox empirical verification. Confirm in Windows Sandbox the
+code-derived behavior the design relies on: self-update and installer
+suppression in all three layers, Claude Code's version housekeeping,
+the background service's executable-path fallback and
+`daemon stop --any`, `--settings` precedence over project settings,
+subcommand interception, and the real `install.cmd` flow in a fresh
+profile. Blockers: the operator must enable the Windows Sandbox optional
+feature and reboot (`ai-human-requests.txt`, 2026-10-12T01:00:00-07:00).

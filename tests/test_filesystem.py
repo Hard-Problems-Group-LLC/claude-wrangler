@@ -447,3 +447,37 @@ def test_remove_file_if_managed_accepts_line_ending_converted_copy(tmp_path):
 
     assert removed is True
     assert not managed_path.exists()
+
+
+def test_write_text_file_is_atomic_and_leaves_no_temporary_files(tmp_path):
+    path = tmp_path / "bin" / "claude-local"
+    write_text_file(path, "one\n", force=False, dry_run=False)
+    write_text_file(
+        path,
+        "# managed by claude-wrangler\ntwo\n",
+        force=True,
+        dry_run=False,
+    )
+    assert path.read_bytes() == b"# managed by claude-wrangler\ntwo\n"
+    assert [p.name for p in path.parent.iterdir()] == ["claude-local"]
+
+
+def test_write_text_file_ascii_encoding_refuses_before_writing(tmp_path):
+    path = tmp_path / "claude-local.cmd"
+    path.write_bytes(b"old\r\n")
+    with pytest.raises(UnicodeEncodeError):
+        write_text_file(
+            path,
+            "caf\u00e9\n",
+            force=True,
+            dry_run=False,
+            newline="\r\n",
+            encoding="ascii",
+        )
+    assert path.read_bytes() == b"old\r\n"
+
+
+def test_write_text_file_reports_whether_it_wrote(tmp_path):
+    path = tmp_path / "file.txt"
+    assert write_text_file(path, "x\n", force=False, dry_run=False) is True
+    assert write_text_file(path, "x\n", force=False, dry_run=False) is False

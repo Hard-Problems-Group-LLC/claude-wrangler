@@ -16,10 +16,12 @@ attributes, and the user-facing claude-wrangler launcher on Windows.
 
 `install.sh`, `bootstrap.sh`, `bootstrap-stage2.py`,
 `scripts/install-stage-2.py`, `scripts/python_environment_bootstrap.py`,
-`scripts/dev_setup.py`, and the managed `.gitignore` block are
-TheKnowledge starter files and are not edited for Windows support. The
-files below are owned by this project and are written to be portable to
-TheKnowledge's successor without depending on TheKnowledge internals.
+`scripts/dev_setup.py`, and TheKnowledge's managed `.gitignore` block
+are TheKnowledge starter files and are not edited for Windows support.
+claude-wrangler's own marked `.gitignore` block is separate: it is owned
+by claude-wrangler and governed by `managed_gitignore_enforcement.md`.
+The files below are owned by this project and are written to be portable
+to TheKnowledge's successor without depending on TheKnowledge internals.
 
 ## Required Behavior
 
@@ -83,7 +85,12 @@ TheKnowledge's successor without depending on TheKnowledge internals.
    - refuses when `HOME` or `USERPROFILE` is a repo-local isolated home or
      when `CLAUDE_LOCAL_MANAGED_BY` / `CODEX_LOCAL_MANAGED_BY` is set with
      a home that differs from the Windows profile, unless
-     `--allow-isolated-home` is given (consumed, not forwarded);
+     `--allow-isolated-home` is given (consumed, not forwarded). Known
+     gap: both checks examine only `HOME` and `USERPROFILE`, not
+     `HOMEDRIVE`/`HOMEPATH`, which `install_scope.py` consults after
+     `USERPROFILE` (`explicit_user_home_targeting_for_installers.md`);
+     a session that redirects only `HOMEDRIVE`/`HOMEPATH` is not
+     detected here;
    - on an elevated token, prompts on a console and refuses without one
      unless `THEKNOWLEDGE_INSTALL_ALLOW_ELEVATED=1`;
    - sets `THEKNOWLEDGE_MANAGED_INSTALL_STAGE1=1` only in the child's

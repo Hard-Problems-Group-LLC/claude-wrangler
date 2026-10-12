@@ -243,3 +243,55 @@ def test_bootstrap_stage2_help_delegates_to_install_stage_2():
     assert completed.returncode == 0
     assert "--mode {standard,dev,venv-only}" in completed.stdout
     assert "--system" in completed.stdout
+
+
+def test_cli_dispatches_rollback(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_rollback(config):
+        calls.append(config.operation)
+        return 0
+
+    monkeypatch.setattr("claude_wrangler.cli.rollback_operation", fake_rollback)
+
+    assert main(["--rollback", str(tmp_path)]) == 0
+    assert calls == ["rollback"]
+    # Maintenance operations write the .gitignore block themselves, under
+    # the maintenance lock (ab_runtime_slots.md requirement 4).
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_cli_inspect_still_writes_the_gitignore_block(monkeypatch, tmp_path):
+    monkeypatch.setattr("claude_wrangler.cli.inspect_operation", lambda config: 0)
+
+    assert main(["--inspect", str(tmp_path)]) == 0
+    assert "bin/claude-local.cmd" in (tmp_path / ".gitignore").read_text("utf-8")
+
+
+def test_cli_maps_an_interrupt_to_130(monkeypatch, tmp_path, capsys):
+    def interrupted(config):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("claude_wrangler.cli.install_like_operation", interrupted)
+
+    assert main([str(tmp_path)]) == 130
+    assert "Interrupted." in capsys.readouterr().err
+
+
+def test_cli_uninstall_does_not_recreate_the_gitignore_block(monkeypatch, tmp_path):
+    monkeypatch.setattr("claude_wrangler.cli.uninstall_operation", lambda config: 0)
+
+    assert main(["--uninstall", str(tmp_path)]) == 0
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_cli_reports_filesystem_errors_without_traceback(monkeypatch, tmp_path, capsys):
+    def denied(config):
+        raise PermissionError(13, "Permission denied", "x")
+
+    monkeypatch.setattr("claude_wrangler.cli.install_like_operation", denied)
+
+    assert main([str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert "ERROR:" in captured.err and "Permission denied" in captured.err
+    assert "Traceback" not in captured.err

@@ -89,6 +89,14 @@ NONESSENTIAL_TRAFFIC_VAR = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 INTERCEPTED_SUBCOMMANDS = ("update", "upgrade", "install")
 PROJECT_SETTINGS_FILES = ("settings.json", "settings.local.json")
 
+# How CLAUDE_CONFIG_DIR is spelled. "forward-slash" reproduces, on Windows,
+# the value a Git Bash launcher exported (C:/.../.local/claude) so a project
+# migrated from the npm-era layout keeps the byte-identical string Claude
+# Code keys some per-config-dir state on. Mirrors claude_wrangler.constants.
+CONFIG_DIR_SPELLING_NATIVE = "native"
+CONFIG_DIR_SPELLING_FORWARD_SLASH = "forward-slash"
+CONFIG_DIR_SPELLINGS = (CONFIG_DIR_SPELLING_NATIVE, CONFIG_DIR_SPELLING_FORWARD_SLASH)
+
 MANAGED_BY_VAR = "CLAUDE_LOCAL_MANAGED_BY"
 MANAGED_BY_VALUE = "claude-wrangler"
 CONFIG_DIR_VAR = "CLAUDE_CONFIG_DIR"
@@ -100,6 +108,12 @@ PREFLIGHT_VAR = "CLAUDE_LOCAL_PREFLIGHT"
 # skip once-per-session notices; another project's launcher sees a
 # different value and still shows its own.
 NOTICES_SHOWN_VAR = "CLAUDE_LOCAL_NOTICES_SHOWN"
+# Set by the POSIX shim under Git Bash/MSYS2 when it had to disable MSYS
+# argument conversion (so a prompt such as "/review" is not rewritten into
+# a Windows path); the core then removes that override from the child
+# environment so commands Claude Code runs keep the normal MSYS behavior.
+MSYS_ARGS_VAR = "CLAUDE_LOCAL_MSYS_ARGS"
+MSYS_ARG_CONVERSION_VARS = ("MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL")
 
 SHARED_HOME_FLAG = "--shared-home"
 ISOLATED_HOME_FLAG = "--isolated-home"
@@ -114,6 +128,12 @@ PREFLIGHT_PREFIX = "[claude-local] preflight:"
 WINDOWS_CTRL_C_EXIT = 0xC000013A
 SIGINT_EXIT_CODE = 130
 FALLBACK_BANNER = "!" * 68
+MIGRATION_PENDING_NOTE = (
+    "note: migration pending: this project still runs the Claude Code binary "
+    "from its npm-era layout. Run `{cmd} .`, `{cmd} --upgrade --channel "
+    "{channel} .`, or `{cmd} --repair-install .` to move it to the native "
+    "runtime."
+)
 
 WINDOWS_SANDBOX_WARNING = (
     "note: Claude Code has no sandbox on native Windows, so the commands it "
@@ -192,6 +212,10 @@ class LaunchConfig:
     suppression_env: Dict[str, str]
     settings_override: Dict[str, Any]
     wrangler_command: str
+    release_base_url: str = DEFAULT_RELEASE_BASE_URL
+    config_dir_spelling: str = CONFIG_DIR_SPELLING_NATIVE
+    legacy_binary: Optional[Tuple[str, ...]] = None
+    legacy_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -382,6 +406,17 @@ def env_set(env: Dict[str, str], name: str, value: str, os_name: str) -> None:
     env[name] = value
 
 
+def env_pop(env: Dict[str, str], name: str, os_name: str) -> None:
+    """Remove a variable, matching case-insensitively on Windows."""
+
+    if os_name == "nt":
+        wanted = name.upper()
+        for key in [key for key in env if key.upper() == wanted]:
+            del env[key]
+    else:
+        env.pop(name, None)
+
+
 def is_absolute_windows_path(value: str) -> bool:
     """Return True for ``X:\\...`` and UNC paths, which never depend on cwd.
 
@@ -533,6 +568,45 @@ def parse_launch_config(data: Any) -> LaunchConfig:
         raise LaunchConfigError("launch.json field settings_override must be an object")
     _config_env_mapping(settings_override.get("env"), "settings_override.env")
 
+    release_base_url = data.get("release_base_url", DEFAULT_RELEASE_BASE_URL)
+    if release_base_url is None:
+        release_base_url = DEFAULT_RELEASE_BASE_URL
+    if _release_base_host(release_base_url) is None:
+        raise LaunchConfigError(
+            "launch.json field release_base_url must be an https:// URL with a "
+            "host and no credentials, query, or fragment: {!r}".format(release_base_url)
+        )
+
+    spelling = data.get("config_dir_spelling", CONFIG_DIR_SPELLING_NATIVE)
+    if spelling is None:
+        spelling = CONFIG_DIR_SPELLING_NATIVE
+    if spelling not in CONFIG_DIR_SPELLINGS:
+        raise LaunchConfigError(
+            "launch.json field config_dir_spelling must be one of {}: {!r}".format(
+                ", ".join(CONFIG_DIR_SPELLINGS), spelling
+            )
+        )
+
+    legacy_binary: Optional[Tuple[str, ...]] = None
+    legacy_version: Optional[str] = None
+    legacy = data.get("legacy")
+    if legacy is not None:
+        if not isinstance(legacy, dict):
+            raise LaunchConfigError("launch.json field legacy must be an object")
+        legacy_binary = _config_relative(
+            legacy, "binary", allow_parent=False, allow_empty=False
+        )
+        raw_version = legacy.get("version")
+        if raw_version is not None and (
+            not isinstance(raw_version, str)
+            or not _CHANNEL_POINTER_RE.match(raw_version)
+        ):
+            raise LaunchConfigError(
+                "launch.json field legacy.version must be a version or null: "
+                "{!r}".format(raw_version)
+            )
+        legacy_version = raw_version
+
     return LaunchConfig(
         repo_root_from_core=_config_relative(
             data, "repo_root_from_core", allow_parent=True, allow_empty=True
@@ -556,7 +630,44 @@ def parse_launch_config(data: Any) -> LaunchConfig:
         ),
         settings_override=settings_override,
         wrangler_command=wrangler_command.strip(),
+        release_base_url=release_base_url.strip().rstrip("/"),
+        config_dir_spelling=spelling,
+        legacy_binary=legacy_binary,
+        legacy_version=legacy_version,
     )
+
+
+def _release_base_host(value: Any) -> Optional[str]:
+    """Return the host of a usable https release base URL, else None."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    if any(char in value for char in "\r\n\x00 "):
+        return None
+    import urllib.parse
+
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+        parts.port  # noqa: B018 - raises ValueError for a malformed port
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    if parts.query or parts.fragment:
+        return None
+    return parts.hostname.lower().rstrip(".")
+
+
+def update_check_hosts(config: LaunchConfig) -> Tuple[str, ...]:
+    """Return the hosts update checks may contact (and be redirected to)."""
+
+    hosts = [UPDATE_CHECK_ALLOWED_HOST]
+    host = _release_base_host(config.release_base_url)
+    if host is not None and host not in hosts:
+        hosts.append(host)
+    return tuple(hosts)
 
 
 def load_launch_config(path: str) -> LaunchConfig:
@@ -657,13 +768,32 @@ def choose_repo_root(derived: str, environ: Mapping[str, str], os_name: str) -> 
     return cleaned if same else derived
 
 
+def forward_slash_spelling(value: str) -> str:
+    """Return a Windows path spelled the way Git Bash hands it to programs.
+
+    MSYS converts ``/c/repo/.local/claude`` into ``C:/repo/.local/claude``
+    for native children: forward slashes and an upper-case drive letter.
+    """
+
+    text = value.replace("\\", "/")
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        text = text[0].upper() + text[1:]
+    return text
+
+
 def build_repo_paths(repo_root: str, config: LaunchConfig, os_name: str) -> RepoPaths:
     """Compute every managed path for one launch from the chosen root."""
 
     runtime_root = spelled_join(repo_root, config.runtime_root, os_name)
+    config_dir = spelled_join(repo_root, config.config_dir, os_name)
+    if (
+        os_name == "nt"
+        and config.config_dir_spelling == CONFIG_DIR_SPELLING_FORWARD_SLASH
+    ):
+        config_dir = forward_slash_spelling(config_dir)
     return RepoPaths(
         repo_root=repo_root,
-        config_dir=spelled_join(repo_root, config.config_dir, os_name),
+        config_dir=config_dir,
         home_dir=spelled_join(repo_root, config.home_dir, os_name),
         runtime_root=runtime_root,
         shim_dir=spelled_join(runtime_root, (SHIM_DIR_NAME,), os_name),
@@ -782,9 +912,17 @@ def build_session_environment(
     """
 
     env = dict(base)
+    if env_lookup(env, MSYS_ARGS_VAR, os_name) == "1":
+        for name in (MSYS_ARGS_VAR,) + MSYS_ARG_CONVERSION_VARS:
+            env_pop(env, name, os_name)
+    else:
+        env_pop(env, MSYS_ARGS_VAR, os_name)
     if not shared_home:
         for name, value in redirected_home_environment(paths.home_dir, os_name).items():
             env_set(env, name, value, os_name)
+    # Nested launches (hooks, `claude -p`, respawns through the PATH shim)
+    # inherit this and keep the ring this session chose.
+    env_set(env, SHARED_HOME_VAR, "1" if shared_home else "0", os_name)
     env_set(env, CONFIG_DIR_VAR, paths.config_dir, os_name)
     env_set(env, MANAGED_BY_VAR, MANAGED_BY_VALUE, os_name)
     for name, value in REQUIRED_SUPPRESSION_ENV:
@@ -796,12 +934,22 @@ def build_session_environment(
     return env
 
 
-def ensure_session_directories(paths: RepoPaths, shared_home: bool) -> None:
-    """Create the config dir, and the redirected home at ring 1, if missing."""
+def ensure_session_directories(
+    paths: RepoPaths, shared_home: bool, os_name: Optional[str] = None
+) -> None:
+    """Create the config dir, and the redirected home at ring 1, if missing.
+
+    On Windows ring 1 also creates ``HOME\\AppData\\Roaming`` and
+    ``HOME\\AppData\\Local``, because APPDATA and LOCALAPPDATA point
+    there and native programs expect both to exist.
+    """
 
     targets = [paths.config_dir_fs]
     if not shared_home:
         targets.insert(0, paths.home_dir_fs)
+        if (os.name if os_name is None else os_name) == "nt":
+            targets.insert(1, os.path.join(paths.home_dir_fs, "AppData", "Roaming"))
+            targets.insert(2, os.path.join(paths.home_dir_fs, "AppData", "Local"))
     for target in targets:
         try:
             os.makedirs(target, exist_ok=True)
@@ -873,23 +1021,45 @@ def record_subcommands(record: Mapping[str, Any]) -> Tuple[str, ...]:
     return tuple(item for item in raw if isinstance(item, str))
 
 
+def record_settings_rejected(record: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
+    """Return the subcommands that refused ``--settings`` at install time.
+
+    None when the record predates the install-time probe (or the field is
+    unusable); the launcher then omits ``--settings`` for every recorded
+    subcommand, as before.
+    """
+
+    raw = record.get("settings_rejected")
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        return None
+    return tuple(raw)
+
+
 def build_claude_arguments(
     args: Sequence[str],
     *,
     subcommands: Sequence[str],
     settings_override: Mapping[str, Any],
     reasonable_permissions: bool,
+    settings_rejected: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Build Claude Code's argument list (without the executable).
 
-    ``--settings`` goes first unless the first caller argument names a
-    subcommand recorded at install time, because some subcommands reject
-    it. The permission default keeps the bash launcher's behavior.
+    ``--settings`` goes first, so command-line settings outrank a cloned
+    repository's project settings for subcommands too. It is omitted only
+    when the first caller argument is a subcommand that refused it during
+    the install-time probe (``settings_rejected``). A slot promoted before
+    that probe existed has no such list; then every recorded subcommand
+    omits it. The permission default keeps the bash launcher's behavior.
     """
 
     prefix: List[str] = []
     first = args[0] if args else None
-    if first is None or first not in subcommands:
+    if settings_rejected is not None:
+        omit_settings = first is not None and first in settings_rejected
+    else:
+        omit_settings = first is not None and first in subcommands
+    if not omit_settings:
         prefix.extend(
             [
                 "--settings",
@@ -1196,6 +1366,44 @@ def select_slot(
     raise _no_runtime(runtime_root_fs, details, wrangler_command)
 
 
+def select_legacy_binary(repo_root_fs: str, config: LaunchConfig) -> SlotSelection:
+    """Select the npm-era platform binary while migration is pending.
+
+    ``legacy_npm_layout_migration.md`` requirement 6: until install,
+    upgrade, or repair migrates the project, ``--update`` and the settings
+    toggles render a launcher that runs the legacy layout's native binary
+    directly, never node or npm. The binary must be a regular file inside
+    the repository; there is no slot to fall back to.
+    """
+
+    parts = config.legacy_binary or ()
+    binary = os.path.join(repo_root_fs, *parts)
+    if not _is_within(binary, repo_root_fs):
+        raise NoUsableRuntimeError(
+            "the legacy Claude Code binary resolves outside the repository: "
+            "{}".format(binary)
+        )
+    try:
+        status = os.stat(binary)
+    except OSError as exc:
+        raise NoUsableRuntimeError(
+            "the legacy Claude Code binary is missing or unreadable ({}).\n"
+            "Run `{} .` from the project root to install the native "
+            "runtime.".format(exc, config.wrangler_command)
+        ) from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise NoUsableRuntimeError(
+            "the legacy Claude Code binary is not a regular file: {}".format(binary)
+        )
+    return SlotSelection(
+        slot="legacy",
+        version=config.legacy_version or "",
+        binary=binary,
+        record={},
+        fallback=None,
+    )
+
+
 def fallback_warning_lines(
     selection: SlotSelection, wrangler_command: str
 ) -> List[str]:
@@ -1485,23 +1693,64 @@ def update_cache_is_fresh(
     return -UPDATE_CHECK_CLOCK_SKEW_SECONDS <= age < UPDATE_CHECK_TTL_SECONDS
 
 
+def verified_latest_version(
+    cache: Optional[Mapping[str, Any]], channel: str
+) -> Optional[str]:
+    """Return the manifest-verified newest version the cache records, if any.
+
+    Only ``claude-wrangler --update`` writes ``latest_version``, after the
+    signed manifest for that version verified. The launcher's own refresh
+    carries it forward unchanged and never writes a pointer value there.
+    """
+
+    if not cache or cache.get("channel") != channel:
+        return None
+    value = cache.get("latest_version")
+    return value if isinstance(value, str) else None
+
+
+def unverified_pointer_version(
+    cache: Optional[Mapping[str, Any]], channel: str
+) -> Optional[str]:
+    """Return the unsigned channel pointer the cache records, if any."""
+
+    if not cache or cache.get("channel") != channel:
+        return None
+    value = cache.get("pointer_version")
+    return value if isinstance(value, str) else None
+
+
 def update_notice(
     cache: Optional[Mapping[str, Any]],
     channel: str,
     installed_version: str,
     wrangler_command: str,
 ) -> Optional[str]:
-    """Return the one-line notice when the cache names a newer release."""
+    """Return the one-line notice when the cache names a newer release.
 
-    if not cache or cache.get("channel") != channel:
-        return None
-    latest = cache.get("latest_version")
-    if not is_newer_version(latest, installed_version):
+    A newer manifest-verified version is announced as available. Failing
+    that, a newer unsigned channel pointer is announced as unverified:
+    ``native_runtime_distribution_and_verification.md`` requirement 2
+    trusts a pointer only to choose which signed manifest to fetch, and
+    ``--upgrade`` verifies that manifest before it installs anything.
+    """
+
+    verified = verified_latest_version(cache, channel)
+    if is_newer_version(verified, installed_version):
+        return (
+            "Claude Code {} is available on the {} channel (this project runs {}). "
+            "Run `{} --upgrade --channel {}` to install it.".format(
+                verified, channel, installed_version, wrangler_command, channel
+            )
+        )
+    pointer = unverified_pointer_version(cache, channel)
+    if not is_newer_version(pointer, installed_version):
         return None
     return (
-        "Claude Code {} is available on the {} channel (this project runs {}). "
-        "Run `{} --upgrade --channel {}` to install it.".format(
-            latest, channel, installed_version, wrangler_command, channel
+        "The {} channel pointer names Claude Code {} (unverified; this project "
+        "runs {}). Run `{} --upgrade --channel {}` to verify its signed manifest "
+        "and install it.".format(
+            channel, pointer, installed_version, wrangler_command, channel
         )
     )
 
@@ -1535,10 +1784,15 @@ def _call_with_budget(function: Callable[[], Any], budget_seconds: float) -> Any
     return outcome.get("value")
 
 
-def fetch_url_bytes(url: str, timeout_seconds: float) -> bytes:
-    """GET a small HTTPS resource from the release host with urllib.
+def fetch_url_bytes(
+    url: str,
+    timeout_seconds: float,
+    allowed_hosts: Sequence[str] = (UPDATE_CHECK_ALLOWED_HOST,),
+) -> bytes:
+    """GET a small HTTPS resource from a release host with urllib.
 
-    Redirects must stay on HTTPS and on the release host. urllib honors
+    Redirects must stay on HTTPS and on ``allowed_hosts`` (the default
+    release host plus a recorded mirror's host). urllib honors
     HTTPS_PROXY/NO_PROXY, and the default TLS context honors SSL_CERT_FILE.
     """
 
@@ -1548,14 +1802,14 @@ def fetch_url_bytes(url: str, timeout_seconds: float) -> bytes:
     import urllib.parse
     import urllib.request
 
+    wanted_hosts = tuple(host.lower().rstrip(".") for host in allowed_hosts)
+
     def allowed(target: str) -> bool:
-        """Return True for HTTPS URLs on the release host."""
+        """Return True for HTTPS URLs on an allowed release host."""
 
         parts = urllib.parse.urlsplit(target)
-        return (
-            parts.scheme == "https"
-            and (parts.hostname or "").lower() == UPDATE_CHECK_ALLOWED_HOST
-        )
+        host = (parts.hostname or "").lower().rstrip(".")
+        return parts.scheme == "https" and host in wanted_hosts
 
     class AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
         """Refuse redirects that leave HTTPS or the release host."""
@@ -1583,10 +1837,15 @@ def fetch_url_bytes(url: str, timeout_seconds: float) -> bytes:
     return data
 
 
-def fetch_channel_version(channel: str, fetch: FetchFn, budget_seconds: float) -> str:
+def fetch_channel_version(
+    channel: str,
+    fetch: FetchFn,
+    budget_seconds: float,
+    base_url: str = DEFAULT_RELEASE_BASE_URL,
+) -> str:
     """Fetch and validate the channel pointer within the time budget."""
 
-    url = "{}/{}".format(DEFAULT_RELEASE_BASE_URL, channel)
+    url = "{}/{}".format(base_url.rstrip("/"), channel)
     try:
         data = _call_with_budget(lambda: fetch(url, budget_seconds), budget_seconds)
     except UpdateCheckError:
@@ -1614,28 +1873,35 @@ def refresh_update_cache(
     now: datetime,
     budget_seconds: float,
     previous: Optional[Mapping[str, Any]] = None,
+    base_url: str = DEFAULT_RELEASE_BASE_URL,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Refresh update-check.json; return the new cache and an error or None.
 
-    A failed attempt is recorded too (keeping any earlier answer for the
-    same channel), so an offline machine retries once per day instead of
-    spending the budget on every launch. Cache write failures are ignored.
+    The unsigned channel pointer goes into ``pointer_version`` only; the
+    manifest-verified ``latest_version`` that ``claude-wrangler --update``
+    recorded is carried forward unchanged, so an unverified pointer never
+    passes for verified data. A failed attempt is recorded too (keeping any
+    earlier pointer for the same channel), so an offline machine retries
+    once per day instead of spending the budget on every launch. The
+    ``error`` key is null after a successful refresh and names the failure
+    otherwise, so ``--inspect`` can tell the two apart. Cache write
+    failures are ignored.
     """
 
     error: Optional[str] = None
+    pointer: Optional[str] = None
     try:
-        latest: Optional[str] = fetch_channel_version(channel, fetch, budget_seconds)
+        pointer = fetch_channel_version(channel, fetch, budget_seconds, base_url)
     except UpdateCheckError as exc:
         error = str(exc)
-        latest = None
-        if previous and previous.get("channel") == channel:
-            kept = previous.get("latest_version")
-            latest = kept if isinstance(kept, str) else None
+        pointer = unverified_pointer_version(previous, channel)
     cache: Dict[str, Any] = {
         "checked_at": format_timestamp(now),
         "channel": channel,
-        "latest_version": latest,
+        "latest_version": verified_latest_version(previous, channel),
+        "pointer_version": pointer,
         "installed_version": installed_version,
+        "error": error,
     }
     try:
         _write_json_atomic(os.path.join(runtime_root_fs, UPDATE_CHECK_NAME), cache)
@@ -1683,7 +1949,8 @@ def find_executable_on_path(
     ``shutil.which`` searches the current directory first on Windows, and
     the launcher usually runs from the repository root, so a checked-in
     ``node.exe`` there must never be executed. Relative PATH entries are
-    skipped for the same reason.
+    skipped for the same reason. On Windows a name that already ends in a
+    ``PATHEXT`` extension (``npm.cmd``) is looked up as given.
     """
 
     nt = os_name == "nt"
@@ -1692,7 +1959,10 @@ def find_executable_on_path(
         extensions = [
             ext for ext in (pathext or ".COM;.EXE;.BAT;.CMD").split(";") if ext
         ]
-        candidates = [name + ext for ext in extensions]
+        if any(name.lower().endswith(ext.lower()) for ext in extensions):
+            candidates = [name]
+        else:
+            candidates = [name + ext for ext in extensions]
     else:
         candidates = [name]
     for entry in (path_value or "").split(";" if nt else ":"):
@@ -1885,8 +2155,13 @@ def windows_warning_applies(
 def _installed_version_quietly(
     paths: RepoPaths, config: LaunchConfig, platform_key: Optional[str]
 ) -> Tuple[str, Optional[str]]:
-    """Return ``(version, slot)`` of the slot a launch would run, or ``("", None)``."""
+    """Return ``(version, slot)`` of the slot a launch would run, or ``("", None)``.
 
+    In legacy mode the slot is reported as ``legacy``.
+    """
+
+    if config.legacy_binary is not None:
+        return (config.legacy_version or ""), "legacy"
     try:
         key = platform_key or detect_host_platform_key()
         selection = select_slot(paths.runtime_root_fs, key, config.wrangler_command)
@@ -1917,6 +2192,7 @@ def run_check_updates(
         now,
         UPDATE_CHECK_BUDGET_SECONDS,
         previous,
+        config.release_base_url,
     )
     if error is not None:
         _emit(
@@ -1926,20 +2202,38 @@ def run_check_updates(
             ),
         )
         return 1
-    latest = cache.get("latest_version")
+    pointer = unverified_pointer_version(cache, config.channel)
+    verified = verified_latest_version(cache, config.channel)
+    command = config.wrangler_command
     _emit(stdout, "Claude Code update check ({} channel)".format(config.channel))
-    _emit(stdout, "  latest:    {}".format(latest))
+    _emit(stdout, "  channel pointer: {} (unsigned, not verified)".format(pointer))
     _emit(
         stdout,
-        "  installed: {}".format(
+        "  verified:        {}".format(
+            "{} (signed manifest checked by `{} --update`)".format(verified, command)
+            if verified
+            else "none recorded; run `{} --update`".format(command)
+        ),
+    )
+    _emit(
+        stdout,
+        "  installed:       {}".format(
             "{} (slot {})".format(installed, slot) if slot else "none usable"
         ),
     )
-    if installed and is_newer_version(latest, installed):
+    if installed and is_newer_version(verified, installed):
         _emit(
             stdout,
             "Update available. Run `{} --upgrade --channel {}` to install "
-            "it.".format(config.wrangler_command, config.channel),
+            "it.".format(command, config.channel),
+        )
+    elif installed and is_newer_version(pointer, installed):
+        _emit(
+            stdout,
+            "The channel pointer names a newer release, which is unverified until "
+            "its signed manifest is checked. Run `{} --upgrade --channel {}` to "
+            "verify and install it, or `{} --update` to verify it without "
+            "installing.".format(command, config.channel, command),
         )
     elif installed:
         _emit(stdout, "Up to date.")
@@ -1977,6 +2271,7 @@ def _maybe_emit_update_notice(
                 now,
                 UPDATE_CHECK_BUDGET_SECONDS,
                 cache,
+                config.release_base_url,
             )
         line = update_notice(
             cache, config.channel, installed_version, config.wrangler_command
@@ -1998,7 +2293,7 @@ def _launch(
     spawn_fn: Optional[SpawnFn],
     stderr: Any,
     stdout: Any,
-    fetch: FetchFn,
+    fetch: Optional[FetchFn],
     now_fn: Callable[[], datetime],
     platform_key: Optional[str],
     node_probe: NodeProbe,
@@ -2011,6 +2306,13 @@ def _launch(
     )
     repo_root = choose_repo_root(derive_repo_root(core_path, config), environ, os_name)
     paths = build_repo_paths(repo_root, config, os_name)
+    if fetch is None:
+        hosts = update_check_hosts(config)
+
+        def fetch(url: str, timeout_seconds: float) -> bytes:
+            """Fetch from the release host or the recorded mirror only."""
+
+            return fetch_url_bytes(url, timeout_seconds, hosts)
 
     if parsed.check_updates:
         return run_check_updates(
@@ -2030,8 +2332,20 @@ def _launch(
     if caller_passed_settings(forwarded):
         raise LauncherError(settings_refusal_message(paths, os_name), exit_code=2)
 
-    key = platform_key or detect_host_platform_key()
-    selection = select_slot(paths.runtime_root_fs, key, config.wrangler_command)
+    if config.legacy_binary is not None:
+        selection = select_legacy_binary(repo_root, config)
+        _emit(
+            stderr,
+            "{} {}".format(
+                MESSAGE_PREFIX,
+                MIGRATION_PENDING_NOTE.format(
+                    cmd=config.wrangler_command, channel=config.channel
+                ),
+            ),
+        )
+    else:
+        key = platform_key or detect_host_platform_key()
+        selection = select_slot(paths.runtime_root_fs, key, config.wrangler_command)
     if selection.fallback is not None:
         for line in fallback_warning_lines(selection, config.wrangler_command):
             _emit(stderr, "{} {}".format(MESSAGE_PREFIX, line))
@@ -2081,12 +2395,13 @@ def _launch(
     child_env = build_session_environment(
         environ, paths=paths, config=config, shared_home=shared_home, os_name=os_name
     )
-    ensure_session_directories(paths, shared_home)
+    ensure_session_directories(paths, shared_home, os_name)
     child_argv = [selection.binary] + build_claude_arguments(
         forwarded,
         subcommands=record_subcommands(selection.record),
         settings_override=config.settings_override,
         reasonable_permissions=config.reasonable_permissions,
+        settings_rejected=record_settings_rejected(selection.record),
     )
 
     try:
@@ -2142,7 +2457,7 @@ def main(
             spawn_fn=spawn_fn,
             stderr=error_stream,
             stdout=stdout if stdout is not None else sys.stdout,
-            fetch=fetch_fn or fetch_url_bytes,
+            fetch=fetch_fn,
             now_fn=now_fn or _utc_now,
             platform_key=platform_key,
             node_probe=node_probe or default_node_probe,

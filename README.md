@@ -1,23 +1,25 @@
 # claude-wrangler
 
 `claude-wrangler` is a Python utility for setting up per-project,
-isolated Claude Code support: it manages project-local
-`@anthropic-ai/claude-code` installs without making the repository root
-look like a Node project, and keeps all session-specific Claude data
-inside the project. It is designed to coexist with instances from
-`codex-wrangler` in the same project.
+isolated Claude Code support: it installs a pinned native Claude Code
+release, verified against Anthropic's signed release manifests, inside
+the project, and keeps all session-specific Claude data there too. It
+needs neither Node.js nor npm, runs on Windows, macOS, and Linux, and is
+designed to coexist with instances from `codex-wrangler` in the same
+project.
 
 It creates and manages a disciplined local layout under the
 TheKnowledge-standard `.local/` operator-state directory:
 
-- `.local/claude/npm/` for the local npm package install, npm cache, and
-  managed metadata
+- `.local/claude/wrangler/` as the runtime root: two A/B runtime slots
+  holding verified releases, the generated launcher core, the
+  update-check cache, and managed metadata
 - `.local/claude/HOME/` as the project-local `$HOME` used at security
   rings 1 and 2
 - `.local/claude/` as the pinned `CLAUDE_CONFIG_DIR`, so Claude auth,
   sessions, history, and todos stay project-local at every ring
-- `bin/claude-local` as the generated launcher used inside the target
-  project
+- `bin/claude-local` (POSIX `sh`) and `bin/claude-local.cmd` (cmd and
+  PowerShell) as the generated launchers used inside the target project
 - `README-LOCAL-Start-Claude.md` as an ignored local operator guide
   inside the target project
 - a marked `.gitignore` block so uninstall can remove only what it owns
@@ -26,24 +28,34 @@ The utility also supports:
 
 - installation of the current stable Claude Code release by default
 - JSON inspection with `--inspect`
-- pessimistic verification with `--selftest`
+- pessimistic verification with `--selftest`, including offline
+  re-verification of both runtime slots
 - conservative removal with `--uninstall`
-- version-catalog refresh with `--update`
-- channel-aware upgrades with `--upgrade --channel stable|latest|next`
-- exact-version targeting with `--version latest|x.y.z`
+- notify-only version-catalog refresh with `--update`
+- channel-aware upgrades with `--upgrade --channel stable|latest`
+  (`next` is a deprecated alias of `latest`)
+- exact-version targeting with `--version latest|x.y.z` (2.1.207 or
+  newer)
+- instant rollback to the previous release with `--rollback`
+- runtime repair with `--repair-install`
 - managed reasonable-permissions launcher defaults with
   `--set-reasonable-permissions` and `--clear-reasonable-permissions`
   (mapped to `--permission-mode acceptEdits`, shipped disabled)
+- per-project switches for launcher update notices
+  (`--set-update-checks on|off`) and the native-Windows sandbox note
+  (`--set-windows-sandbox-warning on|off`)
+- automatic migration of projects installed by npm-based releases
 
 ## Why Project-Local Pinning
 
 A bad tool update that lands in a global install can take out
 development work on every project at once. `claude-wrangler` pins the
 Claude Code CLI per project, the same way a virtualenv pins Python
-dependencies: the generated launcher execs the managed local binary
-directly, never falls back to a global or registry copy, and emits
-update *notices* rather than auto-updating. A bad release affects one
-project, and the managed metadata records exactly what to roll back to.
+dependencies: the generated launcher runs the binary in the project's
+active runtime slot, never falls back to a global or registry copy, and
+emits update *notices* rather than auto-updating. A bad release affects
+one project, and the previous release stays installed in the other slot
+for `--rollback`.
 
 ## Security Ring Model
 
@@ -58,10 +70,35 @@ security ring ladder, numbered by the CPU protection-ring convention
   starts Claude Code sessions here.
 - Ring 0 (last resort): unsandboxed with the real `$HOME`. Reach it
   per-invocation with `bin/claude-local --shared-home` or
-  `CLAUDE_LOCAL_SHARED_HOME=1`.
+  `CLAUDE_LOCAL_SHARED_HOME=1`. `--isolated-home` forces ring 1 for one
+  invocation.
 
 `CLAUDE_CONFIG_DIR` stays pinned to `.local/claude` at every ring, so
 escalating `$HOME` fidelity never forks Claude auth or session history.
+
+Which rings exist depends on the operating system:
+
+| Host | Rings available | Default for agent work | What ring 1 redirects |
+|---|---|---|---|
+| Linux, macOS, WSL2 | 3, 2, 1, 0 | ring 3 | `HOME`, `XDG_*` |
+| Native Windows | 1, 0 | ring 1 | `HOME`, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`, `LOCALAPPDATA`, `XDG_*` |
+
+Claude Code has no sandbox on native Windows, so rings 3 and 2 do not
+exist there, and the operator confirmed ring 1 as the native-Windows
+default (recorded in `AGENTS.md`). Native Windows programs read their
+home from `USERPROFILE` and the related variables rather than `HOME`, so
+the launcher moves all of them together; redirecting `HOME` alone would
+effectively be ring 0. Once per session the launcher prints a note that
+commands run unsandboxed and that isolation covers Claude's state and
+the redirected-home tools, not per-user Windows stores. For personal
+work you can turn the note off per project:
+
+```bash
+claude-wrangler --set-windows-sandbox-warning off .
+```
+
+Client work that needs ring 3 should use WSL2 or a separate Windows
+account.
 
 ## Changelog
 
@@ -78,12 +115,14 @@ python scripts/git_commit_with_changelog.py -m "Your subject"
 ```
 
 That helper updates `CHANGELOG.md` first, then delegates to
-`python TheKnowledge/scripts/git_standard_commit_push.py`.
+`python TheKnowledge/scripts/git_standard_commit_push.py`. On Windows,
+follow the interim commit procedure in `AGENTS.md` instead: that helper
+always pushes, and its quality gate does not redirect the user profile.
 
 ## Quick Start
 
 Use the top-level installer when you want a normal user-local install
-from this checkout:
+from this checkout on Linux or macOS:
 
 ```bash
 ./install.sh
@@ -95,10 +134,71 @@ environment. Use `sudo ./install.sh --system` when you explicitly want
 a system-level install; `sudo ./install.sh` without `--system` is
 rejected on purpose.
 
+If Python or Git is missing, install only what is missing first:
+
+```bash
+scripts/install_prerequisites.sh --dry-run   # show the commands
+scripts/install_prerequisites.sh             # ask once, then install
+```
+
+It uses `apt-get`, `dnf`/`yum`, or `brew`. It runs `sudo` only when you
+pass `--system-packages`; otherwise it prints the commands that need
+root for you to run.
+
+## Windows Quick Start
+
+From cmd or PowerShell in the checkout:
+
+```bat
+scripts\install_prerequisites.cmd
+.\install.cmd
+```
+
+- `scripts\install_prerequisites.cmd` installs only what is missing:
+  Python 3.9+, Git, and Git for Windows' bash (which Claude Code's Bash
+  tool uses; `--no-git-bash` skips it). It uses
+  `winget install --scope user` where the package supports it, asks once
+  before installing (`--yes` skips the question, `--dry-run` only prints
+  the commands), and never elevates; a package that needs elevation is
+  printed for you to run. When no Python exists yet, it offers to
+  install Python through winget and then continues, or asks you to open
+  a new terminal and rerun.
+- `install.cmd` is the native-Windows peer of `install.sh`. It finds
+  Python 3.9+ (`THEKNOWLEDGE_BOOTSTRAP_PYTHON`, `py -3`, each
+  `python.exe` on `PATH`, then the default python.org, Python install
+  manager, and pyenv-win locations), applies Windows policy, and runs
+  the same stage-2 installer. The result is
+  `%USERPROFILE%\.local\bin\claude-wrangler.exe` backed by a virtual
+  environment in `%USERPROFILE%\.local\share\claude-wrangler\venv`.
+  `.\install.cmd --help` (or `/?`) shows the options.
+- PATH: if `%USERPROFILE%\.local\bin` is not on `PATH`, the installer
+  prints a PowerShell command that adds it for your user. It never edits
+  `PATH` or runs `setx` itself. Run the printed command, then open a new
+  terminal.
+- Where `.cmd` files are blocked by policy, run the policy helper
+  directly: `py -3 scripts\install-stage-1-windows.py`.
+- Native Windows supports the standard user-local mode only.
+  `--mode dev`, `--mode venv-only`, and `--system` are refused with a
+  pointer to `scripts\install_prerequisites.cmd --dev` or WSL2.
+- Inside a `claude-local` session (where `USERPROFILE` points into a
+  project), the installer refuses so it does not install into the
+  isolated home by accident. Run it from a normal terminal, or pass
+  `--allow-isolated-home` when that is what you want.
+- Run it from a normal, non-elevated terminal. On an elevated token it
+  asks for confirmation on a console and refuses without one (Git Bash
+  and mintty give it a pipe, not a console). Set
+  `THEKNOWLEDGE_INSTALL_ALLOW_ELEVATED=1` only for unattended CI. On
+  hosts with UAC disabled, administrators see that question on every
+  run.
+- Pressing Ctrl+C during `install.cmd` gets cmd's own
+  `Terminate batch job (Y/N)?` prompt.
+- `./install.sh` under Git Bash still reaches stage 2, but without these
+  Windows checks; prefer `install.cmd` on Windows.
+
 ## Developer Quick Start
 
 Use this explicit development mode when you are setting up this
-repository for active editing:
+repository for active editing on Linux, macOS, or WSL2:
 
 ```bash
 ./install.sh --mode dev
@@ -110,6 +210,18 @@ installs a pyenv-managed Python toolchain, builds the repo-local
 mandatory for automatic activation when you enter the repository. After
 the script finishes, open a new shell in this repository so the managed
 `direnv` hook can activate `.venv` automatically.
+
+On native Windows, use the project's own prerequisite installer
+instead; it installs anything missing, then creates `.venv` with the
+development extras:
+
+```bat
+scripts\install_prerequisites.cmd --dev
+```
+
+The same `--dev` path works on Linux and macOS through
+`scripts/install_prerequisites.sh --dev` when you do not want pyenv and
+direnv.
 
 Run `./install.sh --help` to see the current stage-1 help plus the live
 stage-2 options. `./bootstrap.sh` and `./bootstrap-stage2.py` remain
@@ -135,33 +247,31 @@ Self-test the managed state:
 claude-wrangler --selftest .
 ```
 
-Refresh the locally known stable, latest, and next versions:
+Refresh the locally known stable and latest versions without changing
+the installed runtime:
 
 ```bash
 claude-wrangler --update .
 ```
 
-Upgrade to the latest known version on one channel:
+Upgrade to the current version on one channel:
 
 ```bash
 claude-wrangler --upgrade --channel stable .
 claude-wrangler --upgrade --channel latest .
-claude-wrangler --upgrade --channel next .
 ```
 
 Upgrade to one exact version:
 
 ```bash
-claude-wrangler --upgrade --channel stable --version 2.1.153 .
+claude-wrangler --upgrade --channel stable --version 2.1.287 .
 ```
 
-If a prior npm install was interrupted and left the managed install
-inconsistent, use the explicit repair mode. It removes only managed npm
-install artifacts under `.local/claude/npm` before reinstalling; it
-never touches Claude session state:
+Switch back to the previous release, or repair the runtime:
 
 ```bash
-claude-wrangler --upgrade --channel stable --repair-install .
+claude-wrangler --rollback .
+claude-wrangler --repair-install .
 ```
 
 Enable or clear the managed reasonable-permissions launcher default:
@@ -183,19 +293,370 @@ Uninstall the managed setup:
 claude-wrangler --uninstall .
 ```
 
-`claude-wrangler` resolves the exact release for the stable, latest,
-and next channels at install time from npm dist-tags (which map
-one-to-one onto the channels), then writes that exact version plus the
-known channel catalog into managed metadata. `--update` refreshes that
-local catalog without changing the install, and `--upgrade --channel
-...` uses the recorded catalog unless you supply an explicit exact
-`--version`.
+`claude-wrangler` resolves the stable and latest channels from
+Anthropic's channel pointers at install time, fetches and verifies the
+signed manifest for the chosen version, and writes that exact version
+plus the known channel catalog into managed metadata. `--update`
+refreshes that local catalog without changing the install, and
+`--upgrade --channel ...` installs the channel's current version unless
+you supply an explicit exact `--version`. Add `--dry-run` to see what
+an operation would do without changing anything or contacting the
+release server.
 
-Managed npm operations use a 300-second timeout by default and disable
-npm's optional audit, funding, update-notifier, and spinner progress
-behavior while keeping HTTP fetch logs and foreground lifecycle-script
-output for troubleshooting. Use `--npm-timeout-seconds` and
-`--npm-install-loglevel` to adjust.
+## Starting Claude Code
+
+Every launcher form runs the same Python launcher core,
+`.local/claude/wrangler/launch.py`, so ring selection, the pinned
+config dir, self-update suppression, and slot selection behave the same
+everywhere.
+
+bash, zsh, macOS, Linux, and WSL:
+
+```bash
+./bin/claude-local
+./bin/claude-local --continue
+./bin/claude-local --shared-home     # one ring-0 session
+```
+
+cmd.exe:
+
+```bat
+bin\claude-local
+bin\claude-local --resume
+```
+
+Windows PowerShell 5.1 and PowerShell 7 resolve `.\bin\claude-local` to
+the `.cmd` launcher, so no `.ps1` exists and execution policy never
+applies:
+
+```powershell
+.\bin\claude-local
+.\bin\claude-local --continue
+```
+
+Git Bash runs the `sh` launcher with a native Windows Python and
+Windows-form paths, and turns off MSYS argument conversion so prompts
+such as `/review` reach Claude Code unchanged:
+
+```bash
+./bin/claude-local
+```
+
+Notes:
+
+- The launchers need a Python 3.9+ interpreter. They use the one that
+  ran `claude-wrangler` (recorded at install time), then `py -3`,
+  `python3`, and `python`. Under Git Bash an MSYS or Cygwin Python is
+  not enough; a native Windows Python is required.
+- `--shared-home`, `--isolated-home`, and `--check-updates` are
+  launcher flags and are never passed to Claude Code.
+- `claude update`, `claude upgrade`, and `claude install` are
+  intercepted: the launcher explains that `claude-wrangler` manages the
+  runtime and exits 2.
+- A caller `--settings` flag is refused, because the launcher passes its
+  own; put persistent settings in `.local/claude/settings.json`.
+- The launcher puts `.local/claude/wrangler/shim/` first on `PATH`, so
+  hooks, scripts, `claude -p`, and background respawns that call
+  `claude` run this project's pinned binary with this project's
+  environment instead of a global install.
+- On Windows the launcher waits for Claude Code and returns its exit
+  code. Ctrl+C is left to Claude Code, and a session that Ctrl+C ends
+  reports exit code 130, as on POSIX.
+
+## Runtime Slots, Rollback, and Repair
+
+Each project keeps at most two releases in `.local/claude/wrangler/`:
+the active slot and the rollback slot, chosen by the one-line
+`active-slot` pointer. An install or upgrade downloads into
+`.staging/`, verifies and smoke-tests the candidate there, and only
+then moves it into the inactive slot and flips the pointer, so a failed
+or interrupted operation leaves the working runtime untouched. Every
+maintenance operation holds `.local/claude/wrangler/.lock`; a second
+maintainer fails fast and changes nothing.
+
+- **Launch-time fallback.** On every launch the launcher checks the
+  active slot cheaply (completion record, binary present, size). If it
+  fails and the other slot passes, the launcher prints a prominent
+  warning naming both versions, runs the other slot, and records the
+  event in `fallback.json` for `--inspect` and `--repair-install`. If
+  neither slot passes it refuses and tells you to run
+  `claude-wrangler --repair-install`. It never runs a global `claude`.
+- **`--rollback`** makes the other slot active after checking that
+  nothing runs from it and re-verifying it fully offline (signatures and
+  SHA-256 from its retained evidence).
+- **`--repair-install`** clears `.staging/`, deletes retired slots that
+  are no longer in use, re-verifies both slots offline, repairs an
+  invalid pointer, re-downloads the pinned version when the active slot
+  is missing or corrupt, and regenerates the launchers. It never
+  removes Claude session state.
+- **In-use protection.** A slot is never replaced, rolled back to, or
+  removed while a process runs from it; the operation stops and names
+  the process IDs. Claude Code's background service counts. Pass
+  `--stop-background-sessions` to let `claude-wrangler` run
+  `claude daemon stop --any` with the project's launcher environment
+  first. That also ends the project's background sessions, so it is
+  never done without the flag.
+
+## Updates and Notices
+
+Claude Code's own updater is disabled in three layers: environment
+variables (`DISABLE_UPDATES`, `DISABLE_AUTOUPDATER`,
+`DISABLE_INSTALLATION_CHECKS`), a `--settings` argument that outranks a
+cloned repository's `.claude/settings.json`, and the same keys merged
+into `.local/claude/settings.json` for processes that bypass the
+launcher. The launcher warns when the project's
+`.claude/settings*.json` switches any of them off. Updates are
+`claude-wrangler`'s job, and it only ever notifies:
+
+- `claude-wrangler --update .` fetches both channel pointers, verifies
+  the signed manifest of each version they name, and records the
+  version, build date, and check time. It never changes the installed
+  binary.
+- The launcher prints a one-line notice when the recorded catalog names
+  a newer release on the installed channel, for example
+  `Run claude-wrangler --upgrade --channel stable to install it.` It
+  may refresh the catalog itself at most once per 24 hours within a
+  3-second budget, and a network problem never blocks or fails a
+  launch. A version that only the unsigned channel pointer names is
+  reported as unverified until `--update` or `--upgrade` checks its
+  signed manifest.
+- `./bin/claude-local --check-updates` checks now and prints the result,
+  even when automatic checks are off.
+- `claude-wrangler --set-update-checks off .` turns the automatic
+  notices off for one project.
+
+Nothing installs automatically; run
+`claude-wrangler --upgrade --channel <channel> .` when you are ready.
+
+### "Updates are disabled by your administrator"
+
+Claude Code prints "Updates are disabled by your administrator. Contact
+your IT team" when its own update command runs with `DISABLE_UPDATES`
+set. In a project managed here there is no administrator or IT policy
+involved: `claude-wrangler` set that variable on purpose so the session
+cannot replace the project's pinned binary or, at ring 0, your global
+install. The launcher intercepts `claude update` before Claude Code sees
+it, so you normally meet this text only when a binary is run outside the
+launcher. The same applies when Claude Code says the installed version
+is too old and asks you to run `claude update`: run
+`claude-wrangler --upgrade --channel <channel> .` from the project root
+instead.
+
+## Migrating From npm-Based Releases
+
+Earlier releases of `claude-wrangler` installed the
+`@anthropic-ai/claude-code` npm package under `.local/claude/npm/` and
+launched it through Node.js. Those projects move to the native runtime
+automatically the next time you run an install, `--upgrade`, or
+`--repair-install`. `--inspect` and `--selftest` report
+"migration pending" instead, and `--uninstall`, `--dry-run`, and
+`--skip-install` never migrate.
+
+- Migration keeps the exact version the npm install pinned. If that
+  version is older than 2.1.207, the oldest release with both signature
+  forms, it stops and asks you to run
+  `claude-wrangler --upgrade --channel <channel> .`; it never upgrades
+  silently. A recorded `next` channel becomes `latest` with a
+  deprecation notice.
+- When the npm tree already holds the native platform binary, migration
+  hashes it against the signed manifest and adopts it on a match instead
+  of downloading it again.
+- Auth, sessions, memories, the home mode, the permission default, and
+  the exact `CLAUDE_CONFIG_DIR` spelling carry over. Session state is
+  never part of the migration.
+- The commit point is the new metadata in `.local/claude/wrangler/`.
+  Until then the old launcher and npm tree keep working. Afterwards the
+  new launchers are written, a schema-1 compatibility copy of the
+  metadata stays at `.local/claude/npm/.claude-wrangler.json`, and the
+  npm tree is removed. On Windows, files still locked by a running
+  process are left in place, reported, and removed by the next install,
+  upgrade, or repair.
+- `--update` and the permission and notice toggles still work before
+  migration; they write a Node-free launcher that runs the npm-era
+  binary directly and reports "migration pending".
+- The retired `--npm-timeout-seconds` and `--npm-install-loglevel`
+  flags are still accepted, but only print a warning. Use
+  `--download-timeout-seconds` instead.
+
+**Rolling `claude-wrangler` itself back.** After a project has moved to
+the native runtime, use an older, npm-based `claude-wrangler` release
+only for `--uninstall` (it may need `--force`). Its other operations,
+such as `--update` or a permission toggle, would rewrite the launcher
+into the old Node-based form that points at the removed npm tree. If
+that happens, run `claude-wrangler --repair-install .` with the current
+release. The native runtime slots are still in place, so it regenerates
+the native launchers, or migrates again if the older release
+reinstalled the npm tree.
+
+## Network, TLS, and Proxies
+
+Releases come from `https://downloads.claude.ai/claude-code-releases`.
+Every request and every redirect must be HTTPS on an allowlisted host.
+Binaries stream into staging while being hashed, stop as soon as they
+exceed the signed size, resume interrupted transfers, and must match
+the signed size and SHA-256 exactly.
+
+- Proxies: `HTTPS_PROXY` and `NO_PROXY` are honored. On Windows, when
+  no proxy variable is set, the system proxy settings apply.
+- Corporate TLS inspection: `--ca-bundle <file.pem>` replaces the
+  system trust store for one operation; otherwise `SSL_CERT_FILE` is
+  honored. A verification failure names the certificate issuer the
+  server presented. On macOS with a python.org Python, run
+  `Install Certificates.command` from the `/Applications/Python 3.x/`
+  folder first.
+- Mirrors: `--release-base-url <https URL>` points at a mirror of the
+  release distribution. Its host joins the allowlist, and the launcher's
+  update checks use it too. Signatures are still checked against the
+  pinned keys, so a mirror cannot alter a release, although it could
+  still offer an older signed one.
+- Timeouts: `--download-timeout-seconds` (default 60) bounds each
+  connect and read; a small number of retries with backoff follows.
+- npm settings such as `.npmrc` proxies, registries, and `cafile` no
+  longer apply.
+
+The launcher's own update check uses the system trust store or
+`SSL_CERT_FILE`; it does not know a `--ca-bundle` given at install time.
+Behind TLS inspection, set `SSL_CERT_FILE` for launches too, or turn
+the checks off with `--set-update-checks off`.
+
+## Verification and Trust
+
+- Both manifest signatures, the OpenPGP signature and the raw RSA
+  signature, must verify against keys compiled into the installed
+  `claude-wrangler` package. Keys are never read from the project, the
+  network, or a GnuPG keyring, and `gpg` is never run. The manifest is
+  verified before it is parsed.
+- The oldest installable version is 2.1.207, and there is no unsigned
+  mode.
+- Platform selection reflects the hardware, not the Python process
+  (Rosetta 2, Windows on ARM x64 emulation, and musl Linux are
+  detected); `--platform` overrides it within the host's own operating
+  system.
+- Before promotion every binary passes a size and SHA-256 check, an
+  executable-structure check (PE, Mach-O, or ELF for the expected
+  machine), and a `--version` smoke test in a scratch environment that
+  never sees your home or the project's config dir.
+- Each slot keeps its manifest and both signatures, so `--selftest`,
+  `--rollback`, and `--repair-install` re-verify it offline.
+
+## Runtime Boundary
+
+`claude-wrangler` localizes the Claude Code runtime under
+`.local/claude/wrangler/` and Claude state under `.local/claude/`.
+Claude Code needs neither Node.js nor npm, and no `claude-wrangler`
+operation or launcher requires them. The launchers need only a Python
+3.9+ interpreter, and the launcher core uses the standard library
+alone, so a project keeps launching even if `claude-wrangler` itself is
+later uninstalled.
+
+The launcher core performs a cheap startup preflight before it starts
+Claude Code. Besides the slot check, it compares a checked-in Node.js
+selector (`.nvmrc`, `.node-version`, or `.tool-versions`) with the
+`node` on `PATH`, because project tooling started from Claude Code may
+still depend on it. A literal selector matches by leading version
+components, so `20` matches `v20.11.0`. A missing `node` only warns.
+`CLAUDE_LOCAL_PREFLIGHT` controls the check:
+
+- `warn` (default): report and continue;
+- `strict`: refuse to launch when a literal selector does not match the
+  `node` on `PATH`, or when that `node` cannot report its version;
+- `off`: skip the Node.js check.
+
+`claude-wrangler --inspect` and `--selftest` report `node`, `npm`, and
+`npx` paths and versions as information only, detected checked-in
+Node.js selectors, any root `package.json` package-manager declaration,
+and the effective `CLAUDE_CONFIG_DIR`, `HOME`, `XDG_*` (and, on native
+Windows, `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`, `APPDATA`, and
+`LOCALAPPDATA`) values the launcher exposes at each ring. They also
+report both slots, the pointer, any fallback or failed update check,
+generated-file freshness, and whether the self-update suppression
+settings are in place. `--selftest` fails when an explicit Node.js
+selector disagrees with the resolved `node`.
+
+Submodules such as `TheKnowledge` should use the parent project's local
+interpreters and package environments as if they were part of the same
+project tree.
+
+## Trust and Install Scope
+
+`claude-wrangler` treats user-scoped install targets as an explicit
+trust boundary.
+
+- Less-trusted AI or isolated `claude-local` sessions should normally
+  stay in repo scope and should not mutate an operator's shell init,
+  `~/.local/bin`, or `~/.pyenv` implicitly.
+- More-trusted AI can still manage its own user scope, but that should
+  be its own explicit home directory, not an accidental by-product of
+  whatever home the current session inherited.
+- Operator-user installs remain supported, but when the current home is
+  a repo-local isolated home (this tool's `.local/claude/HOME`, or a
+  coexisting codex-wrangler `.local/codex-home` or legacy
+  `.codex-home`), they require `--user-home /path/to/home` instead of
+  silently targeting the wrong scope, or `--allow-isolated-home` when
+  an AI-local install is deliberate. On native Windows the home is read
+  from `USERPROFILE` (then `HOMEDRIVE`/`HOMEPATH`, then `HOME`), and
+  each of those variables is checked.
+- System installs remain separate and still require
+  `sudo ./install.sh --system` (not available on native Windows).
+
+## Safety Notes
+
+The tool is intentionally suspicious.
+
+- Managed paths must stay under the target project root, and the
+  runtime root must not overlap the redirected home, any
+  `claude/versions` directory, or Claude Code's own config-dir
+  children.
+- Uninstall removes files only when it can prove ownership, unless
+  `--force` is used. It refuses while anything runs from the runtime,
+  removes the runtime before session state, and stops before session
+  state if a binary cannot be deleted.
+- The generated launchers and the generated local README are
+  content-checked; the launcher core must be a byte-for-byte copy of
+  the packaged one.
+- Every generated file is written atomically, with LF line endings for
+  files POSIX shells read and CRLF for `.cmd` files.
+- Inspection emits a JSON report so automation or operators can see
+  what the tool believes it owns, and never takes the maintenance lock.
+
+## Known Limitations
+
+- **No sandbox on native Windows.** Claude Code runs the commands it
+  executes unsandboxed there, so rings 3 and 2 are unavailable. Use
+  WSL2 or a separate Windows account for work that needs them.
+- **Per-user Windows stores.** Ring 1 redirects the home variables,
+  but Windows Credential Manager (including Git Credential Manager),
+  the registry, and `HKCU\SOFTWARE\Policies` stay per user and are
+  shared by every project. `HOMESHARE`, `TEMP`, and `TMP` are not
+  redirected.
+- **Ring-0 housekeeping.** Claude Code's daily cleanup prunes old
+  versions in `~/.local/share/claude/versions` whatever the update
+  settings say. A ring-0 session can therefore prune old versions of
+  your global install. Prefer ring 1; the project runtime itself never
+  lives under any `claude/versions` directory.
+- **WSL needs its own install.** WSL is a separate Linux host:
+  `claude-wrangler` refuses to install another operating system's build,
+  so install and run it inside WSL to add the Linux binary. A slot can
+  carry the same release for several platforms, so a checkout shared
+  between Windows and WSL keeps both builds.
+- **Pinned trust anchors.** If Anthropic rotates its release signing
+  key, a new `claude-wrangler` release is required, and a manifest
+  signed by several keys during a rotation is refused.
+- **Long Windows paths.** A deeply nested checkout can push the binary
+  path past 260 characters, which some programs cannot start from;
+  `claude-wrangler` warns before the smoke test.
+- **Disk and synced folders.** Each kept release is about 250 MB, and
+  two are kept per project. Folders synced by OneDrive or Dropbox
+  upload each one.
+- **Python 3.13 and newer** verify certificates more strictly by
+  default and can reject some TLS-inspection CA certificates that a
+  browser accepts; fix the CA certificate or run `claude-wrangler` with
+  Python 3.12 or older.
+- **Not yet validated everywhere.** The native runtime was developed
+  and tested on Windows. Its Linux and macOS code paths, Windows on ARM
+  detection, and the Python 3.9 floor still need runs on those systems
+  (planned CI); until then they are covered by tests with injected host
+  facts and by syntax checks.
 
 ## TheKnowledge Submodule
 
@@ -214,8 +675,8 @@ The developer bootstrap script runs this automatically.
 When you run `claude-wrangler` against another repository, it manages
 these artifacts inside that target repository:
 
-- `.local/claude/` (npm install, ring-1/2 HOME, pinned config dir)
-- `bin/claude-local`
+- `.local/claude/` (runtime root, ring-1/2 HOME, pinned config dir)
+- `bin/claude-local` and `bin/claude-local.cmd`
 - `README-LOCAL-Start-Claude.md`
 - a marked `.gitignore` block
 
@@ -223,71 +684,9 @@ The managed `.gitignore` block deliberately does not ignore the
 project-root `.claude/` directory, which Claude Code uses for
 trackable project settings. The block also never touches ignore blocks
 owned by other tools, including TheKnowledge's managed baseline and
-codex-wrangler's block, even where entries overlap.
-
-## Runtime Boundary
-
-`claude-wrangler` localizes the `@anthropic-ai/claude-code` package
-install under `.local/claude/npm/` and localizes Claude state under
-`.local/claude/`. It does not install or pin the `node` runtime used by
-`bin/claude-local`, or the `npm` executable used by maintenance
-commands. Managed npm operations set `NPM_CONFIG_CACHE` to
-`.local/claude/npm/.npm-cache` so package installs and npm scratch
-writes stay inside the target project.
-
-The generated launcher executes
-`.local/claude/npm/node_modules/.bin/claude` directly. It intentionally
-does not use `npx claude` or any global `claude`, so a bad global tool
-update or a registry package squatting a bare name cannot affect the
-project. The Node.js runtime family still comes from the shell `PATH`
-that launched the command.
-
-The launcher performs a cheap startup preflight before it starts Claude
-Code. It always refuses to launch when `node` or the managed local
-binary is unavailable. By default it also warns when a checked-in
-Node.js selector such as `.nvmrc`, `.node-version`, or `.tool-versions`
-appears inconsistent with the active shell. Use
-`CLAUDE_LOCAL_PREFLIGHT=warn`, `strict`, or `off` to control the
-selector-warning behavior.
-
-`claude-wrangler --inspect` and `--selftest` report the resolved
-`node`, `npm`, and `npx` paths and versions, detected checked-in
-Node.js selectors, any root `package.json` package-manager declaration,
-and the effective `CLAUDE_CONFIG_DIR`, `HOME`, and `XDG_*` paths the
-launcher will expose. They also report whether the managed local Claude
-binary and its host platform package exist and whether the requested,
-lockfile, and installed package versions agree.
-
-## Trust and Install Scope
-
-`claude-wrangler` treats user-scoped install targets as an explicit
-trust boundary.
-
-- Less-trusted AI or isolated `claude-local` sessions should normally
-  stay in repo scope and should not mutate an operator's shell init,
-  `~/.local/bin`, or `~/.pyenv` implicitly.
-- More-trusted AI can still manage its own user scope, but that should
-  be its own explicit home directory, not an accidental by-product of
-  whatever `HOME` the current session inherited.
-- Operator-user installs remain supported, but when the current `HOME`
-  is a repo-local isolated home (this tool's `.local/claude/HOME` or a
-  coexisting `.codex-home`), they require `--user-home /path/to/home`
-  instead of silently targeting the wrong scope, or
-  `--allow-isolated-home` when an AI-local install is deliberate.
-- System installs remain separate and still require
-  `sudo ./install.sh --system`.
-
-## Safety Notes
-
-The tool is intentionally suspicious.
-
-- Managed paths must stay under the target project root.
-- Uninstall removes files only when it can prove ownership, unless
-  `--force` is used.
-- The generated launcher and generated local README are
-  content-checked.
-- Inspection emits a JSON report so automation or operators can see
-  what the tool believes it owns.
+codex-wrangler's block, even where entries overlap. Edits to
+`.gitignore` keep its existing line endings and never produce
+`\r\r\n`.
 
 ## Development
 

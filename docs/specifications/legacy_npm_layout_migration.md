@@ -26,18 +26,37 @@ the migration.
 2. **Discovery is read-only**
 
    Legacy discovery reads `.local/claude/npm/.claude-wrangler.json`, then
-   `package-lock.json`, then `package.json` (the existing inference order)
-   for the selector, channel, exact version, `shared_home`, and
-   `reasonable_permissions_enabled`. A custom legacy `--local-dir`
-   recorded in metadata is honored. Discovery must not write anything.
+   `package-lock.json`, then `package.json` (the existing inference
+   order), then the installed wrapper's `package.json`, for the
+   selector, channel, exact version, `shared_home`, and
+   `reasonable_permissions_enabled`. Discovery must not write anything.
+
+   A custom npm-era `--local-dir` is recorded only inside that
+   directory, so candidate directories are tried in this order:
+   1. an explicit `--local-dir` that names an npm-era directory (the
+      native runtime then goes to the default `.local/claude/wrangler`);
+   2. the native metadata's record of the directory it migrated from;
+   3. the directory the project's generated launcher still names: an
+      npm-era bash launcher's `local_prefix="$repo_root/<dir>"` line,
+      counted only when the launcher carries claude-wrangler's managed
+      marker and runs `node_modules/.bin/claude`, or the legacy binary
+      path in a migration-pending `launch.json` (requirement 6);
+   4. the default `.local/claude/npm`.
+
+   A candidate counts only when it resolves inside the project and holds
+   an npm-era layout, so `claude-wrangler .` migrates a custom tree
+   without the operator repeating `--local-dir`.
 
 3. **Version continuity**
 
-   Migration targets the same exact version the legacy install pinned.
-   When that version is below the native floor (2.1.207), migration must
-   stop and tell the operator to run an explicit
-   `--upgrade --channel <channel>`; it must never upgrade silently. A
-   legacy `next` channel becomes `latest` with a deprecation notice.
+   Without an explicit target, migration targets the same exact version
+   the legacy install pinned. When that version is below the native
+   floor (2.1.207), migration must stop and tell the operator to run an
+   explicit `--upgrade --channel <channel>`; it must never upgrade
+   silently. An explicit target (`--upgrade`, or `--channel` or
+   `--version` on a plain install) migrates straight to that target,
+   which is still subject to the floor. A legacy `next` channel becomes
+   `latest` with a deprecation notice.
 
 4. **Adopt in place**
 
@@ -62,9 +81,9 @@ the migration.
       channel, version, `shared_home`, `reasonable_permissions_enabled`,
       and a `migrated_to` pointer;
    7. remove `node_modules/`, `package.json`, `package-lock.json`, and
-      `.npm-cache/` from the legacy tree. On Windows, locked files are
-      renamed to `.retired-<txid>` or left in place and reported; the next
-      install, upgrade, or repair retries the cleanup.
+      `.npm-cache/` from the legacy tree. On Windows, locked entries are
+      renamed to `.retired-<txid>-<name>` or left in place and reported;
+      the next install, upgrade, or repair retries the cleanup.
 
    A failure before step 4 leaves the legacy launcher and npm tree fully
    working.
@@ -76,14 +95,41 @@ the migration.
    that executes the legacy platform binary directly, exports the
    self-update suppression variables, and reports "migration pending";
    they must never render a launcher that points at a runtime that does
-   not exist yet.
+   not exist yet. The launcher is the native core and shims, with a
+   `legacy` block (binary path and version) in `launch.json`; the core,
+   `launch.json`, shims, and `update-check.json` already live in the
+   native runtime root. The binary must pass the structural check of
+   `native_runtime_distribution_and_verification.md` requirement 9; when
+   no binary passes, the existing launcher is left untouched and a
+   warning names the fix. Until migration writes schema-2 metadata, the
+   state these operations change is kept in the schema-1 legacy
+   metadata. No subcommand list is recorded for a legacy binary, so the
+   launcher always passes `--settings`.
 
 7. **Config-dir spelling**
 
-   The `CLAUDE_CONFIG_DIR` value the new launcher exports must be
-   byte-identical to the value the legacy launcher exported, because
    Claude Code keys some per-config-dir state (including a gated Windows
-   Credential Manager backend) on that exact string.
+   Credential Manager backend) on the exact `CLAUDE_CONFIG_DIR` string,
+   so the new launcher must export the value the legacy launcher
+   exported for the same invocation. Byte identity cannot be guaranteed
+   in general: the npm-era bash launcher built the value from `pwd`, so
+   it already varied with how the operator reached the checkout. The
+   achievable guarantee is:
+   - the new launcher derives the value the same way, from its own
+     invocation path, joined with the same repo-relative config-dir
+     suffix. That suffix, and the home suffix, come from the legacy
+     metadata, or from the npm-era launcher's `export CLAUDE_CONFIG_DIR=`
+     and `export HOME=` lines when the metadata does not record them;
+   - `launch.json` records `config_dir_spelling`. `native` uses the
+     host's own separators. `forward-slash` is chosen automatically on
+     native Windows when an npm-era layout is migrated without native
+     metadata, because Git Bash handed native programs `C:/...`; it
+     converts backslashes to `/` and upper-cases the drive letter.
+     The recorded spelling then persists.
+
+   The value matches for the same invocation path, up to drive-letter
+   case. UNC, `subst`, and WSL (`/mnt/c/...`) spellings of the same
+   checkout produce different strings, as they did before migration.
 
 8. **Rolling claude-wrangler back**
 
@@ -109,4 +155,10 @@ the migration.
 - Failure injection before and after the commit point.
 - Below-floor refusal.
 - Deferred cleanup when a legacy file is locked.
-- Launcher rendering for `--update` against an unmigrated layout.
+- Launcher rendering for `--update` against an unmigrated layout, and
+  no rendering when the legacy binary is missing or fails the
+  structural check.
+- Discovery of a custom npm-era directory from the old launcher and
+  from a migration-pending `launch.json`, without `--local-dir`.
+- Selftest reporting "migration pending" as a warning, and uninstall
+  never migrating.

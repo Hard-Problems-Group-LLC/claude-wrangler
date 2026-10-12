@@ -1,14 +1,33 @@
-"""Filesystem layout and state-discovery helpers."""
+"""Filesystem layout and native-metadata discovery helpers.
+
+Legacy npm-layout discovery lives in `migration.py`; this module only knows
+the native (schema 2) layout rooted at `--local-dir`.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
-from .constants import CLAUDE_PACKAGE_NAME, METADATA_FILENAME
+from .constants import (
+    CLAUDE_CHANNELS,
+    CONFIG_DIR_SPELLINGS,
+    METADATA_FILENAME,
+    SCHEMA_VERSION,
+)
 from .models import ClaudeWranglerError, ExistingState, Layout
+
+# Recorded `paths` keys and the CLI flags they mirror.
+RECORDED_PATH_KEYS = (
+    "local_dir",
+    "claude_home_dir",
+    "claude_config_dir",
+    "launcher",
+    "readme_local",
+)
 
 
 def resolve_project_root(raw_path: str) -> Path:
@@ -35,7 +54,7 @@ def resolve_relative_within_root(
 
     The returned relative spelling always uses POSIX `/` separators, even
     on Windows, because it is recorded in metadata and embedded in the
-    `.gitignore` block and generated launcher scripts, all of which must
+    `.gitignore` block and generated launcher files, all of which must
     read the same on every operating system that shares a checkout.
     """
 
@@ -107,9 +126,6 @@ def build_layout(
         config_dir=config_dir,
         launcher_path=launcher_path,
         readme_path=readme_path,
-        local_package_json_path=local_dir / "package.json",
-        local_package_lock_path=local_dir / "package-lock.json",
-        local_node_modules_dir=local_dir / "node_modules",
         metadata_path=local_dir / METADATA_FILENAME,
         gitignore_path=project_root / ".gitignore",
     )
@@ -121,9 +137,8 @@ def read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(path.read_bytes().decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ClaudeWranglerError(
             "Failed to parse JSON in {}: {}".format(path, exc)
         ) from exc
@@ -136,109 +151,144 @@ def read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     return payload
 
 
-def read_existing_state(layout: Layout) -> ExistingState:
-    """Read any previously managed state available at the target paths."""
+def _optional_bool(payload: Dict[str, Any], key: str) -> Optional[bool]:
+    """Return a boolean field or None when absent or mistyped."""
+
+    value = payload.get(key)
+    return value if isinstance(value, bool) else None
+
+
+def _optional_str(payload: Dict[str, Any], key: str) -> Optional[str]:
+    """Return a non-empty string field or None."""
+
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def parse_available_versions(raw: Any) -> Dict[str, Optional[str]]:
+    """Return the `{channel: version-or-None}` catalog from metadata."""
+
+    versions: Dict[str, Optional[str]] = {}
+    if not isinstance(raw, dict):
+        return versions
+    for raw_channel, raw_version in raw.items():
+        if not isinstance(raw_channel, str):
+            continue
+        if isinstance(raw_version, str) or raw_version is None:
+            versions[raw_channel] = raw_version
+    return versions
+
+
+def parse_recorded_paths(raw: Any) -> Dict[str, str]:
+    """Return the recorded relative `paths` that still look usable."""
+
+    paths: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return paths
+    for key in RECORDED_PATH_KEYS:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            paths[key] = value.strip()
+    return paths
+
+
+def read_native_metadata(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return `(metadata, error)` for a schema-2 metadata file.
+
+    A missing file is `(None, None)`. A file that cannot be parsed, is not
+    an object, or carries another schema yields `(None, reason)`; the
+    payload of a foreign schema is never mistaken for native state.
+    """
 
     try:
-        metadata = read_json_file(layout.metadata_path)
-    except ClaudeWranglerError:
-        metadata = None
-    requested_claude_selector = None
-    claude_channel = None
-    pinned_claude_version = None
-    available_versions: Dict[str, Optional[str]] = {}
-    available_versions_updated_at = None
-    reasonable_permissions_enabled = None
-    shared_home = None
+        payload = read_json_file(path)
+    except ClaudeWranglerError as exc:
+        return None, str(exc)
+    if payload is None:
+        return None, None
+    schema = payload.get("schema_version")
+    if schema != SCHEMA_VERSION or isinstance(schema, bool):
+        return None, "Metadata {} has schema_version {!r}, not {}.".format(
+            path, schema, SCHEMA_VERSION
+        )
+    return payload, None
 
-    if metadata:
-        requested_claude_selector = metadata.get("claude_selector")
-        claude_channel = metadata.get("claude_channel")
-        pinned_claude_version = metadata.get("claude_version")
-        raw_available_versions = metadata.get("available_versions")
-        if isinstance(raw_available_versions, dict):
-            for raw_channel, raw_version in raw_available_versions.items():
-                if not isinstance(raw_channel, str):
-                    continue
-                if isinstance(raw_version, str):
-                    available_versions[raw_channel] = raw_version
-                elif raw_version is None:
-                    available_versions[raw_channel] = None
-        raw_updated_at = metadata.get("available_versions_updated_at")
-        if isinstance(raw_updated_at, str):
-            available_versions_updated_at = raw_updated_at
-        raw_reasonable_permissions = metadata.get("reasonable_permissions_enabled")
-        if isinstance(raw_reasonable_permissions, bool):
-            reasonable_permissions_enabled = raw_reasonable_permissions
-        raw_shared_home = metadata.get("shared_home")
-        if isinstance(raw_shared_home, bool):
-            shared_home = raw_shared_home
 
-    # Metadata is authoritative when present, but conservative fallback
-    # inference keeps update/inspect useful for older managed installs.
-    if requested_claude_selector is None:
-        try:
-            requested_claude_selector = infer_requested_version_from_package_json(
-                layout.local_package_json_path
-            )
-        except ClaudeWranglerError:
-            requested_claude_selector = None
-    if pinned_claude_version is None:
-        try:
-            pinned_claude_version = infer_installed_version_from_lockfile(
-                layout.local_package_lock_path
-            )
-        except ClaudeWranglerError:
-            pinned_claude_version = None
-    if pinned_claude_version is None:
-        pinned_claude_version = requested_claude_selector
+def read_existing_state(layout: Layout) -> ExistingState:
+    """Read the native install's schema-2 metadata, tolerating damage."""
 
+    metadata, error = read_native_metadata(layout.metadata_path)
+    if metadata is None:
+        return ExistingState(metadata=None, metadata_error=error)
+
+    channel = _optional_str(metadata, "claude_channel")
+    if channel is not None and channel not in CLAUDE_CHANNELS:
+        channel = None
+    spelling = _optional_str(metadata, "config_dir_spelling")
+    if spelling not in CONFIG_DIR_SPELLINGS:
+        spelling = None
+    details = metadata.get("available_version_details")
+    last_check = metadata.get("last_update_check")
     return ExistingState(
         metadata=metadata,
-        requested_claude_selector=(
-            requested_claude_selector
-            if isinstance(requested_claude_selector, str)
-            else None
+        metadata_error=None,
+        schema_version=SCHEMA_VERSION,
+        requested_claude_selector=_optional_str(metadata, "claude_selector"),
+        claude_channel=channel,
+        pinned_claude_version=_optional_str(metadata, "claude_version"),
+        reasonable_permissions_enabled=_optional_bool(
+            metadata, "reasonable_permissions_enabled"
         ),
-        claude_channel=claude_channel if isinstance(claude_channel, str) else None,
-        pinned_claude_version=(
-            pinned_claude_version if isinstance(pinned_claude_version, str) else None
+        available_versions=parse_available_versions(metadata.get("available_versions")),
+        available_versions_updated_at=_optional_str(
+            metadata, "available_versions_updated_at"
         ),
-        reasonable_permissions_enabled=reasonable_permissions_enabled,
-        available_versions=available_versions,
-        available_versions_updated_at=available_versions_updated_at,
-        shared_home=shared_home,
+        available_version_details=(
+            {
+                key: dict(value)
+                for key, value in details.items()
+                if isinstance(key, str) and isinstance(value, dict)
+            }
+            if isinstance(details, dict)
+            else {}
+        ),
+        last_update_check=dict(last_check) if isinstance(last_check, dict) else None,
+        shared_home=_optional_bool(metadata, "shared_home"),
+        update_checks=_optional_bool(metadata, "update_checks"),
+        windows_sandbox_warning=_optional_bool(metadata, "windows_sandbox_warning"),
+        release_base_url=_optional_str(metadata, "release_base_url"),
+        platform=_optional_str(metadata, "platform"),
+        launcher_python=_optional_str(metadata, "launcher_python"),
+        config_dir_spelling=spelling,
+        generated_at=_optional_str(metadata, "generated_at"),
+        legacy_migrated_from=_optional_str(metadata, "legacy_migrated_from"),
+        legacy_migrated_at=_optional_str(metadata, "legacy_migrated_at"),
+        recorded_paths=parse_recorded_paths(metadata.get("paths")),
+        version_source=_optional_str(metadata, "version_source"),
     )
 
 
-def infer_requested_version_from_package_json(
-    package_json_path: Path,
-) -> Optional[str]:
-    """Return the pinned Claude version from the managed local package manifest."""
+def managed_state_fingerprint(paths: Sequence[Path]) -> str:
+    """Return a digest of the metadata files a command's decisions rest on.
 
-    payload = read_json_file(package_json_path)
-    if not payload:
-        return None
-    dev_dependencies = payload.get("devDependencies")
-    if not isinstance(dev_dependencies, dict):
-        return None
-    version = dev_dependencies.get(CLAUDE_PACKAGE_NAME)
-    return version if isinstance(version, str) else None
+    Commands read their state (native metadata, npm-era metadata) before
+    they take the maintenance lock. Comparing this digest again once the
+    lock is held detects another maintainer's publish in between, so a
+    stale read can never revert it (`ab_runtime_slots.md` requirement 4).
+    A missing file and an unreadable one hash differently from any content.
+    """
 
-
-def infer_installed_version_from_lockfile(lockfile_path: Path) -> Optional[str]:
-    """Return the installed Claude version from package-lock.json when present."""
-
-    payload = read_json_file(lockfile_path)
-    if not payload:
-        return None
-
-    packages = payload.get("packages")
-    if not isinstance(packages, dict):
-        return None
-
-    claude_entry = packages.get("node_modules/{}".format(CLAUDE_PACKAGE_NAME))
-    if not isinstance(claude_entry, dict):
-        return None
-    version = claude_entry.get("version")
-    return version if isinstance(version, str) else None
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(os.fsencode(str(path)) + b"\0")
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            digest.update(b"missing\0")
+            continue
+        except OSError as exc:
+            digest.update("unreadable {}\0".format(exc.errno).encode("ascii"))
+            continue
+        digest.update(str(len(data)).encode("ascii") + b"\0")
+        digest.update(data)
+    return digest.hexdigest()

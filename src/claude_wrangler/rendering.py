@@ -1,66 +1,117 @@
-"""Deterministic rendered content for managed files and reports."""
+"""Deterministic rendered content for managed files and reports.
+
+Everything here is a pure function of the configuration: the schema-2
+metadata document, the `.gitignore` block, `launch.json` for the launcher
+core, the POSIX and cmd launcher shims, the nested-`claude` PATH shims,
+the local README, and operator summaries. `generator.py` publishes the
+files; this module never touches the filesystem except to read the
+launcher core it copies and to look up a Windows short path.
+"""
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import ntpath
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
+from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import (
     CLAUDE_CHANNELS,
-    CLAUDE_PACKAGE_NAME,
+    DEEP_LINK_SETTING_KEY,
+    DEEP_LINK_SETTING_VALUE,
     DEFAULT_INSTALL_CLAUDE_SELECTOR,
     GITIGNORE_BEGIN,
     GITIGNORE_END,
-    METADATA_FILENAME,
+    LAUNCH_CONFIG_SCHEMA,
+    LAUNCH_CORE_FILENAME,
+    PATH_SHIM_DIRNAME,
+    PATH_SHIM_NAME,
     README_MARKER,
     SCHEMA_VERSION,
+    SCRIPT_MARKER,
     SCRIPT_NAME,
     SCRIPT_VERSION,
-    SCRIPT_MARKER,
     SELF_UPDATE_SUPPRESSION_ENV,
 )
-from .models import Config, Layout
-from .releases import CHANNEL_TO_SELECTOR
+from .distribution import DEFAULT_RELEASE_BASE_URL, VERSION_FLOOR
+from .models import ClaudeWranglerError, Config, Layout
 from .runtime import utc_now_iso
 
-LOCAL_PACKAGE_NAME = "claude-local-managed-install"
+PYTHON_PROBE_POSIX = (
+    "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
+)
+# Git Bash and MSYS2 ship POSIX-emulation Pythons; the launcher core needs
+# a native Windows interpreter there.
+PYTHON_PROBE_MSYS = (
+    "import sys; raise SystemExit("
+    "0 if sys.version_info >= (3, 9) and sys.platform == 'win32' else 1)"
+)
+# No redirection or escape characters, so a dropped quote can never turn
+# the probe into a cmd redirection (the install.cmd convention).
+PYTHON_PROBE_CMD = (
+    "import sys; raise SystemExit(not (sys.hexversion // 0x03090000 and "
+    "sys.platform == 'win32'))"
+)
 
 
-def build_local_package_json(claude_version: str) -> str:
-    """Return the deterministic package.json content for the managed install."""
+def suppression_env() -> Dict[str, str]:
+    """Return the self-update suppression variables as a mapping."""
 
-    payload = {
-        "name": LOCAL_PACKAGE_NAME,
-        "private": True,
-        "devDependencies": {
-            CLAUDE_PACKAGE_NAME: claude_version,
-        },
+    return {name: value for name, value in SELF_UPDATE_SUPPRESSION_ENV}
+
+
+def settings_override() -> Dict[str, Any]:
+    """Return the `--settings` document the launcher passes to Claude Code."""
+
+    return {
+        "env": suppression_env(),
+        DEEP_LINK_SETTING_KEY: DEEP_LINK_SETTING_VALUE,
     }
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
-def build_metadata(config: Config) -> Dict[str, Any]:
-    """Build the metadata document recorded under the managed local directory."""
+def build_metadata(
+    config: Config, *, generated_at: Optional[str] = None
+) -> Dict[str, Any]:
+    """Build the schema-2 metadata document stored at the runtime root."""
 
     return {
         "schema_version": SCHEMA_VERSION,
         "script_name": SCRIPT_NAME,
         "script_version": SCRIPT_VERSION,
-        "generated_at": utc_now_iso(),
+        "generated_at": generated_at or utc_now_iso(),
         "project_root": str(config.project_root),
         "claude_selector": config.claude_selector,
         "claude_channel": config.claude_channel,
         "claude_version": config.claude_version,
         "shared_home": config.shared_home,
         "reasonable_permissions_enabled": config.reasonable_permissions_enabled,
+        "update_checks": config.update_checks,
+        "windows_sandbox_warning": config.windows_sandbox_warning,
+        "release_base_url": config.release_base_url or DEFAULT_RELEASE_BASE_URL,
+        "platform": config.platform_key,
+        "launcher_python": config.launcher_python,
+        "config_dir_spelling": config.config_dir_spelling,
         "version_source": config.version_source,
-        "available_versions": dict(config.available_versions),
+        "available_versions": {
+            channel: config.available_versions.get(channel)
+            for channel in CLAUDE_CHANNELS
+        },
         "available_versions_updated_at": config.available_versions_updated_at,
+        "available_version_details": {
+            channel: dict(details)
+            for channel, details in sorted(config.available_version_details.items())
+        },
+        "last_update_check": config.last_update_check,
+        "legacy_migrated_from": config.legacy_migrated_from,
+        "legacy_migrated_at": config.legacy_migrated_at,
         "paths": {
             "local_dir": config.layout.local_dir_relative,
             "claude_home_dir": config.layout.claude_home_relative,
             "claude_config_dir": config.layout.config_dir_relative,
             "launcher": config.layout.launcher_relative,
+            "launcher_cmd": config.layout.launcher_cmd_relative,
             "readme_local": config.layout.readme_relative,
         },
     }
@@ -72,8 +123,9 @@ def build_gitignore_block(layout: Layout) -> str:
     The default layout keeps every managed directory under `.local/`, so
     one umbrella rule covers them; explicit directory rules are added only
     when an operator relocated a managed directory outside `.local/`.
-    The project-root `.claude/` directory is deliberately not ignored:
-    Claude Code keeps trackable project settings there.
+    Both launcher shims are listed. The project-root `.claude/` directory
+    is deliberately not ignored: Claude Code keeps trackable project
+    settings there.
     """
 
     directory_entries: List[str] = [".local/"]
@@ -91,13 +143,14 @@ def build_gitignore_block(layout: Layout) -> str:
 
     lines = [
         GITIGNORE_BEGIN,
-        "# Local Claude Code package, session state, wrapper, and sentinel",
+        "# Local Claude Code runtime, session state, launchers, and sentinel",
         "# artifacts.",
     ]
     lines.extend(directory_entries)
     lines.extend(
         [
             layout.launcher_relative,
+            layout.launcher_cmd_relative,
             layout.readme_relative,
             GITIGNORE_END,
             "",
@@ -106,329 +159,396 @@ def build_gitignore_block(layout: Layout) -> str:
     return "\n".join(lines)
 
 
-def build_launcher_home_lines(config: Config) -> List[str]:
-    """Return the shell block that selects the session's security ring.
+def _parent_depth(relative: str) -> int:
+    """Return how many directories a POSIX relative path sits below the root."""
 
-    The install-time mode only chooses the default; both the
-    `CLAUDE_LOCAL_SHARED_HOME` environment variable and the launcher-only
-    `--shared-home` / `--isolated-home` arguments switch one invocation
-    between ring 1 (redirected HOME) and ring 0 (real HOME) without
-    regenerating managed files. `CLAUDE_CONFIG_DIR` stays pinned in both
-    modes, so ring escalation never forks Claude session state.
+    return len(PurePosixPath(relative).parent.parts)
+
+
+def build_launch_config(
+    config: Config,
+    *,
+    legacy_binary: Optional[str] = None,
+    legacy_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the `launch.json` document the launcher core reads.
+
+    Keys follow the launcher contract (schema 1); `release_base_url` and
+    `config_dir_spelling` are optional extensions, and `legacy` switches the
+    core to the Node-free npm-layout launcher while migration is pending.
     """
 
-    default_value = "1" if config.shared_home else "0"
-    return [
-        "# Ring selection: 0 keeps the operator's real HOME (ring 0); any",
-        "# other value redirects HOME into the project-local home (ring 1).",
-        'shared_home="${{CLAUDE_LOCAL_SHARED_HOME:-{}}}"'.format(default_value),
-        "launcher_args=()",
-        'for arg in "$@"; do',
-        '  case "$arg" in',
-        "    --shared-home)",
-        '      shared_home="1"',
-        "      ;;",
-        "    --isolated-home)",
-        '      shared_home="0"',
-        "      ;;",
-        "    *)",
-        '      launcher_args+=("$arg")',
-        "      ;;",
-        "  esac",
-        "done",
-        "",
-        'if [[ "$shared_home" != "1" ]]; then',
-        '  export HOME="$repo_root/{}"'.format(config.layout.claude_home_relative),
-        '  export XDG_CONFIG_HOME="$HOME/.config"',
-        '  export XDG_CACHE_HOME="$HOME/.cache"',
-        '  export XDG_STATE_HOME="$HOME/.local/state"',
-        '  export XDG_DATA_HOME="$HOME/.local/share"',
-        '  mkdir -p "$HOME"',
-        "fi",
-        'mkdir -p "$CLAUDE_CONFIG_DIR"',
-    ]
+    layout = config.layout
+    depth = len(PurePosixPath(layout.local_dir_relative).parts)
+    channel = (
+        config.claude_channel
+        if config.claude_channel in CLAUDE_CHANNELS
+        else ("stable")
+    )
+    data: Dict[str, Any] = {
+        "schema": LAUNCH_CONFIG_SCHEMA,
+        "repo_root_from_core": "/".join([".."] * depth),
+        "config_dir": layout.config_dir_relative,
+        "home_dir": layout.claude_home_relative,
+        "runtime_root": layout.local_dir_relative,
+        "shared_home_default": bool(config.shared_home),
+        "reasonable_permissions": bool(config.reasonable_permissions_enabled),
+        "windows_sandbox_warning": bool(config.windows_sandbox_warning),
+        "update_checks": bool(config.update_checks),
+        "channel": channel,
+        "suppression_env": suppression_env(),
+        "settings_override": settings_override(),
+        "wrangler_command": SCRIPT_NAME,
+        "release_base_url": config.release_base_url or DEFAULT_RELEASE_BASE_URL,
+        "config_dir_spelling": config.config_dir_spelling,
+    }
+    if legacy_binary is not None:
+        data["legacy"] = {"binary": legacy_binary, "version": legacy_version}
+    return data
 
 
-def build_launcher_preflight_lines() -> List[str]:
-    """Return the shell preflight block embedded in the launcher."""
+def launch_config_text(data: Dict[str, Any]) -> str:
+    """Return `launch.json` text: sorted keys, two-space indent, LF."""
 
-    return [
-        'preflight_mode="${CLAUDE_LOCAL_PREFLIGHT:-warn}"',
-        'preflight_prefix="[claude-local] preflight"',
-        'local_claude_bin="$local_prefix/node_modules/.bin/claude"',
-        "",
-        "emit_preflight_warning() {",
-        '  printf "%s: %s\\n" "$preflight_prefix" "$1" >&2',
-        "}",
-        "",
-        "preflight_fail() {",
-        '  emit_preflight_warning "$1"',
-        "  exit 1",
-        "}",
-        "",
-        "handle_preflight_mismatch() {",
-        '  if [[ "$preflight_mode" == "strict" ]]; then',
-        '    preflight_fail "$1"',
-        "  fi",
-        '  emit_preflight_warning "$1"',
-        "}",
-        "",
-        "normalize_node_version() {",
-        '  local raw_value="${1:-}"',
-        '  raw_value="${raw_value#v}"',
-        '  printf "%s" "$raw_value"',
-        "}",
-        "",
-        "is_literal_node_version() {",
-        '  [[ "${1:-}" =~ ^v?[0-9]+(\\.[0-9]+){0,2}$ ]]',
-        "}",
-        "",
-        'case "$preflight_mode" in',
-        "  warn|strict|off) ;;",
-        "  *)",
-        '    emit_preflight_warning "Unknown CLAUDE_LOCAL_PREFLIGHT value \\"$preflight_mode\\"; defaulting to warn."',
-        '    preflight_mode="warn"',
+    return json.dumps(data, indent=2, sort_keys=True) + "\n"
+
+
+def launcher_core_source() -> bytes:
+    """Return the packaged launcher core's exact bytes (copied to launch.py)."""
+
+    from . import launcher_core
+
+    path = Path(launcher_core.__file__)
+    if path.suffix != ".py":
+        path = path.with_suffix(".py")
+    return path.read_bytes()
+
+
+def _sh_quote(value: str) -> str:
+    """Quote a string for POSIX sh with single quotes."""
+
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _windows_short_path(path: str) -> Optional[str]:
+    """Return the 8.3 short spelling of an existing path, or None."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        function = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+        function.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        function.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = function(path, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not length or length >= len(buffer):
+        return None
+    return buffer.value
+
+
+def cmd_safe_python_path(python: Optional[str]) -> Optional[str]:
+    """Return a spelling of the recorded interpreter safe to embed in a .cmd.
+
+    cmd shims are ASCII-only, so a non-ASCII path is replaced by its 8.3
+    short name when one exists and otherwise left out (the shim then falls
+    back to `py -3`, `python3`, and `python`). `%` is doubled for cmd.
+    Only absolute Windows paths qualify.
+    """
+
+    if not python:
+        return None
+    drive, tail = ntpath.splitdrive(python)
+    if not drive or not tail.startswith(("\\", "/")):
+        return None
+    candidate = python
+    if not candidate.isascii():
+        short = _windows_short_path(candidate)
+        if short is None or not short.isascii():
+            return None
+        candidate = short
+    if any(char in candidate for char in '"\r\n'):
+        return None
+    return candidate.replace("%", "%%")
+
+
+def _require_ascii(value: str, label: str) -> str:
+    """Refuse a non-ASCII value that must go into an ASCII-only cmd file."""
+
+    if not value.isascii():
+        raise ClaudeWranglerError(
+            "{} {!r} is not ASCII, so it cannot be written into the ASCII-only "
+            "cmd launcher. Choose an ASCII path.".format(label, value)
+        )
+    return value
+
+
+def build_posix_shim(config: Config) -> str:
+    """Return `bin/claude-local`: a POSIX `sh` shim (LF) for the launcher core.
+
+    The shim derives the repository root from its own location, exports it
+    as an absolute `CLAUDE_LOCAL_REPO_ROOT`, and runs the recorded
+    interpreter with `-I`, falling back to `py -3`, `python3`, and `python`
+    after an exit-code probe. Under Git Bash, MSYS2, or Cygwin it requires a
+    native Windows Python, passes Windows-form paths (`cygpath -w`), and
+    disables MSYS argument conversion so prompts such as `/review` reach
+    Claude Code unchanged.
+    """
+
+    layout = config.layout
+    ups = "/".join([".."] * _parent_depth(layout.launcher_relative)) or "."
+    core_relative = posixpath.join(layout.local_dir_relative, LAUNCH_CORE_FILENAME)
+    recorded = config.launcher_python or ""
+    lines = [
+        "#!/bin/sh",
+        "# {}".format(SCRIPT_MARKER),
+        "# Generated by {}: starts this project's pinned native Claude Code".format(
+            SCRIPT_NAME
+        ),
+        "# through the launcher core. Do not edit; rerun {} to regenerate.".format(
+            SCRIPT_NAME
+        ),
+        "#",
+        "# All launch logic (the security-ring environment, the pinned",
+        "# CLAUDE_CONFIG_DIR, self-update suppression, and A/B slot selection)",
+        "# lives in {}. This shim only finds a Python 3.9+".format(core_relative),
+        "# interpreter. It never falls back to a global claude.",
+        'CLAUDE_LOCAL_REPO_ROOT=$(cd "$(dirname "$0")/{}" && pwd) || exit 1'.format(
+            ups
+        ),
+        'claude_local_core="$CLAUDE_LOCAL_REPO_ROOT/{}"'.format(core_relative),
+        "claude_local_recorded={}".format(_sh_quote(recorded)),
+        "claude_local_probe={}".format(_sh_quote(PYTHON_PROBE_POSIX)),
+        'case "$(uname -s 2>/dev/null)" in',
+        "  MINGW*|MSYS*|CYGWIN*)",
+        "    # The launcher core needs a native Windows Python and Windows-form",
+        "    # paths, and MSYS must not rewrite arguments such as /review.",
+        "    claude_local_probe={}".format(_sh_quote(PYTHON_PROBE_MSYS)),
+        '    CLAUDE_LOCAL_REPO_ROOT=$(cygpath -w "$CLAUDE_LOCAL_REPO_ROOT") || exit 1',
+        '    claude_local_core=$(cygpath -w "$claude_local_core") || exit 1',
+        '    if [ -z "${MSYS_NO_PATHCONV+x}" ] && [ -z "${MSYS2_ARG_CONV_EXCL+x}" ]; then',
+        "      CLAUDE_LOCAL_MSYS_ARGS=1",
+        "      export CLAUDE_LOCAL_MSYS_ARGS",
+        "    fi",
+        "    MSYS_NO_PATHCONV=1",
+        "    MSYS2_ARG_CONV_EXCL='*'",
+        "    export MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL",
         "    ;;",
         "esac",
-        "",
-        'node_path="$(command -v node || true)"',
-        'if [[ -z "$node_path" ]]; then',
-        '  preflight_fail "Required node command is not available in PATH."',
+        "export CLAUDE_LOCAL_REPO_ROOT",
+        'if [ -n "$claude_local_recorded" ] && "$claude_local_recorded" -I -c '
+        '"$claude_local_probe" >/dev/null 2>&1; then',
+        '  exec "$claude_local_recorded" -I "$claude_local_core" "$@"',
         "fi",
-        "",
-        'if [[ ! -x "$local_claude_bin" ]]; then',
-        '  preflight_fail "Local Claude Code executable is missing or not executable: $local_claude_bin. Re-run claude-wrangler install or upgrade for this project."',
+        'if command -v py >/dev/null 2>&1 && py -3 -I -c "$claude_local_probe" '
+        ">/dev/null 2>&1; then",
+        '  exec py -3 -I "$claude_local_core" "$@"',
         "fi",
-        "",
-        'if [[ "$preflight_mode" != "off" ]]; then',
-        '  selector_path=""',
-        '  selector_value=""',
-        '  if [[ -f "$repo_root/.nvmrc" ]]; then',
-        '    selector_path="$repo_root/.nvmrc"',
-        '    selector_value="$(sed -n \'1{s/\\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//;p;}\' "$selector_path" 2>/dev/null)"',
-        '  elif [[ -f "$repo_root/.node-version" ]]; then',
-        '    selector_path="$repo_root/.node-version"',
-        '    selector_value="$(sed -n \'1{s/\\r$//;s/^[[:space:]]*//;s/[[:space:]]*$//;p;}\' "$selector_path" 2>/dev/null)"',
-        '  elif [[ -f "$repo_root/.tool-versions" ]]; then',
-        '    selector_path="$repo_root/.tool-versions"',
-        '    selector_value="$(awk \'/^[[:space:]]*nodejs[[:space:]]+/ { print $2; exit }\' "$selector_path" 2>/dev/null)"',
-        "    selector_value=\"${selector_value%$'\\r'}\"",
+        "for claude_local_python in python3 python; do",
+        '  if command -v "$claude_local_python" >/dev/null 2>&1 && '
+        '"$claude_local_python" -I -c "$claude_local_probe" >/dev/null 2>&1; then',
+        '    exec "$claude_local_python" -I "$claude_local_core" "$@"',
         "  fi",
-        "",
-        '  if [[ -n "$selector_path" && -n "$selector_value" ]]; then',
-        '    selector_label="${selector_path#"$repo_root/"}"',
-        '    actual_node_version="$(node --version 2>/dev/null || true)"',
-        '    if [[ -z "$actual_node_version" ]]; then',
-        '      handle_preflight_mismatch "Project declares Node.js selector ${selector_label}=${selector_value}, but node --version could not be resolved."',
-        '    elif is_literal_node_version "$selector_value"; then',
-        '      expected_node_version="$(normalize_node_version "$selector_value")"',
-        '      actual_node_version_normalized="$(normalize_node_version "$actual_node_version")"',
-        '      if [[ "$expected_node_version" != "$actual_node_version_normalized" ]]; then',
-        '        handle_preflight_mismatch "Project declares Node.js ${selector_value} in ${selector_label}, but PATH resolves node ${actual_node_version} at ${node_path}."',
-        "      fi",
-        "    else",
-        '      emit_preflight_warning "Project declares Node.js selector ${selector_label}=${selector_value}. Launch claude-local from the project-activated shell for best parity."',
-        "    fi",
-        "  fi",
-        "fi",
-    ]
-
-
-def build_launcher_update_notice_lines(layout: Layout) -> List[str]:
-    """Return the shell block that prints a known-update notice before launch."""
-
-    metadata_path = "{}/{}".format(layout.local_dir_relative, METADATA_FILENAME)
-    return [
-        "emit_update_notice() {",
-        "  node - \"$repo_root/{}\" <<'NODE'".format(metadata_path),
-        'const fs = require("fs");',
-        "const metadataPath = process.argv[2];",
-        "let metadata;",
-        "try {",
-        '  metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));',
-        "} catch (error) {",
-        "  process.exit(0);",
-        "}",
-        'const installedVersion = typeof metadata.claude_version === "string" ? metadata.claude_version : null;',
-        'const channel = typeof metadata.claude_channel === "string" ? metadata.claude_channel.toLowerCase() : null;',
-        'const availableVersions = metadata && typeof metadata.available_versions === "object" && metadata.available_versions !== null ? metadata.available_versions : {};',
-        'const availableVersion = typeof availableVersions[channel] === "string" ? availableVersions[channel] : null;',
-        "if (!installedVersion || !channel || !availableVersion) {",
-        "  process.exit(0);",
-        "}",
-        "function parseVersion(raw) {",
-        '  const normalized = String(raw).trim().replace(/^v/, "");',
-        '  const pieces = normalized.split("-", 2);',
-        '  const main = pieces[0].split(".").map((part) => Number.parseInt(part, 10) || 0);',
-        "  while (main.length < 3) {",
-        "    main.push(0);",
-        "  }",
-        '  const prerelease = pieces.length > 1 ? pieces[1].split(".") : [];',
-        "  return { main, prerelease };",
-        "}",
-        "function compareIdentifier(left, right) {",
-        "  const leftIsNumeric = /^[0-9]+$/.test(left);",
-        "  const rightIsNumeric = /^[0-9]+$/.test(right);",
-        "  if (leftIsNumeric && rightIsNumeric) {",
-        "    return Number(left) - Number(right);",
-        "  }",
-        "  if (leftIsNumeric) {",
-        "    return -1;",
-        "  }",
-        "  if (rightIsNumeric) {",
-        "    return 1;",
-        "  }",
-        "  if (left < right) {",
-        "    return -1;",
-        "  }",
-        "  if (left > right) {",
-        "    return 1;",
-        "  }",
-        "  return 0;",
-        "}",
-        "function comparePrerelease(left, right) {",
-        "  if (left.length === 0 && right.length === 0) {",
-        "    return 0;",
-        "  }",
-        "  if (left.length === 0) {",
-        "    return 1;",
-        "  }",
-        "  if (right.length === 0) {",
-        "    return -1;",
-        "  }",
-        "  const count = Math.max(left.length, right.length);",
-        "  for (let index = 0; index < count; index += 1) {",
-        "    const leftValue = left[index];",
-        "    const rightValue = right[index];",
-        "    if (leftValue === undefined) {",
-        "      return -1;",
-        "    }",
-        "    if (rightValue === undefined) {",
-        "      return 1;",
-        "    }",
-        "    const compared = compareIdentifier(leftValue, rightValue);",
-        "    if (compared !== 0) {",
-        "      return compared;",
-        "    }",
-        "  }",
-        "  return 0;",
-        "}",
-        "function compareVersions(leftRaw, rightRaw) {",
-        "  const left = parseVersion(leftRaw);",
-        "  const right = parseVersion(rightRaw);",
-        "  for (let index = 0; index < 3; index += 1) {",
-        "    const delta = left.main[index] - right.main[index];",
-        "    if (delta !== 0) {",
-        "      return delta;",
-        "    }",
-        "  }",
-        "  return comparePrerelease(left.prerelease, right.prerelease);",
-        "}",
-        "if (compareVersions(installedVersion, availableVersion) >= 0) {",
-        "  process.exit(0);",
-        "}",
-        "console.error(`NOTE: {} has an available update on ${{channel}} (installed ${{installedVersion}}; available ${{availableVersion}}). Run \\`{} --update\\` to refresh version information and \\`{} --upgrade --channel ${{channel}}\\` to install it.`);".format(
-            CLAUDE_PACKAGE_NAME,
-            SCRIPT_NAME,
-            SCRIPT_NAME,
+        "done",
+        'echo "claude-local: no Python 3.9+ interpreter was found (tried the recorded '
+        'interpreter, py -3, python3, and python). Rerun {} to record one." >&2'.format(
+            SCRIPT_NAME
         ),
-        "NODE",
-        "}",
+        "exit 127",
         "",
-        "emit_update_notice",
     ]
-
-
-def build_launcher_reasonable_permissions_lines(config: Config) -> List[str]:
-    """Return the shell block that injects the managed permission default."""
-
-    state_value = "1" if config.reasonable_permissions_enabled else "0"
-    return [
-        'reasonable_permissions_enabled="{}"'.format(state_value),
-        "default_claude_args=()",
-        "",
-        'if [[ "$reasonable_permissions_enabled" == "1" ]]; then',
-        "  explicit_permission_choice=0",
-        '  for arg in "${launcher_args[@]}"; do',
-        '    case "$arg" in',
-        "      --permission-mode|--dangerously-skip-permissions)",
-        "        explicit_permission_choice=1",
-        "        ;;",
-        "      --permission-mode=*)",
-        "        explicit_permission_choice=1",
-        "        ;;",
-        "    esac",
-        '    if [[ "$explicit_permission_choice" == "1" ]]; then',
-        "      break",
-        "    fi",
-        "  done",
-        '  if [[ "$explicit_permission_choice" == "0" ]]; then',
-        '    default_claude_args+=("--permission-mode" "acceptEdits")',
-        "  fi",
-        "fi",
-    ]
-
-
-def build_launcher_content(config: Config) -> str:
-    """Build the generated shell launcher."""
-
-    lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "",
-        "# {}".format(SCRIPT_MARKER),
-        "# Generated by {}".format(SCRIPT_NAME),
-        "#",
-        "# This launcher keeps the Claude Code npm package local to the",
-        "# repository by executing the managed local claude binary directly.",
-        "# It must not fall back to a registry package or global install named",
-        "# claude, so a bad global tool update cannot take out this project.",
-        "#",
-        "# CLAUDE_CONFIG_DIR is pinned to the project so auth, sessions, and",
-        "# other Claude state stay project-local at every security ring. In",
-        "# default mode the launcher also redirects HOME into the managed",
-        "# project-local home directory (ring 1); pass --shared-home or set",
-        "# CLAUDE_LOCAL_SHARED_HOME=1 for one ring-0 session with the real",
-        "# HOME.",
-        "#",
-        "# Claude Code's own updater and installer write wherever HOME points,",
-        "# not next to the running binary, so at ring 0 they would replace or",
-        "# delete the operator's global install. claude-wrangler owns updates",
-        "# for this project, so self-update and install checks stay disabled.",
-        "",
-        'repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
-        'local_prefix="$repo_root/{}"'.format(config.layout.local_dir_relative),
-        'export NPM_CONFIG_CACHE="$local_prefix/.npm-cache"',
-        'export CLAUDE_LOCAL_MANAGED_BY="{}"'.format(SCRIPT_NAME),
-        'export CLAUDE_CONFIG_DIR="$repo_root/{}"'.format(
-            config.layout.config_dir_relative
-        ),
-    ]
-    lines.extend(
-        'export {}="{}"'.format(name, value)
-        for name, value in SELF_UPDATE_SUPPRESSION_ENV
-    )
-    lines.append("")
-    lines.extend(build_launcher_home_lines(config))
-    lines.extend([""])
-    lines.extend(build_launcher_preflight_lines())
-    lines.extend([""])
-    lines.extend(build_launcher_update_notice_lines(config.layout))
-    lines.extend([""])
-    lines.extend(build_launcher_reasonable_permissions_lines(config))
-    lines.extend(
-        [
-            "",
-            'exec "$local_claude_bin" "${default_claude_args[@]}" "${launcher_args[@]}"',
-            "",
-        ]
-    )
     return "\n".join(lines)
 
 
-def build_local_readme_content(config: Config) -> str:
+def build_cmd_shim(config: Config) -> str:
+    """Return `bin/claude-local.cmd`: an ASCII cmd shim (CRLF when written).
+
+    It has no labels, keeps `%*` on the final command line only, and exits
+    through `CMD_EXIT`, the TheKnowledge shim convention. The interpreter is
+    chosen by exit-code probe: the recorded interpreter, then `py -3`,
+    `python3`, and `python`.
+    """
+
+    layout = config.layout
+    depth = _parent_depth(layout.launcher_relative)
+    ups = "\\".join([".."] * depth) or "."
+    core_relative = _require_ascii(
+        ntpath.join(
+            *PurePosixPath(layout.local_dir_relative).parts, LAUNCH_CORE_FILENAME
+        ),
+        "Runtime root",
+    )
+    recorded = cmd_safe_python_path(config.launcher_python)
+    lines = [
+        "@echo off",
+        "rem {}".format(SCRIPT_MARKER),
+        "rem Generated by {}: starts this project's pinned native Claude Code".format(
+            SCRIPT_NAME
+        ),
+        "rem through the launcher core. Do not edit; rerun {} to regenerate.".format(
+            SCRIPT_NAME
+        ),
+        "rem",
+        "rem ASCII only, no labels, and the argument list appears only on the",
+        "rem final command line, so arguments such as x)y never break parsing.",
+        "rem The exit code passes through CMD_EXIT.",
+        "setlocal EnableExtensions DisableDelayedExpansion",
+        'set "NoDefaultCurrentDirectoryInExePath=1"',
+        'for %%I in ("%~dp0{}") do set "CLAUDE_LOCAL_REPO_ROOT=%%~fI"'.format(ups),
+        'set "CLAUDE_LOCAL_CORE=%CLAUDE_LOCAL_REPO_ROOT%\\{}"'.format(core_relative),
+        'set "CLAUDE_LOCAL_PROBE={}"'.format(PYTHON_PROBE_CMD),
+        'set "CLAUDE_LOCAL_PY="',
+        'set "CLAUDE_LOCAL_PYARG="',
+    ]
+    if recorded is not None:
+        lines.extend(
+            [
+                'if exist "{}" ('.format(recorded),
+                '  "{0}" -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+                'set "CLAUDE_LOCAL_PY={0}"'.format(recorded),
+                ")",
+            ]
+        )
+    lines.extend(
+        [
+            "if not defined CLAUDE_LOCAL_PY (",
+            '  py -3 -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && set "CLAUDE_LOCAL_PY=py" '
+            '&& set "CLAUDE_LOCAL_PYARG=-3"',
+            ")",
+            "if not defined CLAUDE_LOCAL_PY (",
+            '  python3 -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+            'set "CLAUDE_LOCAL_PY=python3"',
+            ")",
+            "if not defined CLAUDE_LOCAL_PY (",
+            '  python -I -c "%CLAUDE_LOCAL_PROBE%" 1>nul 2>nul && '
+            'set "CLAUDE_LOCAL_PY=python"',
+            ")",
+            "if not defined CLAUDE_LOCAL_PY (",
+            "  >&2 echo claude-local: no Python 3.9+ interpreter was found. Tried the "
+            "recorded interpreter, py -3, python3, and python.",
+            "  >&2 echo claude-local: Rerun {} to record one.".format(SCRIPT_NAME),
+            "  exit /b 127",
+            ")",
+            '"%CLAUDE_LOCAL_PY%" %CLAUDE_LOCAL_PYARG% -I "%CLAUDE_LOCAL_CORE%" %*',
+            'set "CMD_EXIT=%ERRORLEVEL%"',
+            "exit /b %CMD_EXIT%",
+            "",
+        ]
+    )
+    text = "\n".join(lines)
+    return _require_ascii(text, "cmd launcher content")
+
+
+def path_shim_relative_target(layout: Layout, cmd: bool) -> str:
+    """Return the launcher path relative to the PATH shim directory."""
+
+    shim_dir = posixpath.join(layout.local_dir_relative, PATH_SHIM_DIRNAME)
+    target = layout.launcher_cmd_relative if cmd else layout.launcher_relative
+    return posixpath.relpath(target, shim_dir)
+
+
+def build_path_shim_sh(config: Config) -> str:
+    """Return `<runtime root>/shim/claude`, a sh shim that re-enters the launcher.
+
+    The launcher core puts the shim directory first on PATH, so hooks,
+    scripts, `claude -p`, and background respawns run this project's pinned
+    binary with this project's environment instead of a global `claude`.
+    """
+
+    relative = path_shim_relative_target(config.layout, cmd=False)
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "# {}".format(SCRIPT_MARKER),
+            "# Nested `{}` calls re-enter this project's launcher; generated by".format(
+                PATH_SHIM_NAME
+            ),
+            "# {}. Do not edit.".format(SCRIPT_NAME),
+            'exec "$(dirname "$0")/{}" "$@"'.format(relative),
+            "",
+        ]
+    )
+
+
+def build_path_shim_cmd(config: Config) -> str:
+    """Return `<runtime root>/shim/claude.cmd`, re-entering the cmd launcher.
+
+    The final line hands control to the launcher shim without `call`, so
+    the arguments are not re-parsed and the launcher's own CMD_EXIT sets
+    the exit code.
+    """
+
+    relative = path_shim_relative_target(config.layout, cmd=True).replace("/", "\\")
+    text = "\n".join(
+        [
+            "@echo off",
+            "rem {}".format(SCRIPT_MARKER),
+            "rem Nested {} calls re-enter this project's launcher; generated by".format(
+                PATH_SHIM_NAME
+            ),
+            "rem {}. Do not edit.".format(SCRIPT_NAME),
+            '"%~dp0{}" %*'.format(relative),
+            "",
+        ]
+    )
+    return _require_ascii(text, "cmd PATH shim content")
+
+
+def _ring_lines(config: Config) -> List[str]:
+    """Return the README section describing the security rings per OS."""
+
+    layout = config.layout
+    home = layout.claude_home_relative
+    launcher = layout.launcher_relative
+    default_ring = "ring 0 (shared HOME)" if config.shared_home else "ring 1"
+    return [
+        "## Security Rings",
+        "",
+        "Agent work follows the project security ring model (see",
+        "`docs/specifications/security_ring_model.md` when present). This",
+        "project's launcher default is {}.".format(default_ring),
+        "",
+        "- Ring 3: agent-managed sandbox with an ephemeral HOME (default for",
+        "  build and test work; not available on native Windows).",
+        "- Ring 2: sandboxed, HOME=`{}` (not available on native".format(home),
+        "  Windows).",
+        "- Ring 1: unsandboxed, HOME=`{}`. On native Windows".format(home),
+        "  the launcher also points USERPROFILE, HOMEDRIVE/HOMEPATH, APPDATA,",
+        "  and LOCALAPPDATA there, because native programs ignore HOME.",
+        "- Ring 0: unsandboxed, real HOME. Last resort; run",
+        "  `{} --shared-home` or set `CLAUDE_LOCAL_SHARED_HOME=1` for".format(launcher),
+        "  one ring-0 session. `--isolated-home` forces ring 1.",
+        "",
+        "`CLAUDE_CONFIG_DIR` stays pinned to `{}` at every".format(
+            layout.config_dir_relative
+        ),
+        "ring, so escalation never forks Claude auth or session history.",
+        "",
+        "Native Windows: Claude Code has no sandbox there, so the commands it",
+        "runs are unsandboxed. Isolation covers Claude's state and the",
+        "redirected-home tools, not per-user Windows stores (Credential",
+        "Manager, the registry, `HKCU\\SOFTWARE\\Policies`). Use WSL2 or a",
+        "separate Windows account for work that needs ring 3. The launcher",
+        "prints this note once per session; it is currently {}.".format(
+            "on" if config.windows_sandbox_warning else "off"
+        ),
+        "Change it with `{} --set-windows-sandbox-warning on|off .`.".format(
+            SCRIPT_NAME
+        ),
+        "",
+    ]
+
+
+def build_local_readme_content(config: Config, *, legacy_pending: bool = False) -> str:
     """Build the generated project-local operator README."""
 
+    layout = config.layout
+    launcher = layout.launcher_relative
+    cmd_launcher = layout.launcher_cmd_relative.replace("/", "\\")
     lines = [
         README_MARKER,
         "# Local Claude Code Start Guide",
@@ -438,183 +558,194 @@ def build_local_readme_content(config: Config) -> str:
         ),
         "It is ignored on purpose and should not be committed.",
         "",
-        "## Managed Paths",
-        "",
-        "- Local install: `{}`".format(config.layout.local_dir_relative),
-        "- Local Claude HOME (rings 1-2): `{}`".format(
-            config.layout.claude_home_relative
-        ),
-        "- Pinned CLAUDE_CONFIG_DIR: `{}`".format(config.layout.config_dir_relative),
-        "- Launcher: `{}`".format(config.layout.launcher_relative),
-        "- This README: `{}`".format(config.layout.readme_relative),
-        "",
-        "## Installed Version",
-        "",
-        "- Channel: `{}`".format(config.claude_channel or "unknown"),
-        "- Requested version: `{}`".format(config.claude_selector),
-        "- Resolved Claude Code version: `{}`".format(config.claude_version),
-        "- Version source: `{}`".format(config.version_source),
-        "- HOME mode: `{}`".format(
-            "shared user HOME" if config.shared_home else "project-local isolated HOME"
-        ),
-        "- Reasonable permissions default: `{}`".format(
-            "enabled" if config.reasonable_permissions_enabled else "disabled"
-        ),
-        "- Known stable version: `{}`".format(
-            config.available_versions.get("stable") or "unavailable"
-        ),
-        "- Known latest version: `{}`".format(
-            config.available_versions.get("latest") or "unavailable"
-        ),
-        "- Known next version: `{}`".format(
-            config.available_versions.get("next") or "unavailable"
-        ),
-        "",
-        "## Start Claude Code",
-        "",
-        "```bash",
-        "./{}".format(config.layout.launcher_relative),
-        "```",
-        "",
-        "## Security Rings",
-        "",
-        "Agent work follows the project security ring model (see",
-        "`docs/specifications/security_ring_model.md` when present):",
-        "",
-        "- Ring 3: agent-managed sandbox, ephemeral sandbox HOME (default",
-        "  for build and test work).",
-        "- Ring 2: sandboxed, HOME=`{}`.".format(config.layout.claude_home_relative),
-        "- Ring 1: unsandboxed, HOME=`{}`. The launcher".format(
-            config.layout.claude_home_relative
-        ),
-        "  starts sessions here by default.",
-        "- Ring 0: unsandboxed, real HOME. Last resort; use",
-        "  `./{} --shared-home` or".format(config.layout.launcher_relative),
-        "  `CLAUDE_LOCAL_SHARED_HOME=1` for one ring-0 session.",
-        "",
-        "`CLAUDE_CONFIG_DIR` stays pinned to `{}` at every".format(
-            config.layout.config_dir_relative
-        ),
-        "ring, so escalation never forks Claude auth or session history.",
-        "",
-        "## Managed Permission Default",
-        "",
-        "The launcher can store one opt-in reasonable-permissions default.",
-        "Current state: `{}`.".format(
-            "enabled" if config.reasonable_permissions_enabled else "disabled"
-        ),
-        "",
-        "When enabled, the wrapper adds `--permission-mode acceptEdits` only",
-        "when you did not already provide an explicit permission choice.",
-        "This keeps ordinary workspace edits flowing while Bash commands and",
-        "ACP operations such as commit and push still prompt for approval.",
-        "",
-        "Explicit `--permission-mode` and `--dangerously-skip-permissions`",
-        "always win. The wrapper never injects",
-        "`--dangerously-skip-permissions`.",
-        "",
-        "## Launcher Preflight",
-        "",
-        "The launcher runs a cheap runtime preflight before it starts Claude",
-        "Code. By default it warns when the project declares a checked-in",
-        "Node.js selector but the active shell appears inconsistent with it.",
-        "",
-        "Use one of these modes when needed:",
-        "",
-        "- `CLAUDE_LOCAL_PREFLIGHT=warn`",
-        "- `CLAUDE_LOCAL_PREFLIGHT=strict`",
-        "- `CLAUDE_LOCAL_PREFLIGHT=off`",
-        "",
-        "## Resume Claude Code",
-        "",
-        "```bash",
-        "./{} --continue".format(config.layout.launcher_relative),
-        "./{} --resume".format(config.layout.launcher_relative),
-        "```",
-        "",
-        "## Audit",
-        "",
-        "```bash",
-        "NPM_CONFIG_CACHE=./{}/.npm-cache npm audit --prefix ./{}".format(
-            config.layout.local_dir_relative,
-            config.layout.local_dir_relative,
-        ),
-        "```",
-        "",
-        "## Inspect Managed State",
-        "",
-        "```bash",
-        "{} --inspect .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Self-Test Managed State",
-        "",
-        "```bash",
-        "{} --selftest .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Refresh Known Versions",
-        "",
-        "```bash",
-        "{} --update .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Upgrade To Latest Known Channel Version",
-        "",
-        "```bash",
-        "{} --upgrade --channel stable .".format(SCRIPT_NAME),
-        "{} --upgrade --channel latest .".format(SCRIPT_NAME),
-        "{} --upgrade --channel next .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Upgrade To One Explicit Version",
-        "",
-        "```bash",
-        "{} --upgrade --channel stable --version 2.1.153 .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Toggle Managed Permission Defaults",
-        "",
-        "```bash",
-        "{} --set-reasonable-permissions .".format(SCRIPT_NAME),
-        "{} --clear-reasonable-permissions .".format(SCRIPT_NAME),
-        "```",
-        "",
-        "## Uninstall Managed Setup",
-        "",
-        "```bash",
-        "{} --uninstall .".format(SCRIPT_NAME),
-        "```",
+        "This project runs a pinned native Claude Code release that",
+        "`{}` downloaded from Anthropic's release distribution and".format(SCRIPT_NAME),
+        "verified against signed manifests. Node.js and npm are not used.",
         "",
     ]
+    if legacy_pending:
+        lines.extend(
+            [
+                "**Migration pending:** this project still runs the Claude Code",
+                "binary from its npm-era layout. Run `{} .` (or".format(SCRIPT_NAME),
+                "`--upgrade` / `--repair-install`) to move it to the native runtime.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Start Claude Code",
+            "",
+            "macOS, Linux, WSL, and Git Bash:",
+            "",
+            "```sh",
+            "./{}".format(launcher),
+            "./{} --continue".format(launcher),
+            "./{} --resume".format(launcher),
+            "```",
+            "",
+            "Windows cmd.exe and PowerShell (both run `{}`):".format(cmd_launcher),
+            "",
+            "```bat",
+            ".\\{}".format(launcher.replace("/", "\\")),
+            "```",
+            "",
+            "The launchers need a Python 3.9+ interpreter (the one that ran",
+            "`{}` is recorded; `py -3`, `python3`, and `python` are".format(
+                SCRIPT_NAME
+            ),
+            "fallbacks). They never fall back to a global `claude`.",
+            "",
+            "## Managed Paths",
+            "",
+            "- Runtime root (A/B slots, launcher core): `{}`".format(
+                layout.local_dir_relative
+            ),
+            "- Local Claude HOME (rings 1-2): `{}`".format(layout.claude_home_relative),
+            "- Pinned CLAUDE_CONFIG_DIR: `{}`".format(layout.config_dir_relative),
+            "- Launchers: `{}` and `{}`".format(launcher, layout.launcher_cmd_relative),
+            "- This README: `{}`".format(layout.readme_relative),
+            "",
+            "## Installed Version",
+            "",
+            "- Channel: `{}`".format(config.claude_channel or "unknown"),
+            "- Requested version: `{}`".format(config.claude_selector),
+            "- Installed Claude Code version: `{}`".format(
+                config.claude_version or "not installed"
+            ),
+            "- Version source: `{}`".format(config.version_source),
+            "- HOME mode: `{}`".format(
+                "shared user HOME"
+                if config.shared_home
+                else "project-local isolated HOME"
+            ),
+            "- Reasonable permissions default: `{}`".format(
+                "enabled" if config.reasonable_permissions_enabled else "disabled"
+            ),
+            "- Update checks: `{}`".format("on" if config.update_checks else "off"),
+            "- Known stable version: `{}`".format(
+                config.available_versions.get("stable") or "unavailable"
+            ),
+            "- Known latest version: `{}`".format(
+                config.available_versions.get("latest") or "unavailable"
+            ),
+            "",
+        ]
+    )
+    lines.extend(_ring_lines(config))
+    lines.extend(
+        [
+            "## Updates Are Managed Here",
+            "",
+            "Claude Code's own updater is disabled in three layers (environment,",
+            "`--settings`, and `{}/settings.json`).".format(layout.config_dir_relative),
+            "`claude update`, `claude upgrade`, and `claude install` are",
+            "intercepted by the launcher. If Claude Code itself says updates are",
+            'disabled and to "contact your administrator", that message is',
+            "misleading here: this project's runtime is managed by",
+            "`{}`; use the commands below instead.".format(SCRIPT_NAME),
+            "",
+            "```sh",
+            "{} --update .                       # refresh known versions".format(
+                SCRIPT_NAME
+            ),
+            "{} --upgrade --channel stable .     # install current stable".format(
+                SCRIPT_NAME
+            ),
+            "{} --upgrade --channel latest .     # install current latest".format(
+                SCRIPT_NAME
+            ),
+            "{} --upgrade --channel stable --version {} .".format(
+                SCRIPT_NAME, VERSION_FLOOR
+            ),
+            "{} --rollback .                     # switch to the previous slot".format(
+                SCRIPT_NAME
+            ),
+            "{} --repair-install .               # re-verify and repair".format(
+                SCRIPT_NAME
+            ),
+            "./{} --check-updates              # check now and print the result".format(
+                launcher
+            ),
+            "```",
+            "",
+            "The launcher prints a one-line notice when a newer release exists on",
+            "the installed channel; nothing installs automatically. A release that",
+            "only the unsigned channel pointer names is marked unverified until",
+            "`{} --update` or `--upgrade` checks its signed manifest. Turn".format(
+                SCRIPT_NAME
+            ),
+            "the checks off with `{} --set-update-checks off .`.".format(SCRIPT_NAME),
+            "",
+            "Each project keeps at most two releases: the active slot and the",
+            "rollback slot. If the active slot is damaged, the launcher warns and",
+            "runs the other slot; `--repair-install` fixes the runtime.",
+            "",
+            "## Managed Permission Default",
+            "",
+            "The launcher can store one opt-in reasonable-permissions default.",
+            "Current state: `{}`.".format(
+                "enabled" if config.reasonable_permissions_enabled else "disabled"
+            ),
+            "",
+            "When enabled, the wrapper adds `--permission-mode acceptEdits` only",
+            "when you did not already provide an explicit permission choice.",
+            "This keeps ordinary workspace edits flowing while Bash commands and",
+            "ACP operations such as commit and push still prompt for approval.",
+            "",
+            "Explicit `--permission-mode` and `--dangerously-skip-permissions`",
+            "always win. The wrapper never injects",
+            "`--dangerously-skip-permissions`.",
+            "",
+            "```sh",
+            "{} --set-reasonable-permissions .".format(SCRIPT_NAME),
+            "{} --clear-reasonable-permissions .".format(SCRIPT_NAME),
+            "```",
+            "",
+            "## Launcher Preflight",
+            "",
+            "Claude Code does not need Node.js. When the project declares a",
+            "checked-in Node.js selector (`.nvmrc`, `.node-version`, or",
+            "`.tool-versions`), the launcher warns if the `node` on PATH does not",
+            "match it, because project tooling started from Claude Code may.",
+            "",
+            "- `CLAUDE_LOCAL_PREFLIGHT=warn` (default)",
+            "- `CLAUDE_LOCAL_PREFLIGHT=strict` (refuse on an explicit mismatch)",
+            "- `CLAUDE_LOCAL_PREFLIGHT=off`",
+            "",
+            "## Inspect and Self-Test",
+            "",
+            "```sh",
+            "{} --inspect .".format(SCRIPT_NAME),
+            "{} --selftest .".format(SCRIPT_NAME),
+            "```",
+            "",
+            "## Uninstall Managed Setup",
+            "",
+            "```sh",
+            "{} --uninstall .".format(SCRIPT_NAME),
+            "```",
+            "",
+            "Uninstall refuses while anything runs from the runtime;",
+            "`--stop-background-sessions` stops the project's background service",
+            "first (this also ends its background sessions).",
+            "",
+            "## Older claude-wrangler Releases",
+            "",
+            "After a project moves to the native runtime, use an npm-era",
+            "claude-wrangler release only for `--uninstall` (it may need",
+            "`--force`). Its other operations would rewrite this launcher into",
+            "the old Node-based form.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
-def local_package_json_looks_managed(content: str) -> bool:
-    """Return True when package.json content matches the managed shape."""
+def build_install_summary(config: Config, runtime_summary: str) -> str:
+    """Return the operator summary shown after install-like operations."""
 
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
-        return False
-
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("name") != LOCAL_PACKAGE_NAME:
-        return False
-    if payload.get("private") is not True:
-        return False
-
-    dev_dependencies = payload.get("devDependencies")
-    if not isinstance(dev_dependencies, dict):
-        return False
-    version = dev_dependencies.get(CLAUDE_PACKAGE_NAME)
-    return isinstance(version, str) and bool(version)
-
-
-def build_install_summary(config: Config) -> str:
-    """Return the operator summary shown after install and upgrade operations."""
-
+    layout = config.layout
     lines = [
         "Operation complete.",
         "",
@@ -622,97 +753,67 @@ def build_install_summary(config: Config) -> str:
         "Operation: {}".format(config.operation),
         "Channel: {}".format(config.claude_channel or "unknown"),
         "Requested version: {}".format(config.claude_selector),
-        "Resolved Claude Code version: {}".format(config.claude_version),
+        "Installed Claude Code version: {}".format(
+            config.claude_version or "not installed"
+        ),
         "Version source: {}".format(config.version_source),
-        "Local package manifest: {}".format(config.layout.local_package_json_path),
-        "Metadata file: {}".format(config.layout.metadata_path),
-        "Launcher: {}".format(config.layout.launcher_path),
-        "Local README: {}".format(config.layout.readme_path),
+        "Runtime: {}".format(runtime_summary),
+        "Runtime root: {}".format(layout.local_dir),
+        "Metadata file: {}".format(layout.metadata_path),
+        "Launchers: {} and {}".format(layout.launcher_path, layout.launcher_cmd_path),
+        "Local README: {}".format(layout.readme_path),
         "Reasonable permissions default: {}".format(
             "enabled" if config.reasonable_permissions_enabled else "disabled"
         ),
         "HOME mode: {}".format(
             "shared user HOME" if config.shared_home else "project-local isolated HOME"
         ),
-        "Pinned CLAUDE_CONFIG_DIR: {}".format(config.layout.config_dir),
-        "Package install: {}".format(
-            "unchanged existing managed install"
-            if config.reconfigure_only
-            else (
-                "skipped by request"
-                if config.skip_install
-                else (
-                    "repair cleanup plus npm install required"
-                    if config.repair_install and config.dry_run
-                    else (
-                        "repair cleanup plus npm install completed"
-                        if config.repair_install
-                        else (
-                            "npm install required"
-                            if config.dry_run
-                            else "npm install completed"
-                        )
-                    )
-                )
-            )
-        ),
+        "Pinned CLAUDE_CONFIG_DIR: {}".format(layout.config_dir),
         "",
         "Recommended usage:",
-        "  {}".format(config.layout.launcher_path),
-        "  {} --continue".format(config.layout.launcher_path),
-        "  {} --resume".format(config.layout.launcher_path),
-        "",
-        "Audit command:",
-        "  NPM_CONFIG_CACHE={}/.npm-cache npm audit --prefix {}".format(
-            config.layout.local_dir,
-            config.layout.local_dir,
-        ),
+        "  {}".format(layout.launcher_path),
+        "  {} --continue".format(layout.launcher_path),
+        "  {} --resume".format(layout.launcher_path),
     ]
     return "\n".join(lines)
 
 
 def build_available_versions_table(
     available_versions: Dict[str, Optional[str]],
+    details: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
     """Render the known channel versions as a simple fixed-width table."""
 
-    rows = [("Channel", "Dist-tag", "Known version")]
-    rows.extend(
-        (
-            channel,
-            CHANNEL_TO_SELECTOR[channel],
-            available_versions.get(channel) or "unavailable",
-        )
-        for channel in CLAUDE_CHANNELS
-    )
-    widths = [
-        max(len(str(row[column_index])) for row in rows)
-        for column_index in range(len(rows[0]))
-    ]
-    rendered_rows = []
-    for row_index, row in enumerate(rows):
-        rendered_rows.append(
-            "  ".join(
-                str(value).ljust(widths[column_index])
-                for column_index, value in enumerate(row)
+    details = details or {}
+    rows: List[Tuple[str, str, str]] = [("Channel", "Known version", "Build date")]
+    for channel in CLAUDE_CHANNELS:
+        entry = details.get(channel) or {}
+        rows.append(
+            (
+                channel,
+                available_versions.get(channel) or "unavailable",
+                str(entry.get("build_date") or "-"),
             )
+        )
+    widths = [max(len(row[index]) for row in rows) for index in range(3)]
+    rendered = []
+    for row_index, row in enumerate(rows):
+        rendered.append(
+            "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
         )
         if row_index == 0:
-            rendered_rows.append(
-                "  ".join("-" * widths[column_index] for column_index in range(3))
-            )
-    return "\n".join(rendered_rows)
+            rendered.append("  ".join("-" * width for width in widths))
+    return "\n".join(line.rstrip() for line in rendered)
 
 
-def build_known_versions(
-    available_versions: Dict[str, Optional[str]],
-    available_versions_updated_at: Optional[str],
-) -> Dict[str, Any]:
+def build_known_versions(config: Config) -> Dict[str, Any]:
     """Return the install-channel defaults and locally known versions."""
 
     return {
         "default_install_selector": DEFAULT_INSTALL_CLAUDE_SELECTOR,
-        "channel_dist_tags": dict(CHANNEL_TO_SELECTOR),
-        "available_versions": dict(available_versions),
-        "available_versions_updated_at": available_versions_updated_at,
+        "channels": list(CLAUDE_CHANNELS),
+        "available_versions": dict(config.available_versions),
+        "available_versions_updated_at": config.available_versions_updated_at,
+        "available_version_details": dict(config.available_version_details),
+        "last_update_check": config.last_update_check,
     }

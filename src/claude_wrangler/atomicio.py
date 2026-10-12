@@ -184,17 +184,21 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: Optional[int] = None) -
 
 
 def normalize_newlines(text: str, newline: str = "\n") -> str:
-    """Return ``text`` with every LF or CRLF line ending set to ``newline``.
+    """Return ``text`` with every CRLF, lone CR, or LF line break set to ``newline``.
 
-    Existing CRLF pairs are folded to LF first so CRLF input never becomes
-    CR CR LF. A lone CR is not a line ending here and is left unchanged.
+    This is the single newline policy for every file claude-wrangler writes
+    (``filesystem.normalize_newlines`` delegates here). Existing CRLF pairs
+    are folded first so CRLF input never becomes CR CR LF, and a lone CR is
+    treated as a line break too, so the bytes on disk follow exactly one
+    convention: a stray CR can never reach a POSIX shell script (where it
+    becomes part of a command word) or a cmd batch file.
     """
 
     if newline not in ALLOWED_NEWLINES:
         raise ValueError(
             "newline must be one of {!r}, not {!r}".format(ALLOWED_NEWLINES, newline)
         )
-    folded = text.replace("\r\n", "\n")
+    folded = text.replace("\r\n", "\n").replace("\r", "\n")
     if newline == "\n":
         return folded
     return folded.replace("\n", newline)

@@ -1,26 +1,35 @@
-"""Small runtime helpers for process execution and operator output."""
+"""Small runtime helpers for bounded process execution and operator output."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
-import shutil
 import subprocess
 import sys
-from typing import Mapping, Optional, Sequence, Tuple
+import tempfile
+from typing import Mapping, Optional, Sequence
 
 from .models import ClaudeWranglerError
+
+# Upper bound on captured output per stream; `--help` is a few kilobytes.
+MAX_CAPTURED_BYTES = 1024 * 1024
+
+
+def format_utc(moment: datetime) -> str:
+    """Render an aware datetime as an ISO 8601 UTC timestamp ending in Z."""
+
+    return (
+        moment.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def utc_now_iso() -> str:
     """Return a UTC timestamp suitable for JSON metadata and reports."""
 
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return format_utc(datetime.now(timezone.utc))
 
 
 def eprint(message: str) -> None:
@@ -29,67 +38,58 @@ def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def detect_npm_binaries() -> Tuple[str, str]:
-    """Return platform-correct executable names for npm and npx."""
+@dataclass(frozen=True)
+class CompletedRun:
+    """Outcome of one bounded child process."""
 
-    if os.name == "nt":
-        return "npm.cmd", "npx.cmd"
-    return "npm", "npx"
-
-
-def ensure_command_exists(name: str) -> None:
-    """Raise a clear error when a required external command is missing."""
-
-    if shutil.which(name) is None:
-        raise ClaudeWranglerError(
-            "Required command {!r} was not found in PATH. Install Node.js/npm "
-            "first and rerun this script.".format(name)
-        )
+    command: Sequence[str]
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool = False
 
 
-def run_command(
+def run_bounded(
     command: Sequence[str],
+    *,
+    env: Mapping[str, str],
     cwd: str,
-    capture_output: bool = False,
-    env: Optional[Mapping[str, str]] = None,
-    timeout_seconds: Optional[int] = None,
-) -> subprocess.CompletedProcess:
-    """Run a subprocess with explicit error reporting."""
+    timeout_seconds: float,
+) -> CompletedRun:
+    """Run a command with stdin closed, captured output, and a hard timeout.
 
-    if env is not None and "NPM_CONFIG_CACHE" in env:
-        eprint(
-            "[claude-wrangler] Environment: NPM_CONFIG_CACHE={}".format(
-                env["NPM_CONFIG_CACHE"]
+    Output goes to temporary files rather than pipes so a detached
+    grandchild that inherits the handles cannot stall the wait. On timeout
+    the process is killed and `timed_out` is set. A command that cannot
+    start raises `ClaudeWranglerError`.
+    """
+
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        try:
+            process = subprocess.Popen(
+                list(command),
+                cwd=cwd,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
             )
-        )
-    eprint("[claude-wrangler] Running: {}".format(" ".join(command)))
-    if timeout_seconds is not None:
-        eprint("[claude-wrangler] Timeout: {}s".format(timeout_seconds))
-    try:
-        completed = subprocess.run(
-            list(command),
-            cwd=cwd,
-            check=False,
-            capture_output=capture_output,
-            env=dict(env) if env is not None else None,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ClaudeWranglerError(
-            "Command timed out after {}s: {}".format(
-                timeout_seconds,
-                " ".join(command),
-            )
-        ) from exc
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() if completed.stderr else ""
-        detail = "\n{}".format(stderr) if stderr else ""
-        raise ClaudeWranglerError(
-            "Command failed with exit code {}: {}{}".format(
-                completed.returncode,
-                " ".join(command),
-                detail,
-            )
-        )
-    return completed
+        except OSError as exc:
+            raise ClaudeWranglerError(
+                "Cannot run {}: {}".format(command[0] if command else "?", exc)
+            ) from exc
+        timed_out = False
+        try:
+            returncode: Optional[int] = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            try:
+                returncode = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                returncode = None
+        out_file.seek(0)
+        err_file.seek(0)
+        stdout = out_file.read(MAX_CAPTURED_BYTES).decode("utf-8", "replace")
+        stderr = err_file.read(MAX_CAPTURED_BYTES).decode("utf-8", "replace")
+    return CompletedRun(list(command), returncode, stdout, stderr, timed_out)
