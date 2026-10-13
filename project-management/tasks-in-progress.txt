@@ -15,5 +15,6 @@ specifications (2037f53), native foundations and Windows entry points
 entry-point, launcher, and isolation review with its fixes (7995740),
 inherited credentials removed by default, the live end-to-end and
 Windows Sandbox verification, and the automatic root fetch on fresh
-Windows (see completed-tasks.txt). Next: merge and push, held by the
+Windows (see completed-tasks.txt). The branch was pushed on operator
+request (2026-10-12T21:14:52-07:00). Next: merge to trunk, held by the
 operator. Owner: AI (Claude) with operator.
