@@ -4,6 +4,16 @@ Record completed tasks with newest entries at the top. Use asterisk-plus-blank
 line formatting. Include concise outcomes, owners, blocker resolution notes,
 and ISO 8601 timestamps.
 
+* Windows Sandbox testing guide (operator request
+  2026-10-12T21:09:00-07:00). `docs/testing/windows_sandbox.md` records
+  how to run a self-closing fresh-Windows test, the upstream defect
+  (microsoft/Windows-Sandbox#103 and #128) that leaves only the first
+  launch after a boot usable on this host, confirmed after a reboot with
+  a bare configuration, how to recognize it in the RDP client log, and
+  the root-certificate and update-suppression findings. The sandbox run
+  of the automatic root fetch remains unverified. Owner: AI (Claude).
+  Completed 2026-10-12T21:12:00-07:00.
+
 * Automatic root fetch on fresh Windows, and the nested-call decision
   (`feature/windows-platform-support`, operator decisions
   2026-10-12T20:00:00-07:00). On "unable to get local issuer

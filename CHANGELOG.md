@@ -139,6 +139,11 @@ where practical.
   `--update`, `--rollback`, the settings toggles, and `--skip-install`
   proceed when git tracks managed runtime, session-state, or launcher
   files.
+- `docs/testing/windows_sandbox.md`, a guide to testing on a fresh
+  Windows with Windows Sandbox: how to run a self-closing test, the
+  upstream defect that leaves only the first launch after a boot usable
+  (with how to recognize it), and what the sandbox showed about root
+  certificates and Claude Code's update suppression.
 
 ### Changed
 

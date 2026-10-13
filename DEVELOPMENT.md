@@ -164,6 +164,10 @@ Specifications and tests:
   `prerequisites_and_platform_entry_points.md`, and
   `security_ring_model.md`. `bounded_managed_npm_operations.md` is
   superseded and kept for history.
+- `docs/testing/`
+  Manual test guides. `windows_sandbox.md` covers using Windows Sandbox
+  as a disposable fresh Windows, its once-per-boot launch defect, and
+  what it showed about root certificates and update suppression.
 - `tests/`
   Focused tests per module, plus real shim execution through cmd,
   PowerShell, Git Bash, and `sh`; Windows entry-point tests that run
@@ -371,6 +375,10 @@ The tests stay offline and light on external side effects:
   bytes and evidence do not), for tests of state a repository could
   supply. Fake services report no git-tracked files unless a test passes
   `tracked_files=services.list_tracked_files` to use real git.
+- Checks that need a never-used Windows, or that run Claude Code's own
+  updater, belong in a disposable VM, never the real profile. See
+  `docs/testing/windows_sandbox.md`, including why only the first
+  Windows Sandbox launch after a boot can be relied on.
 
 ## Line Endings
 
