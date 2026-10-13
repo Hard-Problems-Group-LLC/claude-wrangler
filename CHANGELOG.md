@@ -234,13 +234,16 @@ where practical.
 - `--selftest` no longer says "the npm-era layout still needs
   migration" on the passing `migration_not_pending` line of a project
   with nothing to migrate.
-- On a newly installed Windows, a download that fails with "unable to
-  get local issuer certificate" now explains the cause (Python trusts
-  only roots Windows has already fetched) and names the one PowerShell
-  request that makes Windows fetch the missing root, instead of only
-  suggesting a TLS-inspecting proxy. Found in Windows Sandbox, where
-  `downloads.claude.ai`'s GlobalSign root was absent until such a
-  request.
+- On a newly installed Windows, downloads no longer fail with "unable
+  to get local issuer certificate" because Windows has not fetched
+  `downloads.claude.ai`'s root yet (Python trusts only roots Windows
+  already holds, and Windows fetches most on first use through its own
+  TLS). claude-wrangler now makes one Windows PowerShell request to the
+  same URL, reloads the store, and retries once per host, only on that
+  failure and only with the Windows store (no `--ca-bundle` or
+  `SSL_CERT_FILE`). When that cannot run or does not help, the error
+  explains the cause and names the manual request, instead of only
+  suggesting a TLS-inspecting proxy. Found in Windows Sandbox.
 - The generated `bin/claude-local` launcher now exports
   `DISABLE_UPDATES=1`, `DISABLE_AUTOUPDATER=1`, and
   `DISABLE_INSTALLATION_CHECKS=1`. Claude Code's self-updater targets

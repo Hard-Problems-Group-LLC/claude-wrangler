@@ -4,6 +4,29 @@ Record completed tasks with newest entries at the top. Use asterisk-plus-blank
 line formatting. Include concise outcomes, owners, blocker resolution notes,
 and ISO 8601 timestamps.
 
+* Automatic root fetch on fresh Windows, and the nested-call decision
+  (`feature/windows-platform-support`, operator decisions
+  2026-10-12T20:00:00-07:00). On "unable to get local issuer
+  certificate" with the Windows store (no `--ca-bundle` or
+  `SSL_CERT_FILE`), the fetcher now makes one Windows PowerShell HEAD
+  request to the same URL (`powershell.exe` from the system directory,
+  URL passed through the environment), reloads the store, and retries
+  once per host; the error says why when that cannot run or does not
+  help. Nested calls keep the current design: an updater re-enabled by a
+  repo's `.claude/settings.json` writes only into the project's
+  redirected home, the launcher warns at startup, and the README
+  documents it; the backlog entry is closed. Unit tests cover the retry,
+  once-per-host, the cannot-run and still-failing messages, the
+  PowerShell argument and environment shape, and trust reload, plus a
+  Windows-only test running the real PowerShell against a closed port.
+  A host check (homes redirected) forced one fresh-Windows failure and
+  then ran the real PowerShell request, reload, and retry against
+  downloads.claude.ai; it caught that a caught request error still made
+  `-Command` exit 1 (read as "could not run"), fixed with an explicit
+  `exit 0`. A fresh-sandbox run of the real fetch did not happen: two
+  launches (20:06 and 20:14) never reached logon, even with the host
+  unlocked. Owner: AI (Claude). Completed 2026-10-12T20:22:00-07:00.
+
 * Live end-to-end and Windows Sandbox verification
   (`feature/windows-platform-support`, operator-approved downloads
   2026-10-12T13:15:00-07:00). A scratch-only harness drove the

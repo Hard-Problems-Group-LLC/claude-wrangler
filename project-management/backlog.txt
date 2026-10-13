@@ -12,33 +12,6 @@ All were added 2026-10-12T03:37:00-07:00. Requestor: operator. Owner: AI
 
 *
 
-Fetch a missing Windows root certificate automatically (Windows Sandbox
-finding, added 2026-10-12T14:20:00-07:00). On a fresh Windows, Python's
-`ssl` failed for downloads.claude.ai ("unable to get local issuer
-certificate") until one PowerShell `Invoke-WebRequest` made Windows
-fetch GlobalSign Root CA; the error message now says so. Option: on
-that exact failure on Windows, with no `--ca-bundle` or SSL_CERT_FILE,
-run that one request (or build the chain through CryptoAPI) and retry
-once. It only asks Windows to apply its own root program, but it spawns
-PowerShell, which some policies block. Blockers: operator decision.
-
-*
-
-Warn when nested calls on Windows can update Claude Code (Windows
-Sandbox finding, added 2026-10-12T14:20:00-07:00). A project
-`.claude/settings.json` whose `env` blanks DISABLE_UPDATES and friends
-beats the process environment and the config-dir settings, so a nested
-`claude update` (which reaches the slot's claude.exe without the
-launcher's `--settings`) ran the updater; it installed into the
-project's redirected HOME and left the slots and the real profile
-alone. The launcher already warns at session start when project
-settings override the suppression keys; consider refusing to put the
-slot directory on PATH in that case, so nested calls go through the
-launcher. Blockers: operator decision (ties to the nested-calls
-decision).
-
-*
-
 GitHub release-archive transport. Add Anthropic's GitHub release
 archives as an alternative transport for networks that block
 `downloads.claude.ai`, chosen explicitly and never as a silent fallback.

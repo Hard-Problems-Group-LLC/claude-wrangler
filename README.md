@@ -604,11 +604,15 @@ the signed size and SHA-256 exactly.
 - Newly installed Windows: Python trusts only the root certificates
   Windows has already downloaded, and a fresh Windows fetches most
   roots on first use. Until some Windows program has reached
-  `downloads.claude.ai`, a download can fail with "unable to get local
-  issuer certificate". The error then names the fix: one request
-  through Windows' own TLS, such as
-  `powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing https://downloads.claude.ai/claude-code-releases/stable | Out-Null"`,
-  after which the command works.
+  `downloads.claude.ai`, Python's verification fails with "unable to
+  get local issuer certificate". On that failure, with the Windows
+  store in use (no `--ca-bundle` or `SSL_CERT_FILE`), claude-wrangler
+  says so, makes one request through Windows' own TLS (a Windows
+  PowerShell `Invoke-WebRequest -Method Head` to the same URL, from the
+  system directory, never from `PATH`), reloads the store, and retries
+  once per host. If PowerShell is blocked or the root still does not
+  arrive, the error says which, and names the manual request:
+  `powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing https://downloads.claude.ai/claude-code-releases/stable | Out-Null"`.
 - Mirrors: `--release-base-url <https URL>` points at a mirror of the
   release distribution. Its host joins the allowlist, and the launcher's
   update checks use it too. Signatures are still checked against the

@@ -14,6 +14,12 @@ verifies TLS against the system store, an explicit CA bundle, or
 ``SSL_CERT_FILE``, honors ``HTTPS_PROXY``/``NO_PROXY`` through urllib's
 ``ProxyHandler``, and never follows a redirect on its own.
 
+A newly installed Windows downloads most root certificates on first use
+through its own TLS stack, which Python's ``ssl`` does not trigger. When
+verification fails for want of an issuer on Windows with the system
+store, the fetcher asks Windows to fetch that root (one PowerShell
+request to the same URL) and retries once per host.
+
 This module is on the bootstrap path, so it stays standard-library-only
 and Python 3.9 compatible.
 """
@@ -29,6 +35,7 @@ import re
 import socket
 import ssl
 import stat
+import subprocess
 import sys
 import time
 from typing import (
@@ -61,6 +68,23 @@ BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 8.0
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 ISSUER_PROBE_TIMEOUT_SECONDS = 10.0
+MISSING_ISSUER = "unable to get local issuer"
+ROOT_FETCH_URL_VARIABLE = "CLAUDE_WRANGLER_ROOT_FETCH_URL"
+# PowerShell reads the URL from the environment, so it is never parsed as
+# code, and the script uses no double quotes, so Windows command-line
+# quoting cannot split it. Request errors are ignored: the TLS handshake
+# alone makes Windows fetch the root, and the caller's retry decides
+# whether it worked. The explicit exit 0 matters: a caught error still
+# makes ``-Command`` exit 1, which would read as "PowerShell could not
+# run" and skip the retry.
+ROOT_FETCH_SCRIPT = (
+    "$ProgressPreference = 'SilentlyContinue'; "
+    "[Net.ServicePointManager]::SecurityProtocol = "
+    "[Net.ServicePointManager]::SecurityProtocol -bor "
+    "[Net.SecurityProtocolType]::Tls12; "
+    "try {{ Invoke-WebRequest -UseBasicParsing -Method Head -TimeoutSec {timeout} "
+    "-Uri $env:" + ROOT_FETCH_URL_VARIABLE + " | Out-Null }} catch {{ }}; exit 0"
+)
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)")
@@ -164,7 +188,10 @@ class Transport(Protocol):
     exception types may come out of ``TransportResponse.read``.
 
     A transport may also provide ``presented_issuer(url) -> str | None``,
-    used only to name the certificate issuer in TLS error messages.
+    used only to name the certificate issuer in TLS error messages, and a
+    true ``fetches_missing_roots`` with ``fetch_missing_root(url,
+    timeout_seconds) -> str | None``, used once per host when verification
+    fails for want of an issuer (None means retry; a string is why not).
     """
 
     def open(
@@ -320,6 +347,9 @@ def describe_tls_failure(
     issuer: Optional[str] = None,
     platform: Optional[str] = None,
     url: Optional[str] = None,
+    *,
+    root_fetch_ran: bool = False,
+    root_fetch_problem: Optional[str] = None,
 ) -> str:
     """Return the operator-facing message for a TLS verification failure.
 
@@ -328,6 +358,8 @@ def describe_tls_failure(
     on first use through its own TLS stack. A missing issuer there usually
     means no Windows program has reached that host yet, so the message
     names the one request that makes Windows fetch the root.
+    ``root_fetch_ran`` says the fetcher already made that request and the
+    retry still failed; ``root_fetch_problem`` says why it could not.
     """
 
     current_platform = sys.platform if platform is None else platform
@@ -346,17 +378,100 @@ def describe_tls_failure(
             "Certificates.command' from the /Applications/Python 3.x/ "
             "folder to install a CA bundle for Python."
         )
-    if current_platform == "win32" and "unable to get local issuer" in detail:
-        lines.append(
-            "On a newly installed Windows, Python trusts only the root "
-            "certificates Windows has already downloaded. One request "
-            "through Windows' own TLS fetches the missing root: powershell "
-            '-NoProfile -Command "Invoke-WebRequest -UseBasicParsing {} '
-            '| Out-Null", then run this command again.'.format(
-                url or "https://{}/".format(host)
+    if current_platform == "win32" and MISSING_ISSUER in detail:
+        if root_fetch_ran:
+            lines.append(
+                "claude-wrangler already asked Windows to fetch the missing "
+                "root (one PowerShell request to this host), and the retry "
+                "still failed. Windows may be unable to reach its root "
+                "certificate updates (offline, blocked, or turned off by "
+                "policy), or the chain ends at a root Windows does not trust."
             )
-        )
+        else:
+            lines.append(
+                "On a newly installed Windows, Python trusts only the root "
+                "certificates Windows has already downloaded. One request "
+                "through Windows' own TLS fetches the missing root: powershell "
+                '-NoProfile -Command "Invoke-WebRequest -UseBasicParsing {} '
+                '| Out-Null", then run this command again.'.format(
+                    url or "https://{}/".format(host)
+                )
+            )
+            if root_fetch_problem:
+                lines.append(
+                    "claude-wrangler could not make that request itself: "
+                    "{}.".format(root_fetch_problem)
+                )
     return " ".join(lines)
+
+
+def windows_powershell_path() -> Optional[str]:
+    """Return Windows PowerShell's path under the system directory, or None.
+
+    The system directory comes from ``GetSystemDirectoryW`` rather than
+    ``PATH`` or ``SystemRoot``, so a ``powershell.exe`` planted in a
+    project or on ``PATH`` is never run.
+    """
+
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if not length or length >= len(buffer):
+        return None
+    candidate = os.path.join(
+        buffer.value, "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    return candidate if os.path.isfile(candidate) else None
+
+
+def fetch_windows_root(
+    url: str,
+    timeout_seconds: float,
+    *,
+    powershell: Optional[str] = None,
+    runner: Callable[..., "subprocess.CompletedProcess[bytes]"] = subprocess.run,
+) -> Optional[str]:
+    """Make one Windows PowerShell request to ``url`` so Windows fetches its root.
+
+    Returns None once PowerShell has run, whatever the HTTP outcome, or a
+    short reason when it could not run (missing, blocked by policy, timed
+    out). The caller's retry decides whether the root arrived.
+    """
+
+    executable = powershell if powershell is not None else windows_powershell_path()
+    if not executable:
+        return "Windows PowerShell was not found in the system directory"
+    timeout = max(1, int(timeout_seconds))
+    env = dict(os.environ)
+    env[ROOT_FETCH_URL_VARIABLE] = url
+    try:
+        completed = runner(
+            [
+                executable,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                ROOT_FETCH_SCRIPT.format(timeout=timeout),
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 30,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        return "PowerShell did not finish within {} s".format(timeout + 30)
+    except OSError as exc:
+        return "could not start PowerShell ({})".format(exc)
+    if completed.returncode != 0:
+        return "PowerShell exited with status {}".format(completed.returncode)
+    return None
 
 
 class _NoFollowRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -390,6 +505,11 @@ class UrllibTransport:
         """Build the opener; raise ``DownloadError`` for an unusable CA bundle."""
 
         self.cafile = resolve_ca_bundle(ca_bundle)
+        self._build_opener()
+
+    def _build_opener(self) -> None:
+        """(Re)load the trust store and build the urllib opener over it."""
+
         self._context = build_ssl_context(self.cafile)
         # ProxyHandler() reads HTTPS_PROXY/NO_PROXY (and the Windows registry
         # when no proxy variables are set).
@@ -398,6 +518,29 @@ class UrllibTransport:
             urllib.request.HTTPSHandler(context=self._context),
             _NoFollowRedirectHandler(),
         )
+
+    @property
+    def fetches_missing_roots(self) -> bool:
+        """True on Windows with the system store, where roots arrive on use.
+
+        A ``--ca-bundle`` or ``SSL_CERT_FILE`` replaces Windows' roots, so
+        nothing Windows fetches would help.
+        """
+
+        return sys.platform == "win32" and self.cafile is None
+
+    def fetch_missing_root(self, url: str, timeout_seconds: float) -> Optional[str]:
+        """Have Windows fetch the root for ``url``'s server, then reload trust.
+
+        Returns None when PowerShell ran (the trust store is reloaded, since
+        an ``SSLContext`` reads the Windows store only when it is built), or
+        the reason it could not run.
+        """
+
+        problem = fetch_windows_root(url, timeout_seconds)
+        if problem is None:
+            self._build_opener()
+        return problem
 
     def open(
         self, url: str, headers: Mapping[str, str], timeout_seconds: float
@@ -564,6 +707,8 @@ class HttpsFetcher:
         )
         self._sleep = sleep
         self._backoff_seconds = float(backoff_seconds)
+        # host -> None (root fetch ran) or why it could not; one try per host.
+        self._root_fetches: dict = {}
 
     # -- URL policy -----------------------------------------------------
 
@@ -603,21 +748,43 @@ class HttpsFetcher:
         # identity keeps sizes and hashes about the bytes on the wire.
         return {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
 
-    def _classify(self, exc: BaseException, url: str) -> Exception:
-        """Map a transport exception to a fatal or retryable failure."""
+    @staticmethod
+    def _inner_error(exc: BaseException) -> BaseException:
+        """Unwrap the socket-level cause urllib hides inside a ``URLError``."""
 
-        inner: BaseException = exc
         if (
             isinstance(exc, urllib.error.URLError)
             and not isinstance(exc, urllib.error.HTTPError)
             and isinstance(exc.reason, BaseException)
         ):
-            inner = exc.reason
+            return exc.reason
+        return exc
+
+    @staticmethod
+    def _verification_detail(inner: BaseException) -> Optional[str]:
+        """Return why certificate verification failed, or None if it did not."""
+
+        if not isinstance(inner, ssl.SSLCertVerificationError):
+            return None
+        return getattr(inner, "verify_message", None) or str(inner)
+
+    def _classify(self, exc: BaseException, url: str) -> Exception:
+        """Map a transport exception to a fatal or retryable failure."""
+
+        inner = self._inner_error(exc)
         host = urllib.parse.urlsplit(url).hostname or url
-        if isinstance(inner, ssl.SSLCertVerificationError):
-            detail = getattr(inner, "verify_message", None) or str(inner)
+        detail = self._verification_detail(inner)
+        if detail is not None:
+            ran = host in self._root_fetches and self._root_fetches[host] is None
             return DownloadError(
-                describe_tls_failure(host, detail, self._presented_issuer(url), url=url)
+                describe_tls_failure(
+                    host,
+                    detail,
+                    self._presented_issuer(url),
+                    url=url,
+                    root_fetch_ran=ran,
+                    root_fetch_problem=self._root_fetches.get(host),
+                )
             )
         if isinstance(inner, (socket.timeout, TimeoutError)):
             return _RetryableFailure(
@@ -646,12 +813,45 @@ class HttpsFetcher:
     def _call_transport(
         self, url: str, headers: Mapping[str, str]
     ) -> TransportResponse:
-        """Send one request through the transport, classifying failures."""
+        """Send one request through the transport, classifying failures.
+
+        A missing issuer on a transport that fetches missing roots gets one
+        root fetch per host and one immediate retry.
+        """
 
         try:
             return self.transport.open(url, headers, self.timeout_seconds)
         except (OSError, http.client.HTTPException) as exc:
+            if not self._fetch_missing_root(exc, url):
+                raise self._classify(exc, url) from exc
+        try:
+            return self.transport.open(url, headers, self.timeout_seconds)
+        except (OSError, http.client.HTTPException) as exc:
             raise self._classify(exc, url) from exc
+
+    def _fetch_missing_root(self, exc: BaseException, url: str) -> bool:
+        """Ask the transport to fetch a missing root once; True means retry."""
+
+        detail = self._verification_detail(self._inner_error(exc))
+        if detail is None or MISSING_ISSUER not in detail:
+            return False
+        if not getattr(self.transport, "fetches_missing_roots", False):
+            return False
+        host = urllib.parse.urlsplit(url).hostname or url
+        if host in self._root_fetches:
+            return False
+        print(
+            "note: Windows has not downloaded the root certificate for {} "
+            "yet; asking Windows to fetch it (one PowerShell request) and "
+            "retrying.".format(host),
+            file=sys.stderr,
+            flush=True,
+        )
+        problem = self.transport.fetch_missing_root(  # type: ignore[attr-defined]
+            url, self.timeout_seconds
+        )
+        self._root_fetches[host] = problem
+        return problem is None
 
     def _read(self, response: TransportResponse, url: str, size: int) -> bytes:
         """Read one body chunk, classifying transport failures."""

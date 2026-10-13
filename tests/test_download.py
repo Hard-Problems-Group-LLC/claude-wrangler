@@ -10,6 +10,8 @@ import hashlib
 import io
 import socket
 import ssl
+import subprocess
+import sys
 from typing import Callable, Dict, List, Optional, Tuple
 import urllib.error
 import urllib.request
@@ -421,6 +423,25 @@ def test_describe_tls_failure_explains_a_missing_root_on_windows():
     )
     assert "newly installed Windows" in windows
     assert "Invoke-WebRequest -UseBasicParsing {} | Out-Null".format(url) in windows
+    ran = describe_tls_failure(
+        HOST,
+        "unable to get local issuer certificate",
+        None,
+        "win32",
+        url=url,
+        root_fetch_ran=True,
+    )
+    assert "already asked Windows" in ran and "Invoke-WebRequest" not in ran
+    blocked = describe_tls_failure(
+        HOST,
+        "unable to get local issuer certificate",
+        None,
+        "win32",
+        url=url,
+        root_fetch_problem="PowerShell exited with status 1",
+    )
+    assert "Invoke-WebRequest" in blocked
+    assert "could not make that request itself: PowerShell exited" in blocked
     linux = describe_tls_failure(
         HOST, "unable to get local issuer certificate", "CN=WR3", "linux", url=url
     )
@@ -429,6 +450,205 @@ def test_describe_tls_failure_explains_a_missing_root_on_windows():
         HOST, "unable to get local issuer certificate", None, "win32"
     )
     assert "https://{}/".format(HOST) in fallback
+
+
+def missing_issuer() -> urllib.error.URLError:
+    """Return the error urllib raises when Windows lacks the issuing root."""
+
+    error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+    error.verify_message = "unable to get local issuer certificate"
+    return urllib.error.URLError(error)
+
+
+class RootFetchingTransport(FakeTransport):
+    """Fake transport that, like Windows, can fetch a missing root."""
+
+    fetches_missing_roots = True
+
+    def __init__(self, problem: Optional[str] = None) -> None:
+        """Answer every root fetch with ``problem`` (None means it ran)."""
+
+        super().__init__()
+        self.problem = problem
+        self.root_fetches: List[Tuple[str, float]] = []
+
+    def fetch_missing_root(self, url, timeout_seconds):
+        """Record the fetch and return the configured outcome."""
+
+        self.root_fetches.append((url, timeout_seconds))
+        return self.problem
+
+
+def test_missing_issuer_fetches_the_root_once_and_retries(capsys):
+    transport = RootFetchingTransport().add(
+        BASE + "/stable", fail(missing_issuer()), ok(b"2.1.300")
+    )
+    fetcher, delays = make_fetcher(transport)
+    assert fetcher.get_bytes(BASE + "/stable", 64) == b"2.1.300"
+    assert transport.root_fetches == [(BASE + "/stable", 7.5)]
+    assert len(transport.calls) == 2
+    assert delays == []
+    assert "asking Windows to fetch it" in capsys.readouterr().err
+
+
+def test_root_fetch_runs_once_per_host_and_reports_a_failed_retry():
+    transport = RootFetchingTransport().add(BASE + "/stable", fail(missing_issuer()))
+    fetcher, _ = make_fetcher(transport)
+    with pytest.raises(DownloadError) as caught:
+        fetcher.get_bytes(BASE + "/stable", 64)
+    if sys.platform == "win32":
+        assert "already asked Windows to fetch the missing root" in str(caught.value)
+        assert "Invoke-WebRequest" not in str(caught.value)
+    assert len(transport.calls) == 2
+    with pytest.raises(DownloadError):
+        fetcher.get_bytes(BASE + "/stable", 64)
+    assert len(transport.root_fetches) == 1
+    assert len(transport.calls) == 3
+
+
+def test_root_fetch_that_cannot_run_keeps_the_manual_fix():
+    transport = RootFetchingTransport("PowerShell exited with status 1").add(
+        BASE + "/stable", fail(missing_issuer())
+    )
+    fetcher, _ = make_fetcher(transport)
+    with pytest.raises(DownloadError) as caught:
+        fetcher.get_bytes(BASE + "/stable", 64)
+    message = str(caught.value)
+    if sys.platform == "win32":
+        assert "Invoke-WebRequest" in message
+        assert "could not make that request itself: PowerShell exited" in message
+    assert len(transport.calls) == 1
+
+
+def test_other_verification_failures_do_not_fetch_roots():
+    error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+    error.verify_message = "certificate has expired"
+    transport = RootFetchingTransport().add(
+        BASE + "/stable", fail(urllib.error.URLError(error))
+    )
+    fetcher, _ = make_fetcher(transport)
+    with pytest.raises(DownloadError, match="certificate has expired"):
+        fetcher.get_bytes(BASE + "/stable", 64)
+    assert transport.root_fetches == []
+    assert len(transport.calls) == 1
+
+
+def test_root_fetch_is_skipped_when_the_transport_declines():
+    transport = RootFetchingTransport().add(BASE + "/stable", fail(missing_issuer()))
+    transport.fetches_missing_roots = False
+    fetcher, _ = make_fetcher(transport)
+    with pytest.raises(DownloadError):
+        fetcher.get_bytes(BASE + "/stable", 64)
+    assert transport.root_fetches == []
+
+
+def test_fetch_windows_root_passes_the_url_only_through_the_environment():
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen["argv"] = argv
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0)
+
+    url = BASE + "/stable"
+    assert (
+        download.fetch_windows_root(url, 7.5, powershell="ps.exe", runner=runner)
+        is None
+    )
+    argv = seen["argv"]
+    assert argv[:5] == [
+        "ps.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+    ]
+    script = argv[5]
+    assert url not in " ".join(argv)
+    assert '"' not in script
+    assert "$env:" + download.ROOT_FETCH_URL_VARIABLE in script
+    assert "-TimeoutSec 7 " in script
+    assert seen["env"][download.ROOT_FETCH_URL_VARIABLE] == url
+    assert seen["stdin"] is subprocess.DEVNULL
+    assert seen["check"] is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs Windows PowerShell")
+def test_fetch_windows_root_counts_a_failed_request_as_run():
+    # Real PowerShell against a closed local port: the request fails, but
+    # the handshake attempt is all a root fetch needs, so this must not be
+    # reported as "could not run" (a caught error alone makes -Command exit 1).
+    assert download.fetch_windows_root("https://127.0.0.1:9/", 5) is None
+
+
+def test_fetch_windows_root_reports_why_it_could_not_run(monkeypatch):
+    def exits(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1)
+
+    def hangs(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    def blocked(argv, **kwargs):
+        raise PermissionError("Access is denied")
+
+    url = BASE + "/stable"
+    assert "status 1" in download.fetch_windows_root(
+        url, 5, powershell="p", runner=exits
+    )
+    assert "did not finish" in download.fetch_windows_root(
+        url, 5, powershell="p", runner=hangs
+    )
+    assert "could not start PowerShell" in download.fetch_windows_root(
+        url, 5, powershell="p", runner=blocked
+    )
+    monkeypatch.setattr(download, "windows_powershell_path", lambda: None)
+    assert "not found" in download.fetch_windows_root(url, 5, runner=exits)
+
+
+def test_windows_powershell_path_comes_from_the_system_directory():
+    path = download.windows_powershell_path()
+    if sys.platform != "win32":
+        assert path is None
+        return
+    assert path is not None
+    assert path.lower().endswith("\\windowspowershell\\v1.0\\powershell.exe")
+
+
+def test_urllib_transport_fetches_roots_only_with_the_windows_store(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    transport = UrllibTransport()
+    monkeypatch.setattr(download.sys, "platform", "linux")
+    assert transport.fetches_missing_roots is False
+    monkeypatch.setattr(download.sys, "platform", "win32")
+    assert transport.fetches_missing_roots is True
+    bundle = tmp_path / "corp.pem"
+    bundle.write_text("x", encoding="ascii")
+    monkeypatch.setattr(
+        download.ssl,
+        "create_default_context",
+        lambda **_: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+    )
+    assert UrllibTransport(str(bundle)).fetches_missing_roots is False
+
+
+def test_urllib_transport_reloads_trust_only_after_a_root_fetch(monkeypatch):
+    transport = UrllibTransport()
+    outcomes = ["PowerShell exited with status 1", None]
+    calls = []
+
+    def fake_fetch(url, timeout_seconds):
+        calls.append((url, timeout_seconds))
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(download, "fetch_windows_root", fake_fetch)
+    first = transport._opener
+    assert transport.fetch_missing_root(BASE + "/stable", 5.0) is not None
+    assert transport._opener is first
+    assert transport.fetch_missing_root(BASE + "/stable", 5.0) is None
+    assert transport._opener is not first
+    assert calls == [(BASE + "/stable", 5.0)] * 2
 
 
 def _der(tag: int, content: bytes) -> bytes:
