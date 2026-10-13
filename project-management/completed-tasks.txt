@@ -97,8 +97,8 @@ and ISO 8601 timestamps.
   2026-10-12T08:47:00-07:00. Blockers: none.
 
 * Native Claude Code runtime for claude-wrangler, with Windows support
-  foundations (`feature/windows-platform-support`, commits ea55dab,
-  2037f53, 310c991, 4d5e4e4, 25e0afe). Replaced the npm-managed install
+  foundations (`feature/windows-platform-support`, commits 0feb1ff,
+  251365d, 354a82b, 0d13394, 4813fdc). Replaced the npm-managed install
   with signature-verified native binaries in A/B runtime slots, a Python
   launcher core with thin sh and cmd shims, self-update suppression in
   three layers, legacy npm-layout migration, the install_prerequisites
